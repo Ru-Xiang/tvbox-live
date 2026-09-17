@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 授权路径。
+  用途：Android 7.0+ 起，安装 APK 不能对外暴露 file:// URI，
+  必须经 FileProvider 转成 content:// 并授予读权限，否则系统安装器会拒绝。
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 应用专属外部下载目录：getExternalFilesDir(DIRECTORY_DOWNLOADS) -->
+    <external-files-path
+        name="apk_download"
+        path="Download/" />
+    <!-- 兜底：内部 filesDir 下万一存在下载文件也能授权 -->
+    <files-path
+        name="apk_internal"
+        path="Download/" />
+</paths>

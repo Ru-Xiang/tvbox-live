@@ -92,6 +92,10 @@ public class LiveSettingsActivity extends AppCompatActivity {
     // ============ 扫码配置 ============
     private ScanConfigDialog scanConfigDialog;
 
+    // ============ 应用更新 ============
+    private TextView tvUpdateState;
+    private Button btnCheckUpdate;
+
     // ============ 播放器设置 ============
     private Spinner spPlayerType;
     private Spinner spScaleMode;
@@ -121,6 +125,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
         initViews();
         loadSettings();
         setupListeners();
+        autoCheckAppUpdate();
     }
 
     private void initViews() {
@@ -174,6 +179,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
 
         // 系统
         cbBootStartup = findViewById(R.id.cb_boot_startup);
+
+        // 应用更新（GitHub Releases）
+        tvUpdateState = findViewById(R.id.tv_update_state);
+        btnCheckUpdate = findViewById(R.id.btn_check_update);
+        if (tvUpdateState != null) {
+            tvUpdateState.setText("当前版本：" + com.github.tvbox.osc.BuildConfig.VERSION_NAME
+                    + "（仓库 " + com.github.tvbox.osc.util.UpdateManager.GITHUB_OWNER + "/"
+                    + com.github.tvbox.osc.util.UpdateManager.GITHUB_REPO + "）");
+        }
 
         // 测速进度（右上角）
         speedTestBar = findViewById(R.id.speed_test_bar);
@@ -437,6 +451,11 @@ public class LiveSettingsActivity extends AppCompatActivity {
             });
         }
 
+        // 检查应用更新（GitHub Releases）
+        if (btnCheckUpdate != null) {
+            btnCheckUpdate.setOnClickListener(v -> checkAppUpdate(true));
+        }
+
         // 清空线路黑名单（恢复所有被删除的线路及自定义置顶顺序）
         if (btnClearBlacklist != null) {
             btnClearBlacklist.setOnClickListener(v -> {
@@ -525,6 +544,50 @@ public class LiveSettingsActivity extends AppCompatActivity {
     // ============ 多仓链接 ============
 
     /** 多仓链接数量摘要（显示在「多仓链接配置」按钮右侧） */
+    // ============ 应用更新（GitHub Releases）============
+
+    /**
+     * 进入设置页时做一次静默检查（每 12 小时最多一次），有更新则直接弹出提示；
+     * 手动点击「检查更新」则无视间隔，必定走一次真实请求。
+     */
+    private void autoCheckAppUpdate() {
+        if (!com.github.tvbox.osc.util.UpdateManager.shouldAutoCheck()) return;
+        // 延后一小段，避免与页面加载抢 UI 线程
+        cbBootStartup.postDelayed(() -> checkAppUpdate(false), 800);
+    }
+
+    private void checkAppUpdate(boolean manual) {
+        if (isFinishing() || isDestroyed()) return;
+        if (tvUpdateState != null) tvUpdateState.setText("正在检查更新...");
+
+        com.github.tvbox.osc.util.UpdateManager.checkForUpdate(
+                new com.github.tvbox.osc.util.UpdateManager.UpdateCallback() {
+                    @Override
+                    public void onUpdate(com.github.tvbox.osc.util.UpdateManager.UpdateInfo info) {
+                        if (isFinishing() || isDestroyed()) return;
+                        if (tvUpdateState != null) tvUpdateState.setText("发现新版本 " + info.version);
+                        if (btnCheckUpdate != null) btnCheckUpdate.setText("下载更新 " + info.version);
+                        com.github.tvbox.osc.ui.dialog.UpdateDialog.show(LiveSettingsActivity.this, info);
+                    }
+
+                    @Override
+                    public void onLatest() {
+                        if (isFinishing() || isDestroyed()) return;
+                        if (tvUpdateState != null) {
+                            tvUpdateState.setText("已是最新版本 " + com.github.tvbox.osc.BuildConfig.VERSION_NAME);
+                        }
+                        if (manual) ToastUtil.show(LiveSettingsActivity.this, "已是最新版本");
+                    }
+
+                    @Override
+                    public void onError(String message) {
+                        if (isFinishing() || isDestroyed()) return;
+                        if (tvUpdateState != null) tvUpdateState.setText("检查更新失败：" + message);
+                        if (manual) ToastUtil.show(LiveSettingsActivity.this, message);
+                    }
+                });
+    }
+
     private void updateMultiRepoSummary() {
         if (tvMultiRepoSummary == null) return;
         int count = parseMultiRepoUrls().size();

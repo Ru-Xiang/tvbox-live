@@ -746,6 +746,43 @@
             android:textColor="@color/text_tertiary"
             android:textSize="12sp" />
 
+        <!-- ============ 应用更新 ============ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="28dp"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.02"
+            android:text="🆕 应用更新"
+            android:textColor="@color/accent_purple_light"
+            android:textSize="18sp" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/glass_stroke_soft" />
+
+        <TextView
+            android:id="@+id/tv_update_state"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="当前版本：1.2.0"
+            android:textColor="@color/text_tertiary"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_check_update"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/btn_primary"
+            android:focusable="true"
+            android:text="检查更新"
+            android:textColor="#FFFFFF"
+            android:textSize="15sp" />
+
         <!-- 底部间距 -->
         <View
             android:layout_width="match_parent"

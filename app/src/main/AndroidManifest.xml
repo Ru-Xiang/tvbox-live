@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Android 13+ 需显式声明，否则前台测速服务的进度通知会被静默丢弃 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android 8+ 应用内安装 APK 需要此权限，否则会跳转到"允许安装未知应用"设置页或直接失败 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- 电视特性声明 -->
     <uses-feature
@@ -80,6 +82,20 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>
+
+        <!--
+          FileProvider：Android 7.0+ 安装 APK 时必须用它把 file:// 换成 content://
+          并授予读权限，否则系统安装器会拒绝解析包。
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 </manifest>

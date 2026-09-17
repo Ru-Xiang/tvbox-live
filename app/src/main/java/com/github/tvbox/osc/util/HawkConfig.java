@@ -67,6 +67,14 @@ public class HawkConfig {
     /** 自定义/订阅源连续未入选次数统计（JSON: {url:count}） */
     public static final String IPTV_SOURCE_FAIL_COUNT = "iptv_source_fail_count";
 
+    // ============ 应用更新 ============
+
+    /** 上次检查应用更新的时间（毫秒） */
+    public static final String UPDATE_LAST_CHECK_TIME = "update_last_check_time";
+
+    /** 用户选择"跳过"的版本号，该版本不再提示 */
+    public static final String UPDATE_SKIP_VERSION = "update_skip_version";
+
     /** 自定义源连续未入选达到该次数则自动删除 */
     public static final int MAX_SOURCE_FAIL_COUNT = 3;
 
