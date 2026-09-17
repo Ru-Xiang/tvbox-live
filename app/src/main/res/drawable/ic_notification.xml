@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知专用小图标：单色、路径简单（电视外框 + 播放三角）。
+  刻意不使用自适应启动图标（含前后景图层）或系统 android.R.drawable 资源，
+  避免部分定制系统（如 MIUI）在跨进程渲染通知图标时报
+  "Bad notification for startForeground" 而杀掉进程。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 屏幕外框 -->
+    <path
+        android:pathData="M3,5 L21,5 L21,17 L3,17 Z"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2" />
+
+    <!-- 底部支架 -->
+    <path
+        android:pathData="M9,19 L15,19 L15,20.5 L9,20.5 Z"
+        android:fillColor="#FFFFFFFF" />
+
+    <!-- 播放三角 -->
+    <path
+        android:pathData="M10,8.5 L15.5,11 L10,13.5 Z"
+        android:fillColor="#FFFFFFFF" />
+</vector>

@@ -1,0 +1,47 @@
+// TVBoxOS-Live 项目级构建配置
+// 基于 TVBoxOS 源码，集成 iptv-api 直播源功能
+
+buildscript {
+    ext {
+        compileSdkVersion = 33
+        minSdkVersion = 21
+        targetSdkVersion = 33
+        versionCode = 4
+        versionName = "1.2.0"
+        // 依赖版本
+        okhttpVersion = '4.12.0'
+        gsonVersion = '2.10.1'
+        roomVersion = '2.5.2'
+        lifecycleVersion = '2.6.2'
+        exoplayerVersion = '2.19.1'
+        glideVersion = '4.16.0'
+    }
+
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.4.2'
+    }
+}
+
+allprojects {
+    repositories {
+        maven { url 'https://maven.aliyun.com/repository/google' }
+        maven { url 'https://maven.aliyun.com/repository/public' }
+        maven { url 'https://maven.aliyun.com/repository/gradle-plugin' }
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}

@@ -1,0 +1,7 @@
+local.properties 文件请在本地创建，格式如下：
+sdk.dir=/path/to/your/Android/Sdk
+
+例如：
+- macOS: sdk.dir=/Users/yourname/Library/Android/sdk
+- Linux: sdk.dir=/home/yourname/Android/Sdk
+- Windows: sdk.dir=C\:\\Users\\yourname\\AppData\\Local\\Android\\Sdk

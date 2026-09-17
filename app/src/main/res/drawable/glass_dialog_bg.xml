@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  对话框液态玻璃背景（Apple 毛玻璃风）：
+  深色半透主体 + 顶部反光渐层 + 高光描边。
+  主体透明度提高到约 82%，配合更低的窗口遮罩与 Android 12+ 背景模糊，
+  可透出后方画面，获得真实的“磨砂玻璃”观感。
+-->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:insetLeft="24dp"
+    android:insetRight="24dp"
+    android:insetTop="24dp"
+    android:insetBottom="24dp">
+    <layer-list>
+        <!-- 玻璃主体（半透深色） -->
+        <item>
+            <shape android:shape="rectangle">
+                <solid android:color="@color/glass_dialog_fill" />
+                <corners android:radius="@dimen/radius_lg" />
+                <stroke android:width="1dp" android:color="@color/glass_stroke" />
+            </shape>
+        </item>
+        <!-- 顶部高光：模拟玻璃边缘反射 -->
+        <item>
+            <shape android:shape="rectangle">
+                <gradient
+                    android:startColor="#30FFFFFF"
+                    android:centerColor="#0AFFFFFF"
+                    android:endColor="#00FFFFFF"
+                    android:angle="270" />
+                <corners android:radius="@dimen/radius_lg" />
+            </shape>
+        </item>
+    </layer-list>
+</inset>

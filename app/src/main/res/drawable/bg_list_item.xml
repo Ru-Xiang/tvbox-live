@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 频道列表项：聚焦玻璃高亮、播放中淡绿、普通透明 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <gradient android:startColor="#4D0A84FF" android:endColor="#4D7C3AED" android:angle="135" />
+                    <corners android:radius="@dimen/radius_sm" />
+                    <stroke android:width="1.5dp" android:color="#66FFFFFF" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+    <item android:state_selected="true">
+        <shape android:shape="rectangle">
+            <solid android:color="#2630D158" />
+            <corners android:radius="@dimen/radius_sm" />
+            <stroke android:width="1dp" android:color="@color/accent_green" />
+        </shape>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/glass_fill" />
+            <corners android:radius="@dimen/radius_sm" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#00000000" />
+            <corners android:radius="@dimen/radius_sm" />
+        </shape>
+    </item>
+</selector>

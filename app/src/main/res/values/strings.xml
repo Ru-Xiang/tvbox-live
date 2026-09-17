@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TVBox 直播</string>
+
+    <!-- 通用 -->
+    <string name="loading">加载中…</string>
+    <string name="confirm">确定</string>
+    <string name="cancel">取消</string>
+    <string name="save">保存</string>
+    <string name="refresh">刷新</string>
+    <string name="settings">设置</string>
+    <string name="error">错误</string>
+
+    <!-- 直播 -->
+    <string name="live_play">直播播放</string>
+    <string name="channel_list">频道列表</string>
+    <string name="channel_info">频道信息</string>
+    <string name="no_channel">暂无频道</string>
+    <string name="no_source">该频道无可用源</string>
+    <string name="switching_source">切换源中…</string>
+    <string name="source_format">源 %1$d/%2$d</string>
+    <string name="exit_confirm">确定要退出直播吗？</string>
+
+    <!-- 分组 -->
+    <string name="group_cctv">央视</string>
+    <string name="group_satellite">卫视</string>
+    <string name="group_local">地方台</string>
+    <string name="group_hk_tw">港澳台</string>
+    <string name="group_sports">体育</string>
+    <string name="group_movie">电影</string>
+    <string name="group_news">新闻</string>
+    <string name="group_kids">少儿</string>
+    <string name="group_other">其他</string>
+    <string name="group_favorite">收藏</string>
+    <string name="group_uncategorized">未分类</string>
+
+    <!-- 设置 -->
+    <string name="settings_title">直播设置</string>
+    <string name="settings_iptv_source">直播源配置</string>
+    <string name="settings_speed_test">测速配置</string>
+    <string name="settings_player">播放器设置</string>
+    <string name="settings_display">显示设置</string>
+
+    <!-- 直播源 -->
+    <string name="iptv_ip_version">IP 版本</string>
+    <string name="iptv_auto_update">自动更新直播源</string>
+    <string name="iptv_update_interval">更新间隔</string>
+    <string name="iptv_enable_epg">启用 EPG 节目单</string>
+    <string name="iptv_refresh">刷新直播源</string>
+    <string name="iptv_add_custom">添加自定义源</string>
+    <string name="iptv_last_update">上次更新: %s</string>
+    <string name="iptv_never_updated">从未更新</string>
+    <string name="iptv_refreshing">正在刷新直播源…</string>
+    <string name="iptv_refresh_success">刷新完成: %d 个频道</string>
+    <string name="iptv_refresh_failed">刷新失败: %s</string>
+
+    <!-- 测速 -->
+    <string name="speed_test_enabled">启用直播源测速</string>
+    <string name="speed_test_mode">测速时机</string>
+    <string name="speed_test_manual">仅手动测速</string>
+    <string name="speed_test_periodic_prompt">周期性：打开应用时提示测速</string>
+    <string name="speed_test_interval">测速周期</string>
+    <string name="speed_test_timeout">测速超时</string>
+    <string name="speed_test_concurrency">并发线程</string>
+    <string name="speed_test_sort">按速度排序播放源</string>
+    <string name="speed_test_min_speed">最低可接受速度</string>
+    <string name="speed_test_start">立即测速</string>
+    <string name="speed_test_clear_cache">清除测速缓存</string>
+    <string name="speed_test_last_time">上次测速: %s</string>
+    <string name="speed_test_never">从未测速</string>
+    <string name="speed_test_running">测速中: %1$s (%2$d/%3$d)</string>
+    <string name="speed_test_complete">测速完成: %1$d/%2$d 个源可用</string>
+    <string name="speed_test_prompt_title">直播源测速</string>
+    <string name="speed_test_prompt_msg">检测到直播源尚未测速或测速已过期，\n是否立即进行测速？\n（测速将在后台运行，不影响观看）</string>
+    <string name="speed_test_remind_title">测速提醒</string>
+    <string name="speed_test_remind_msg">上次测速: %s\n建议定期测速以获得最佳播放体验</string>
+    <string name="speed_test_now">立即测速</string>
+    <string name="speed_test_later">稍后再说</string>
+    <string name="speed_test_no_remind">不再提醒</string>
+
+    <!-- 播放器 -->
+    <string name="player_system">系统播放器</string>
+    <string name="player_ijk">IJK 播放器</string>
+    <string name="player_exo">ExoPlayer</string>
+    <string name="scale_fit">自适应</string>
+    <string name="scale_fill">填充</string>
+    <string name="scale_16_9">16:9</string>
+    <string name="scale_4_3">4:3</string>
+    <string name="scale_original">原始</string>
+
+    <!-- 数值后缀 -->
+    <string name="unit_hours">%d 小时</string>
+    <string name="unit_seconds">%d 秒</string>
+    <string name="unit_threads">%d 线程</string>
+    <string name="unit_kbps">%d KB/s</string>
+</resources>

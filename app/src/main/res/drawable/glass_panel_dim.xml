@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  弱玻璃面板：用于对话框内部的内容区（如节目单列表）。
+  比glass_panel 更淡，避免与对话框玻璃底叠加后过于浑浊，保持通透层次。
+-->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/glass_fill_dim" />
+            <corners android:radius="@dimen/radius_md" />
+            <stroke android:width="@dimen/glass_stroke_width" android:color="@color/glass_stroke_soft" />
+        </shape>
+    </item>
+    <!-- 顶部细高光 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:startColor="#1FFFFFFF"
+                android:centerColor="#05FFFFFF"
+                android:endColor="#00FFFFFF"
+                android:angle="270" />
+            <corners android:radius="@dimen/radius_md" />
+        </shape>
+    </item>
+</layer-list>

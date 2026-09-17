@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标前景：电视 + 渐变屏幕 + 播放键 + 信号波纹 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- 信号波纹（右上角） -->
+    <path
+        android:strokeColor="#34D399"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M70,34 a8,8 0 0 1 8,8" />
+    <path
+        android:strokeColor="#34D399"
+        android:strokeWidth="2.4"
+        android:strokeLineCap="round"
+        android:fillColor="#00000000"
+        android:pathData="M70,28 a14,14 0 0 1 14,14" />
+
+    <!-- 电视外框 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,40 h40 a5,5 0 0 1 5,5 v24 a5,5 0 0 1 -5,5 h-40 a5,5 0 0 1 -5,-5 v-24 a5,5 0 0 1 5,-5 z" />
+
+    <!-- 屏幕（渐变） -->
+    <path android:pathData="M34,45 h40 v24 h-40 z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="34" android:startY="45"
+                android:endX="74" android:endY="69"
+                android:type="linear">
+                <item android:offset="0" android:color="#FF7C3AED" />
+                <item android:offset="1" android:color="#FF5B21B6" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- 播放三角 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M50,51 l12,6 -12,6 z" />
+
+    <!-- 底座 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48,74 h3 v3 h-3 z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M57,74 h3 v3 h-3 z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,77 h20 a1.5,1.5 0 0 1 0,3 h-20 a1.5,1.5 0 0 1 0,-3 z" />
+</vector>

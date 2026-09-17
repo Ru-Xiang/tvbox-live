@@ -1,0 +1,156 @@
+# ============================================================================
+# TVBoxOS-Live Android 编译环境 Docker
+# ============================================================================
+# 使用方法:
+#   构建镜像:
+#     docker build -f Dockerfile.build -t tvboxos-live-builder .
+#
+#   编译 Debug APK:
+#     docker run --rm -v $(pwd):/project tvboxos-live-builder debug
+#
+#   编译 Release APK:
+#     docker run --rm -v $(pwd):/project tvboxos-live-builder release
+#
+#   编译仅 arm32 (armeabi-v7a) 的 Release APK:
+#     docker run --rm -v $(pwd):/project tvboxos-live-builder release armeabi-v7a
+#
+#   编译仅 arm64 (arm64-v8a) 的 Release APK:
+#     docker run --rm -v $(pwd):/project tvboxos-live-builder release arm64-v8a
+#
+#   进入交互式环境:
+#     docker run --rm -it -v $(pwd):/project tvboxos-live-builder bash
+# ============================================================================
+
+# 强制使用 linux/amd64：Android build-tools(aapt2/d8/zipalign 等) 官方仅提供 x86_64 二进制，
+# 在 arm64(Apple Silicon) 上需经 Docker 模拟层运行
+FROM --platform=linux/amd64 ubuntu:22.04
+
+LABEL maintainer="TVBoxOS-Live Builder"
+LABEL description="Android 编译环境 - JDK 11 + Android SDK 33 + Gradle 7.5"
+
+# 设置时区
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+# 避免交互式安装提示
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安装基础依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-11-jdk \
+    wget \
+    unzip \
+    git \
+    curl \
+    zip \
+    lib32stdc++6 \
+    lib32z1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置 Java 环境
+ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# ============================================================================
+# Android SDK 安装
+# ============================================================================
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_SDK_ROOT=$ANDROID_HOME
+ENV PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/33.0.2
+
+# 下载并安装 Android Command Line Tools
+RUN mkdir -p $ANDROID_HOME/cmdline-tools && \
+    cd $ANDROID_HOME/cmdline-tools && \
+    wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline-tools.zip && \
+    unzip -q cmdline-tools.zip && \
+    mv cmdline-tools latest && \
+    rm cmdline-tools.zip
+
+# 接受 SDK 许可协议
+RUN yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+# 安装所需的 SDK 组件
+RUN sdkmanager --install \
+    "platforms;android-33" \
+    "build-tools;33.0.2" \
+    "platform-tools" \
+    "extras;google;m2repository" \
+    "extras;android;m2repository"
+
+# ============================================================================
+# Gradle 安装（可选，项目自带 Gradle Wrapper）
+# ============================================================================
+ENV GRADLE_VERSION=7.5
+ENV GRADLE_HOME=/opt/gradle
+ENV PATH=$PATH:$GRADLE_HOME/bin
+
+RUN wget -q https://services.gradle.org/distributions/gradle-${GRADLE_VERSION}-bin.zip -O /tmp/gradle.zip && \
+    unzip -q /tmp/gradle.zip -d /opt && \
+    mv /opt/gradle-${GRADLE_VERSION} $GRADLE_HOME && \
+    rm /tmp/gradle.zip
+
+# ============================================================================
+# 工作目录和构建脚本
+# ============================================================================
+WORKDIR /project
+
+# 预下载 Gradle Wrapper（加速首次构建）
+RUN mkdir -p /tmp/gradle-cache && \
+    cd /tmp/gradle-cache && \
+    gradle --version > /dev/null 2>&1 || true && \
+    rm -rf /tmp/gradle-cache
+
+# 设置 Gradle 缓存目录
+ENV GRADLE_USER_HOME=/root/.gradle
+
+# 创建构建入口脚本
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "========================================"\n\
+echo "  TVBoxOS-Live 编译环境"\n\
+echo "  JDK: $(java -version 2>&1 | head -1)"\n\
+echo "  Gradle: $GRADLE_VERSION"\n\
+echo "  Android SDK: $ANDROID_HOME"\n\
+echo "========================================"\n\
+echo ""\n\
+\n\
+# 如果传入 bash 则进入交互模式\n\
+if [ "$1" = "bash" ] || [ "$1" = "sh" ]; then\n\
+    exec /bin/bash\n\
+fi\n\
+\n\
+# 默认构建类型\n\
+BUILD_TYPE=${1:-debug}\n\
+# ABI 过滤（all / armeabi-v7a / arm64-v8a / x86 / x86_64 / 逗号分隔）\n\
+TARGET_ABI=${2:-all}\n\
+echo "[构建] 类型: $BUILD_TYPE"\n\
+echo "[构建] ABI:  $TARGET_ABI"\n\
+echo ""\n\
+\n\
+# 创建 local.properties\n\
+echo "sdk.dir=$ANDROID_HOME" > local.properties\n\
+\n\
+# 直接使用容器内已安装的 Gradle（版本与项目一致），绕过 gradlew wrapper 联网下载分发包\n\
+GRADLE_TASK=assembleDebug\n\
+OUT_DIR=debug\n\
+if [ "$BUILD_TYPE" = "release" ]; then\n\
+    GRADLE_TASK=assembleRelease\n\
+    OUT_DIR=release\n\
+fi\n\
+GRADLE_ARGS="--no-daemon --stacktrace -PtargetAbi=${TARGET_ABI}"\n\
+\n\
+# 优先离线构建（依赖/SDK 已在镜像或挂载缓存中）；离线失败再联网重试一次\n\
+if gradle ${GRADLE_TASK} ${GRADLE_ARGS} --offline; then\n\
+    echo ""\n\
+    echo "[完成] APK 位于: app/build/outputs/apk/${OUT_DIR}/"\n\
+else\n\
+    echo "[提示] 离线构建失败，尝试联网构建..."\n\
+    gradle ${GRADLE_TASK} ${GRADLE_ARGS}\n\
+    echo ""\n\
+    echo "[完成] APK 位于: app/build/outputs/apk/${OUT_DIR}/"\n\
+fi\n\
+' > /usr/local/bin/build.sh && chmod +x /usr/local/bin/build.sh
+
+ENTRYPOINT ["/usr/local/bin/build.sh"]
+CMD ["debug"]

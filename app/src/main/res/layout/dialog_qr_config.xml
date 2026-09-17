@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 扫码配置弹窗 - 液态玻璃卡片 -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/glass_panel"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    android:padding="28dp">
+
+    <TextView
+        android:id="@+id/tv_qr_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:fontFamily="sans-serif-medium"
+        android:text="手机扫码配置"
+        android:textColor="@color/text_primary"
+        android:textSize="21sp"
+        android:letterSpacing="0.01" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:fontFamily="sans-serif"
+        android:gravity="center"
+        android:text="请确保手机与本设备处于同一 WiFi / 局域网"
+        android:textColor="@color/text_tertiary"
+        android:textSize="13sp" />
+
+    <!-- 二维码：白底圆角卡片 -->
+    <FrameLayout
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:background="@drawable/bg_qr_card"
+        android:padding="14dp">
+
+        <ImageView
+            android:id="@+id/iv_qr_code"
+            android:layout_width="232dp"
+            android:layout_height="232dp"
+            android:contentDescription="@string/settings" />
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/tv_qr_url"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="18dp"
+        android:fontFamily="sans-serif-medium"
+        android:gravity="center"
+        android:textColor="@color/accent_green"
+        android:textIsSelectable="true"
+        android:textSize="16sp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:fontFamily="sans-serif"
+        android:gravity="center"
+        android:text="也可在手机浏览器直接输入以上地址"
+        android:textColor="@color/text_quaternary"
+        android:textSize="12sp" />
+</LinearLayout>

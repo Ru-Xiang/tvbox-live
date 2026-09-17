@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 分组项：聚焦玻璃高亮，选中左侧指示条 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <shape android:shape="rectangle">
+            <gradient android:startColor="#590A84FF" android:endColor="#597C3AED" android:angle="135" />
+            <corners android:radius="@dimen/radius_sm" />
+            <stroke android:width="1.5dp" android:color="#66FFFFFF" />
+        </shape>
+    </item>
+    <item android:state_selected="true">
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <solid android:color="@color/glass_fill" />
+                    <corners android:radius="@dimen/radius_sm" />
+                </shape>
+            </item>
+            <item android:width="3dp" android:gravity="start" android:start="2dp" android:top="10dp" android:bottom="10dp">
+                <shape android:shape="rectangle">
+                    <solid android:color="@color/accent_green" />
+                    <corners android:radius="@dimen/radius_pill" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#00000000" />
+            <corners android:radius="@dimen/radius_sm" />
+        </shape>
+    </item>
+</selector>

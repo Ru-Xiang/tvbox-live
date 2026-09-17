@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 应用主背景：深邃对角渐变，衬托液态玻璃面板 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:startColor="@color/bg_grad_top"
+                android:centerColor="@color/bg_base"
+                android:endColor="@color/bg_grad_bottom"
+                android:angle="135" />
+        </shape>
+    </item>
+    <!-- 顶部柔光，营造玻璃下的环境光 -->
+    <item>
+        <shape android:shape="rectangle">
+            <gradient
+                android:startColor="#260A84FF"
+                android:endColor="#00000000"
+                android:angle="270"
+                android:type="linear" />
+        </shape>
+    </item>
+</layer-list>

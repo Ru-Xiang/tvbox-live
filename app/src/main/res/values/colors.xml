@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ===== 液态玻璃风格基础色板 ===== -->
+    <!-- 背景：深邃渐变底 -->
+    <color name="bg_base">#0B0B14</color>
+    <color name="bg_grad_top">#15152B</color>
+    <color name="bg_grad_bottom">#070710</color>
+
+    <!-- 玻璃面板（半透明叠加 + 细描边） -->
+    <color name="glass_fill">#26FFFFFF</color>          <!-- 15% 白，毛玻璃主体 -->
+    <color name="glass_dialog_fill">#D11A1A2B</color>    <!-- 82% 深色，对话框玻璃底（透出后方画面） -->
+    <color name="glass_sheet_fill">#B315151F</color>     <!-- 70% 深色，覆盖层/面板玻璃底 -->
+    <color name="glass_fill_strong">#3DFFFFFF</color>   <!-- 24% 白，强玻璃 -->
+    <color name="glass_fill_dim">#14FFFFFF</color>      <!-- 8% 白，弱玻璃 -->
+    <color name="glass_stroke">#33FFFFFF</color>        <!-- 玻璃高光描边 -->
+    <color name="glass_stroke_soft">#1FFFFFFF</color>
+
+    <!-- 强调色（Apple 风格鲜亮） -->
+    <color name="accent_blue">#0A84FF</color>
+    <color name="accent_purple">#7C3AED</color>
+    <color name="accent_purple_light">#A78BFA</color>
+    <color name="accent_green">#30D158</color>
+    <color name="accent_orange">#FF9F0A</color>
+    <color name="accent_red">#FF453A</color>
+
+    <!-- 文本 -->
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#B8BCC8</color>
+    <color name="text_tertiary">#80FFFFFF</color>
+    <color name="text_quaternary">#4DFFFFFF</color>
+
+    <!-- 控件聚焦/选中 -->
+    <color name="focus_fill">#5C0A84FF</color>
+    <color name="focus_stroke">#FFFFFF</color>
+    <color name="selected_tint">#330A84FF</color>
+</resources>

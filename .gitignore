@@ -1,0 +1,32 @@
+# ===== 构建产物 =====
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+build/
+app/build/
+.gradle/
+
+# ===== 本地配置 =====
+local.properties
+
+# ===== 签名密钥（切勿提交！）=====
+*.jks
+*.keystore
+keystore.properties
+
+# ===== 本地缓存 / 工具 =====
+.gradle-cache/
+.history/
+.metals/
+.vscode/
+.codebuddy/
+
+# ===== IDE =====
+.idea/
+*.iml
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/

@@ -1,0 +1,794 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 直播设置界面布局 - 适配安卓电视遥控器操作 -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_app_gradient">
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scrollbars="none"
+        android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:paddingStart="40dp"
+        android:paddingTop="30dp"
+        android:paddingEnd="40dp"
+        android:paddingBottom="40dp">
+
+        <!-- 标题 -->
+        <TextView
+            style="@style/Text.LargeTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="直播设置" />
+
+        <!-- ============ IPTV 源设置 ============ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="30dp"
+            android:text="📡 直播源配置"
+            android:textColor="@color/accent_purple_light"
+            android:textSize="18sp"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.02" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/glass_stroke_soft" />
+
+        <!-- IP 版本 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:text="IP 版本"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="自动=IPv4/IPv6 混合；仅 IPv4/仅 IPv6 将只保留对应线路并生成对应本地列表（IPv6 需网络支持）"
+            android:textColor="@color/text_quaternary"
+            android:textSize="12sp" />
+
+        <Spinner
+            android:id="@+id/sp_ip_version"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:layout_marginTop="6dp"
+            android:background="@drawable/glass_input"
+            android:focusable="true"
+            android:focusableInTouchMode="false" />
+
+        <!-- 自动更新 -->
+        <CheckBox
+            android:id="@+id/cb_auto_update"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:focusable="true"
+            android:text="自动更新直播源"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <!-- 更新间隔 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="更新间隔"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_update_interval"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_update_interval_value"
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- EPG -->
+        <CheckBox
+            android:id="@+id/cb_enable_epg"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:focusable="true"
+            android:text="启用 EPG 节目单（长按 OK 查看）"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <!-- 最大线路数 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="单频道最多线路"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_urls_limit"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_urls_limit_value"
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- 频道列表模板 -->
+        <CheckBox
+            android:id="@+id/cb_template_enabled"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:checked="true"
+            android:focusable="true"
+            android:text="启用频道列表模板（按模板过滤并排序）"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="EPG 地址、模板地址、订阅列表、改名规则、自定义源等地址项请使用「扫码用手机配置」设置"
+            android:textColor="@color/text_quaternary"
+            android:textSize="12sp" />
+
+        <!-- 上次更新时间 -->
+        <TextView
+            android:id="@+id/tv_last_update_time"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="@color/text_quaternary"
+            android:textSize="13sp" />
+
+        <!-- 操作按钮 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_refresh_source"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="10dp"
+                android:layout_weight="1"
+                android:background="@drawable/btn_primary"
+                android:focusable="true"
+                android:text="刷新直播源"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/btn_add_custom_source"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:background="@drawable/btn_secondary"
+                android:focusable="true"
+                android:text="添加自定义源"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <!-- 扫码配置 -->
+        <Button
+            android:id="@+id/btn_scan_config"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/btn_primary"
+            android:focusable="true"
+            android:text="扫码用手机配置"
+            android:textColor="#FFFFFF"
+            android:textSize="15sp" />
+
+        <!-- 多仓链接配置 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_multi_repo_config"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="10dp"
+                android:layout_weight="1"
+                android:background="@drawable/btn_secondary"
+                android:focusable="true"
+                android:text="多仓链接配置"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp" />
+
+            <TextView
+                android:id="@+id/tv_multi_repo_summary"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:gravity="center_vertical"
+                android:textColor="@color/text_quaternary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- ============ 测速设置 ============ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:text="⚡ 测速配置"
+            android:textColor="@color/accent_purple_light"
+            android:textSize="18sp"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.02" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/glass_stroke_soft" />
+
+        <!-- 启用测速 -->
+        <CheckBox
+            android:id="@+id/cb_speed_test_enabled"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:focusable="true"
+            android:text="启用直播源测速"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <!-- 测速模式 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="测速时机"
+            android:textColor="@color/text_tertiary"
+            android:textSize="14sp" />
+
+        <RadioGroup
+            android:id="@+id/rg_speed_test_mode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/rb_manual_only"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:focusable="true"
+                android:text="仅手动测速（在下方点击立即测速）"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp" />
+
+            <RadioButton
+                android:id="@+id/rb_periodic_prompt"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:focusable="true"
+                android:text="周期性：超过周期后打开应用时提示测速"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp" />
+        </RadioGroup>
+
+        <!-- 测速周期 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="测速周期"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_speed_test_interval"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_speed_test_interval_value"
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- 测速超时 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="测速超时"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_speed_test_timeout"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_timeout_value"
+                android:layout_width="60dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- 并发数 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="并发线程"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_concurrency"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_concurrency_value"
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- 按速度排序 -->
+        <CheckBox
+            android:id="@+id/cb_sort_by_speed"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:focusable="true"
+            android:text="按速度排序播放源（最快优先）"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <!-- 自动移除不可用线路 -->
+        <CheckBox
+            android:id="@+id/cb_filter_unavailable"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:focusable="true"
+            android:text="测速完成后自动移除不可用线路"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <!-- 最低速度 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="最低速度"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_min_speed"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_min_speed_value"
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <!-- 上次测速时间 -->
+        <TextView
+            android:id="@+id/tv_last_speed_test_time"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="@color/text_quaternary"
+            android:textSize="13sp" />
+
+        <!-- 测速操作按钮 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btn_start_speed_test"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginEnd="10dp"
+                android:layout_weight="1"
+                android:background="@drawable/btn_success"
+                android:focusable="true"
+                android:text="立即测速"
+                android:textColor="#FFFFFF"
+                android:textSize="15sp" />
+
+            <Button
+                android:id="@+id/btn_clear_speed_cache"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:background="@drawable/btn_secondary"
+                android:focusable="true"
+                android:text="清除测速缓存"
+                android:textColor="@color/text_secondary"
+                android:textSize="15sp" />
+        </LinearLayout>
+
+        <!-- ============ 线路管理 ============ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:text="线路管理"
+            android:textColor="@color/accent_purple_light"
+            android:textSize="18sp"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.02" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/glass_stroke_soft" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:text="在播放界面长按左/右方向键，或长按频道列表中的频道，可打开该频道的线路列表，对单条线路进行「置顶」或「删除并加入黑名单」。线路黑名单仅在所属频道内生效。"
+            android:textColor="@color/text_tertiary"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/tv_blacklist_count"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:textColor="@color/text_quaternary"
+            android:textSize="13sp" />
+
+        <Button
+            android:id="@+id/btn_clear_blacklist"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="12dp"
+            android:background="@drawable/btn_secondary"
+            android:focusable="true"
+            android:text="重置线路（清空黑名单与置顶）"
+            android:textColor="@color/text_secondary"
+            android:textSize="15sp" />
+
+        <!-- ============ 播放器设置 ============ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:text="🎬 播放器设置"
+            android:textColor="@color/accent_purple_light"
+            android:textSize="18sp"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.02" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/glass_stroke_soft" />
+
+        <!-- 播放器类型和缩放模式 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:orientation="horizontal">
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginEnd="10dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="播放器类型"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="14sp" />
+
+                <Spinner
+                    android:id="@+id/sp_player_type"
+                    android:layout_width="match_parent"
+                    android:layout_height="44dp"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/glass_input"
+                    android:focusable="true" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="10dp"
+                android:layout_weight="1"
+                android:orientation="vertical">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="缩放模式"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="14sp" />
+
+                <Spinner
+                    android:id="@+id/sp_scale_mode"
+                    android:layout_width="match_parent"
+                    android:layout_height="44dp"
+                    android:layout_marginTop="6dp"
+                    android:background="@drawable/glass_input"
+                    android:focusable="true" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- 显示设置 -->
+        <CheckBox
+            android:id="@+id/cb_show_channel_info"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:focusable="true"
+            android:text="显示频道信息栏"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="信息栏时长"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_info_duration"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+        </LinearLayout>
+
+        <CheckBox
+            android:id="@+id/cb_show_speed_info"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:focusable="true"
+            android:text="显示测速信息"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <!-- 播放超时换源 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="播放超时换源"
+                android:textColor="@color/text_tertiary"
+                android:textSize="14sp" />
+
+            <SeekBar
+                android:id="@+id/sb_play_timeout"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_play_timeout_value"
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="单条线路在该时长内未起播则自动切换下一条；0 表示关闭"
+            android:textColor="@color/text_tertiary"
+            android:textSize="12sp" />
+
+        <!--============ 系统 ============ -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:text="⚙️ 系统"
+            android:textColor="@color/accent_purple_light"
+            android:textSize="18sp"
+            android:fontFamily="sans-serif-medium"
+            android:letterSpacing="0.02" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="10dp"
+            android:background="@color/glass_stroke_soft" />
+
+        <CheckBox
+            android:id="@+id/cb_boot_startup"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="14dp"
+            android:focusable="true"
+            android:text="开机自动启动"
+            android:textColor="@color/text_secondary"
+            android:textSize="16sp" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="开启后设备启动完成时自动进入直播；部分系统需在「自启动管理」中一并允许本应用"
+            android:textColor="@color/text_tertiary"
+            android:textSize="12sp" />
+
+        <!-- 底部间距 -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="60dp" />
+
+    </LinearLayout>
+    </ScrollView>
+
+    <!-- 测速状态栏 - 右上角玻璃药丸（与播放页保持一致，不随内容滚动） -->
+    <LinearLayout
+        android:id="@+id/speed_test_bar"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="24dp"
+        android:layout_marginEnd="24dp"
+        android:background="@drawable/glass_pill"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="18dp"
+        android:paddingTop="10dp"
+        android:paddingEnd="18dp"
+        android:paddingBottom="10dp"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:id="@+id/speed_test_progress"
+            style="@android:style/Widget.ProgressBar.Horizontal"
+            android:layout_width="120dp"
+            android:layout_height="6dp"
+            android:progressTint="@color/accent_green" />
+
+        <TextView
+            android:id="@+id/tv_speed_test_info"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:ellipsize="end"
+            android:fontFamily="sans-serif"
+            android:maxWidth="260dp"
+            android:singleLine="true"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+</FrameLayout>

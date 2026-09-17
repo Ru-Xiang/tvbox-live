@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 主按钮：玻璃质感蓝/紫，聚焦放大高光描边 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true">
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <gradient android:startColor="#FF2E9BFF" android:endColor="#FF7C3AED" android:angle="135" />
+                    <corners android:radius="@dimen/radius_sm" />
+                    <stroke android:width="2dp" android:color="#FFFFFF" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+    <item android:state_pressed="true">
+        <shape android:shape="rectangle">
+            <gradient android:startColor="#FF0A6FD0" android:endColor="#FF5B21B6" android:angle="135" />
+            <corners android:radius="@dimen/radius_sm" />
+        </shape>
+    </item>
+    <item>
+        <layer-list>
+            <item>
+                <shape android:shape="rectangle">
+                    <gradient android:startColor="#FF0A84FF" android:endColor="#FF7C3AED" android:angle="135" />
+                    <corners android:radius="@dimen/radius_sm" />
+                </shape>
+            </item>
+            <item>
+                <shape android:shape="rectangle">
+                    <gradient android:startColor="#33FFFFFF" android:endColor="#00FFFFFF" android:angle="270" />
+                    <corners android:radius="@dimen/radius_sm" />
+                </shape>
+            </item>
+        </layer-list>
+    </item>
+</selector>

@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ===== 基础主题：液态玻璃深色风格 ===== -->
+    <style name="Theme.TVBoxLive" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@drawable/bg_app_gradient</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="colorPrimary">@color/accent_blue</item>
+        <item name="colorPrimaryDark">@color/bg_grad_bottom</item>
+        <item name="colorAccent">@color/accent_green</item>
+        <item name="android:navigationBarColor">@color/bg_grad_bottom</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <!-- 圆角风格的对话框与窗口动效 -->
+        <item name="android:windowAnimationStyle">@style/WindowAnim.Apple</item>
+        <item name="alertDialogTheme">@style/Theme.TVBoxLive.Dialog</item>
+    </style>
+
+    <!-- 全屏主题 - 播放器界面 -->
+    <style name="Theme.TVBoxLive.Fullscreen">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+
+    <!-- ===== Apple 风格圆角玻璃对话框 ===== -->
+    <style name="Theme.TVBoxLive.Dialog" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/glass_dialog_bg</item>
+        <item name="android:windowAnimationStyle">@style/DialogAnim.Apple</item>
+        <!-- 降低遮罩并允许透出背景，配合半透底色形成毛玻璃观感 -->
+        <item name="android:backgroundDimAmount">0.35</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="colorAccent">@color/accent_blue</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="buttonBarPositiveButtonStyle">@style/AppleDialogButton</item>
+        <item name="buttonBarNegativeButtonStyle">@style/AppleDialogButton</item>
+        <item name="buttonBarNeutralButtonStyle">@style/AppleDialogButton</item>
+    </style>
+
+    <style name="AppleDialogButton" parent="Widget.AppCompat.Button.Borderless.Colored">
+        <item name="android:textColor">@color/accent_blue</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:letterSpacing">0.01</item>
+    </style>
+
+    <!-- ===== 窗口/对话框动效（Apple 风格：平滑缩放淡入） ===== -->
+    <style name="WindowAnim.Apple" parent="">
+        <item name="android:activityOpenEnterAnimation">@anim/apple_activity_enter</item>
+        <item name="android:activityOpenExitAnimation">@anim/apple_activity_exit</item>
+        <item name="android:activityCloseEnterAnimation">@anim/apple_activity_enter</item>
+        <item name="android:activityCloseExitAnimation">@anim/apple_activity_exit</item>
+    </style>
+
+    <style name="DialogAnim.Apple" parent="">
+        <item name="android:windowEnterAnimation">@anim/apple_dialog_enter</item>
+        <item name="android:windowExitAnimation">@anim/apple_dialog_exit</item>
+    </style>
+
+    <!-- ===== Apple 风格文字层级 ===== -->
+    <style name="Text.LargeTitle" parent="">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">30sp</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:letterSpacing">0.01</item>
+    </style>
+
+    <style name="Text.Title" parent="">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">22sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:letterSpacing">0.01</item>
+    </style>
+
+    <style name="Text.Headline" parent="">
+        <item name="android:textColor">@color/accent_purple_light</item>
+        <item name="android:textSize">18sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+        <item name="android:letterSpacing">0.02</item>
+    </style>
+
+    <style name="Text.Body" parent="">
+        <item name="android:textColor">@color/text_secondary</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:fontFamily">sans-serif</item>
+    </style>
+
+    <style name="Text.Caption" parent="">
+        <item name="android:textColor">@color/text_tertiary</item>
+        <item name="android:textSize">12sp</item>
+        <item name="android:fontFamily">sans-serif</item>
+    </style>
+</resources>

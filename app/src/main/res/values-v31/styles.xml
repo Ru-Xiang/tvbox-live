@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      Android 12 (API 31) 起支持窗口背后实时高斯模糊。
+      在此覆盖对话框主题，开启真实毛玻璃（frosted glass）效果；
+      低版本自动沿用 values/styles.xml 中的半透明玻璃底，不受影响。
+    -->
+    <style name="Theme.TVBoxLive.Dialog" parent="Theme.AppCompat.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/glass_dialog_bg</item>
+        <item name="android:windowAnimationStyle">@style/DialogAnim.Apple</item>
+        <item name="android:backgroundDimAmount">0.25</item>
+        <item name="android:windowIsTranslucent">true</item>
+        <!-- 真实背景模糊半径：形成 Apple 风格磨砂玻璃 -->
+        <item name="android:windowBlurBehindEnabled">true</item>
+        <item name="android:windowBackgroundBlurRadius">48dp</item>
+        <item name="android:windowBlurBehindRadius">48dp</item>
+        <item name="colorAccent">@color/accent_blue</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="buttonBarPositiveButtonStyle">@style/AppleDialogButton</item>
+        <item name="buttonBarNegativeButtonStyle">@style/AppleDialogButton</item>
+        <item name="buttonBarNeutralButtonStyle">@style/AppleDialogButton</item>
+    </style>
+
+</resources>
