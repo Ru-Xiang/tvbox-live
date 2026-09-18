@@ -1264,50 +1264,32 @@ public class LivePlayActivity extends AppCompatActivity {
     private void updateCornerSpeed() {
         if (tvCornerSpeed == null || !isAlive()) return;
         try {
-            LiveChannel ch = channelManager != null ? channelManager.getCurrentChannel() : null;
             boolean showSpeed = Hawk.get(HawkConfig.LIVE_SHOW_SPEED_INFO, true);
-            if (!showSpeed || ch == null) {
+            // 只显示实时吞吐：没有播放或取不到估算值时直接隐藏，
+            // 不再回退到测速缓存值（那个值长期不变，容易被误认为是当前速度）
+            Double live = showSpeed ? getCurrentLiveSpeedKbps() : null;
+
+            // 左侧频道列表展开/底部信息栏显示时让位，避免文字压在面板上
+            boolean obscured = isChannelListVisible || isInfoPanelVisible();
+
+            if (live == null || live <= 0 || obscured) {
                 tvCornerSpeed.setVisibility(View.GONE);
                 return;
             }
-
-            Double live = getCurrentLiveSpeedKbps();
-            String speedText;
-            if (live != null) {
-                // 实时吞吐加 ↓ 前缀，与测速值区分
-                speedText = "↓ " + formatSpeedKbps(live);
-            } else {
-                Double cached = getSourceSpeedKbps(ch);
-                if (cached == null) {
-                    // 区分两种情况：流式协议（RTSP/RTMP）天生无法测速；其余是尚未测过
-                    String tip = isStreamProtocol(ch.getCurrentSourceUrl()) ? "流式协议" : "未测速";
-                    tvCornerSpeed.setText("线路 " + (ch.getSourceIndex() + 1)
-                            + "/" + Math.max(1, ch.getSourceCount()) + " · " + tip);
-                    tvCornerSpeed.setTextColor(getResources().getColor(R.color.text_tertiary));
-                    tvCornerSpeed.setVisibility(View.VISIBLE);
-                    return;
-                }
-                if (cached <= 0) {
-                    // 测过但不可用（0）：明确区分于"未测速"，避免误以为没测过
-                    tvCornerSpeed.setText("线路 " + (ch.getSourceIndex() + 1)
-                            + "/" + Math.max(1, ch.getSourceCount()) + " · 不可用");
-                    tvCornerSpeed.setTextColor(getResources().getColor(R.color.text_tertiary));
-                    tvCornerSpeed.setVisibility(View.VISIBLE);
-                    return;
-                }
-                // 该线路自己的测速值，切源即随之变化
-                speedText = formatSpeedKbps(cached);
-            }
-
-            tvCornerSpeed.setText("线路 " + (ch.getSourceIndex() + 1) + "/"
-                    + Math.max(1, ch.getSourceCount()) + " · " + speedText);
-            tvCornerSpeed.setTextColor(getResources().getColor(R.color.accent_green));
+            tvCornerSpeed.setText(formatSpeedKbps(live));
             tvCornerSpeed.setVisibility(View.VISIBLE);
         } catch (Throwable t) {
             // 网速显示属装饰性 UI，任何异常都不得影响播放
-            Timber.w(t, "更新右下角网速失败");
+            Timber.w(t, "更新实时网速失败");
         }
     }
+
+    /** 底部频道信息栏是否正在显示（它与网速标签同处底部会重叠） */
+    private boolean isInfoPanelVisible() {
+        return channelInfoPanel != null && channelInfoPanel.getVisibility() == View.VISIBLE;
+    }
+
+
 
     /** 播放中的实时吞吐（KB/s）；无播放或估算不可用时返回 null */
     private Double getCurrentLiveSpeedKbps() {
@@ -1580,6 +1562,8 @@ public class LivePlayActivity extends AppCompatActivity {
             channelListView.scheduleLayoutAnimation();
         }
         isChannelListVisible = true;
+        // 列表盖住左下角，网速标签需要让位
+        updateCornerSpeed();
         // 聚焦到频道列表，方便遥控器操作
         channelListView.post(() -> {
             RecyclerView.ViewHolder vh = channelListView.findViewHolderForAdapterPosition(
@@ -1611,6 +1595,8 @@ public class LivePlayActivity extends AppCompatActivity {
             channelListPanel.setVisibility(View.GONE);
         }
         isChannelListVisible = false;
+        // 列表收起后左下角重新可用
+        updateCornerSpeed();
     }
 
     private void showLoading(boolean show) {

@@ -220,23 +220,21 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- 当前线路网速 - 右下角常驻玻璃药丸 -->
+    <!--
+      当前实时网速 - 左下角。
+      无底色、白色 70% 透明（#B3 = 179 ≈ 70%），只在真正播放时显示实时吞吐，
+      避免测速缓存值（可能长期不变）制造"速度一直一样"的错觉。
+    -->
     <TextView
         android:id="@+id/tv_corner_speed"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom|end"
-        android:layout_marginEnd="28dp"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="28dp"
         android:layout_marginBottom="28dp"
-        android:background="@drawable/glass_pill"
         android:fontFamily="sans-serif-medium"
-        android:gravity="center"
-        android:paddingStart="16dp"
-        android:paddingTop="8dp"
-        android:paddingEnd="16dp"
-        android:paddingBottom="8dp"
         android:singleLine="true"
-        android:textColor="@color/accent_green"
+        android:textColor="#B3FFFFFF"
         android:textSize="13sp"
         android:visibility="gone" />
 
