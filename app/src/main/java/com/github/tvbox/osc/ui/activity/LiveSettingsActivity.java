@@ -600,14 +600,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
             final android.widget.EditText edit = new android.widget.EditText(this);
             edit.setSingleLine(true);
             edit.setText(Hawk.get(com.github.tvbox.osc.util.HawkConfig.UPDATE_MIRROR_PREFIX, ""));
-            edit.setHint("https://gh-proxy.com/");
+            edit.setHint(com.github.tvbox.osc.util.HawkConfig.DEFAULT_UPDATE_MIRROR);
             edit.setSelection(edit.getText().length());
 
             new android.app.AlertDialog.Builder(this)
                     .setTitle("更新镜像（国内加速）")
                     .setMessage("填写中转镜像前缀，会拼在 GitHub 链接前使用。\n"
                             + "留空＝自动，会依次尝试直连与内置镜像。\n\n"
-                            + "常用：\nhttps://gh-proxy.com/\nhttps://ghfast.top/\nhttps://mirror.ghproxy.com/")
+                            + "默认：" + com.github.tvbox.osc.util.HawkConfig.DEFAULT_UPDATE_MIRROR + "\n"
+                            + "其他常用：\nhttps://gh-proxy.com/\nhttps://ghfast.top/\nhttps://mirror.ghproxy.com/")
                     .setView(edit)
                     .setNegativeButton("取消", null)
                     .setPositiveButton("保存", (d, w) -> {

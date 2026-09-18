@@ -240,6 +240,10 @@ public class App extends Application {
         putDefault(HawkConfig.LIVE_SHOW_SPEED_INFO, true);
         // 开机自启默认关闭
         putDefault(HawkConfig.LIVE_BOOT_STARTUP, false);
+
+        // 应用更新默认使用 gh-proxy.org 中转（国内直连 GitHub 经常超时）；
+        // 用户可在设置页/手机配置页清空恢复"自动依次尝试"
+        putDefault(HawkConfig.UPDATE_MIRROR_PREFIX, HawkConfig.DEFAULT_UPDATE_MIRROR);
     }
 
     /**

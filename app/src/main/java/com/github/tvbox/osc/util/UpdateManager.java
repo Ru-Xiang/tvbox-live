@@ -3,6 +3,7 @@ package com.github.tvbox.osc.util;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
 
 import androidx.core.content.FileProvider;
 
@@ -47,22 +48,22 @@ public final class UpdateManager {
      */
     private static final String[] API_MIRRORS = {
             "",                               // 直连 api.github.com
+            "https://gh-proxy.org/",          // 默认镜像，国内表现较好
             "https://gh-proxy.com/",
             "https://ghproxy.net/",
             "https://ghfast.top/",
             "https://mirror.ghproxy.com/",
-            "https://gh-proxy.org/",
             "https://gh.llkk.cc/",
     };
 
     /** APK 下载用的中转镜像（原理同上，拼在 github.com 下载链接前） */
     private static final String[] DOWNLOAD_MIRRORS = {
             "",                               // 直连
+            "https://gh-proxy.org/",          // 默认镜像
             "https://gh-proxy.com/",
             "https://ghfast.top/",
             "https://mirror.ghproxy.com/",
             "https://hub.gitmirror.com/",
-            "https://gh-proxy.org/",
             "https://gh.llkk.cc/",
     };
 
@@ -460,18 +461,112 @@ public final class UpdateManager {
      */
     public static void installApk(Context ctx, File apk) {
         try {
-            Intent intent = new Intent(Intent.ACTION_VIEW);
-            Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", apk);
-            intent.setDataAndType(uri, "application/vnd.android.package-archive");
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            ctx.startActivity(intent);
+            if (apk == null || !apk.exists()) {
+                ToastUtil.show(ctx, "安装包不存在，请重新下载");
+                return;
+            }
+            String path = apk.getAbsolutePath();
+            com.github.tvbox.osc.util.RunLog.i("准备安装 APK: " + path);
+
+            // Android 8+ 需要"允许安装未知应用"授权，未授权则先引导去设置页
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    && !ctx.getPackageManager().canRequestPackageInstalls()) {
+                com.github.tvbox.osc.util.RunLog.i("缺少未知来源安装授权，跳转设置页");
+                try {
+                    Intent i = new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            Uri.parse("package:" + ctx.getPackageName()));
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    ctx.startActivity(i);
+                    ToastUtil.show(ctx, "请开启「允许安装未知应用」，然后回到文件管理器安装：" + path);
+                } catch (Throwable t) {
+                    fallbackManual(ctx, apk, "无法打开授权设置页");
+                }
+                return;
+            }
+
+            boolean ok = tryInstall(ctx, apk);
+            if (!ok) {
+                // 最后再试一次系统安装专用 Action：部分电视 ROM 的 PackageInstaller
+                // 只注册了它，而不接 ACTION_VIEW
+                ok = tryInstallWithAction(ctx, apk, Intent.ACTION_INSTALL_PACKAGE);
+            }
+            if (ok) {
+                com.github.tvbox.osc.util.RunLog.i("已唤起安装器");
+            } else {
+                fallbackManual(ctx, apk, "未找到可用的安装器");
+            }
         } catch (Throwable t) {
             Timber.w(t, "唤起安装器失败");
-            try {
-                ToastUtil.show(ctx, "无法打开安装器，请到文件管理器手动安装");
-            } catch (Throwable ignore) {
+            fallbackManual(ctx, apk, "安装失败：" + describe(t));
+        }
+    }
+
+    /**
+     * 依次尝试不同 URI 方案唤起安装器。
+     *
+     * <p><b>关键点：</b>Android 7.0（API 24）是分水岭——
+     * 7.0+ 禁止对外暴露 file://（会抛 FileUriExposedException），必须用 FileProvider 的 content://；
+     * 而 7.0 以下的老安装器（如 Android 6 的小米盒子）多数<b>只认 file://</b>，
+     * 给 content:// 会因为没有应用接得住而直接抛出 ActivityNotFoundException。
+     * 这里按版本选主方案，再交叉回退一次以兼容行为相反的定制 ROM。
+     */
+    private static boolean tryInstall(Context ctx, File apk) {
+        boolean nougat = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N;
+        if (launchInstall(ctx, apk, nougat)) return true;
+        // 交叉回退：部分 ROM 的接受能力与版本不匹配
+        return launchInstall(ctx, apk, !nougat);
+    }
+
+    /**
+     * @param useFileProvider true 用 content://（Android 7+ 必需），false 用 file://（老系统必需）
+     */
+    private static boolean launchInstall(Context ctx, File apk, boolean useFileProvider, String action) {
+        try {
+            Uri uri = useFileProvider
+                    ? FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", apk)
+                    : Uri.fromFile(apk);
+            Intent intent = new Intent(action);
+            intent.setDataAndType(uri, "application/vnd.android.package-archive");
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+            // 先查有没有应用能接这个 Intent，避免 startActivity 直接抛
+            // ActivityNotFoundException（那正是"无法打开安装器"的真正来源）
+            java.util.List<android.content.pm.ResolveInfo> list =
+                    ctx.getPackageManager().queryIntentActivities(intent, 0);
+            if (list == null || list.isEmpty()) {
+                com.github.tvbox.osc.util.RunLog.i("无应用可处理安装 Intent，方案="
+                        + (useFileProvider ? "content://" : "file://"));
+                return false;
             }
+            ctx.startActivity(intent);
+            return true;
+        } catch (Throwable t) {
+            com.github.tvbox.osc.util.RunLog.i("唤起安装器异常，方案="
+                    + (useFileProvider ? "content://" : "file://") + " → " + describe(t));
+            return false;
+        }
+    }
+
+    /** 用指定 Action（如系统专用的 ACTION_INSTALL_PACKAGE）再试一次 */
+    private static boolean tryInstallWithAction(Context ctx, File apk, String action) {
+        boolean nougat = Build.VERSION.SDK_INT >= Build.VERSION_CODES.N;
+        return launchInstall(ctx, apk, nougat, action)
+                || launchInstall(ctx, apk, !nougat, action);
+    }
+
+    /** @param useFileProvider true 用 content://（Android 7+ 必需），false 用 file://（老系统必需） */
+    private static boolean launchInstall(Context ctx, File apk, boolean useFileProvider) {
+        return launchInstall(ctx, apk, useFileProvider, Intent.ACTION_VIEW);
+    }
+
+    /** 兜底提示：给出真实文件路径，方便手工安装 */
+    private static void fallbackManual(Context ctx, File apk, String reason) {
+        String path = apk == null ? "" : apk.getAbsolutePath();
+        com.github.tvbox.osc.util.RunLog.i("安装失败: " + reason + " path=" + path);
+        try {
+            ToastUtil.show(ctx, reason + "，文件已保存到：\n" + path);
+        } catch (Throwable ignore) {
         }
     }
 }

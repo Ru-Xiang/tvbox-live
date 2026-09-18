@@ -252,7 +252,8 @@ public class ConfigHttpServer extends NanoHTTPD {
 
                 + section("应用更新")
                 + field("GitHub 中转镜像（国内加速，留空自动）",
-                        input("update_mirror", "text", esc(updateMirror), "https://gh-proxy.com/"))
+                        input("update_mirror", "text", esc(updateMirror),
+                                com.github.tvbox.osc.util.HawkConfig.DEFAULT_UPDATE_MIRROR))
 
                 + section("频道模板与线路")
                 + checkbox("template_enabled", "启用频道列表模板（按模板过滤排序）", templateEnabled)
