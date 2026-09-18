@@ -166,6 +166,11 @@ public class ConfigHttpServer extends NanoHTTPD {
         }
         // 系统：开机自启
         Hawk.put(HawkConfig.LIVE_BOOT_STARTUP, p.containsKey("boot_startup"));
+
+        // 应用更新：中转镜像（国内加速）
+        String mirror = p.get("update_mirror");
+        Hawk.put(HawkConfig.UPDATE_MIRROR_PREFIX, mirror == null ? "" : mirror.trim());
+
         Timber.i("已通过扫码网页更新配置");
     }
 
@@ -199,6 +204,7 @@ public class ConfigHttpServer extends NanoHTTPD {
         String subscribeUrl = Hawk.get(HawkConfig.IPTV_SUBSCRIBE_LIST_URL, HawkConfig.DEFAULT_SUBSCRIBE_LIST_URL);
         String aliasUrl = Hawk.get(HawkConfig.IPTV_ALIAS_URL, HawkConfig.DEFAULT_ALIAS_URL);
         String multiRepoUrls = jsonToLines(Hawk.get(HawkConfig.IPTV_MULTI_REPO_URLS, ""));
+        String updateMirror = Hawk.get(HawkConfig.UPDATE_MIRROR_PREFIX, "");
         boolean templateEnabled = Hawk.get(HawkConfig.IPTV_TEMPLATE_ENABLED, true);
         String templateUrl = Hawk.get(HawkConfig.IPTV_TEMPLATE_URL, "");
         int urlsLimit = Hawk.get(HawkConfig.IPTV_URLS_LIMIT, HawkConfig.DEFAULT_URLS_LIMIT);
@@ -243,6 +249,10 @@ public class ConfigHttpServer extends NanoHTTPD {
                         input("alias_url", "text", esc(aliasUrl), "https://.../alias.txt"))
                 + checkbox("auto_update", "自动更新直播源", autoUpdate)
                 + field("更新间隔（小时）", input("update_interval", "number", String.valueOf(updateInterval), "12"))
+
+                + section("应用更新")
+                + field("GitHub 中转镜像（国内加速，留空自动）",
+                        input("update_mirror", "text", esc(updateMirror), "https://gh-proxy.com/"))
 
                 + section("频道模板与线路")
                 + checkbox("template_enabled", "启用频道列表模板（按模板过滤排序）", templateEnabled)

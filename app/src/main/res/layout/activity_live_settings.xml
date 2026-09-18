@@ -783,6 +783,17 @@
             android:textColor="#FFFFFF"
             android:textSize="15sp" />
 
+        <Button
+            android:id="@+id/btn_update_mirror"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:layout_marginTop="10dp"
+            android:background="@drawable/btn_secondary"
+            android:focusable="true"
+            android:text="更新镜像（国内加速）"
+            android:textColor="@color/text_secondary"
+            android:textSize="15sp" />
+
         <!-- 底部间距 -->
         <View
             android:layout_width="match_parent"

@@ -95,6 +95,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
     // ============ 应用更新 ============
     private TextView tvUpdateState;
     private Button btnCheckUpdate;
+    private Button btnUpdateMirror;
 
     // ============ 播放器设置 ============
     private Spinner spPlayerType;
@@ -183,6 +184,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
         // 应用更新（GitHub Releases）
         tvUpdateState = findViewById(R.id.tv_update_state);
         btnCheckUpdate = findViewById(R.id.btn_check_update);
+        btnUpdateMirror = findViewById(R.id.btn_update_mirror);
         if (tvUpdateState != null) {
             tvUpdateState.setText("当前版本：" + com.github.tvbox.osc.BuildConfig.VERSION_NAME
                     + "（仓库 " + com.github.tvbox.osc.util.UpdateManager.GITHUB_OWNER + "/"
@@ -455,6 +457,9 @@ public class LiveSettingsActivity extends AppCompatActivity {
         if (btnCheckUpdate != null) {
             btnCheckUpdate.setOnClickListener(v -> checkAppUpdate(true));
         }
+        if (btnUpdateMirror != null) {
+            btnUpdateMirror.setOnClickListener(v -> showUpdateMirrorDialog());
+        }
 
         // 清空线路黑名单（恢复所有被删除的线路及自定义置顶顺序）
         if (btnClearBlacklist != null) {
@@ -586,6 +591,42 @@ public class LiveSettingsActivity extends AppCompatActivity {
                         if (manual) ToastUtil.show(LiveSettingsActivity.this, message);
                     }
                 });
+    }
+
+    /** 设置 GitHub 中转镜像：国内网络下直连常常超时，可指定一个加速前缀 */
+    private void showUpdateMirrorDialog() {
+        try {
+            if (isFinishing() || isDestroyed()) return;
+            final android.widget.EditText edit = new android.widget.EditText(this);
+            edit.setSingleLine(true);
+            edit.setText(Hawk.get(com.github.tvbox.osc.util.HawkConfig.UPDATE_MIRROR_PREFIX, ""));
+            edit.setHint("https://gh-proxy.com/");
+            edit.setSelection(edit.getText().length());
+
+            new android.app.AlertDialog.Builder(this)
+                    .setTitle("更新镜像（国内加速）")
+                    .setMessage("填写中转镜像前缀，会拼在 GitHub 链接前使用。\n"
+                            + "留空＝自动，会依次尝试直连与内置镜像。\n\n"
+                            + "常用：\nhttps://gh-proxy.com/\nhttps://ghfast.top/\nhttps://mirror.ghproxy.com/")
+                    .setView(edit)
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("保存", (d, w) -> {
+                        try {
+                            String value = edit.getText() == null ? "" : edit.getText().toString();
+                            Hawk.put(com.github.tvbox.osc.util.HawkConfig.UPDATE_MIRROR_PREFIX, value);
+                            String tip = value.trim().isEmpty() ? "已恢复自动选择镜像" : "已使用镜像：" + value.trim();
+                            ToastUtil.show(this, tip);
+                            if (tvUpdateState != null) {
+                                tvUpdateState.setText(tip);
+                            }
+                        } catch (Throwable ignore) {
+                        }
+                    })
+                    .create()
+                    .show();
+        } catch (Throwable ignore) {
+            // 弹窗失败不影响其他设置项
+        }
     }
 
     private void updateMultiRepoSummary() {

@@ -40,6 +40,35 @@ public final class UpdateManager {
     private static final String LATEST_RELEASE_API =
             "https://api.github.com/repos/" + GITHUB_OWNER + "/" + GITHUB_REPO + "/releases/latest";
 
+    /**
+     * GitHub 在国内往往连不上/极慢，这里内置若干<b>公开中转镜像</b>作为兜底。
+     * 用法是把镜像前缀拼在原始 URL 前（{@code 前缀 + https://...}）。
+     * 空串表示直连。检查与下载分别维护列表，逐个尝试直到成功。
+     */
+    private static final String[] API_MIRRORS = {
+            "",                               // 直连 api.github.com
+            "https://gh-proxy.com/",
+            "https://ghproxy.net/",
+            "https://ghfast.top/",
+            "https://mirror.ghproxy.com/",
+            "https://gh-proxy.org/",
+            "https://gh.llkk.cc/",
+    };
+
+    /** APK 下载用的中转镜像（原理同上，拼在 github.com 下载链接前） */
+    private static final String[] DOWNLOAD_MIRRORS = {
+            "",                               // 直连
+            "https://gh-proxy.com/",
+            "https://ghfast.top/",
+            "https://mirror.ghproxy.com/",
+            "https://hub.gitmirror.com/",
+            "https://gh-proxy.org/",
+            "https://gh.llkk.cc/",
+    };
+
+    /** 单个镜像的超时上限，避免整轮尝试拖太久 */
+    private static final int PER_MIRROR_TIMEOUT_SEC = 8;
+
     /** 自动检查最小间隔（GitHub 匿名 API 有限频，不宜频繁） */
     private static final long AUTO_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000L;
 
@@ -91,29 +120,41 @@ public final class UpdateManager {
             UpdateInfo info = null;
             String error = null;
             com.github.tvbox.osc.util.RunLog.i("检查更新: 开始");
-            try {
-                OkHttpClient client = HttpClients.shared().newBuilder()
-                        .connectTimeout(12, TimeUnit.SECONDS)
-                        .readTimeout(20, TimeUnit.SECONDS)
-                        .build();
-                Request req = new Request.Builder()
-                        .url(LATEST_RELEASE_API)
-                        .header("Accept", "application/vnd.github+json")
-                        .header("User-Agent", "TVBoxOS-Live/" + BuildConfig.VERSION_NAME)
-                        .get()
-                        .build();
-                try (Response resp = client.newCall(req).execute()) {
-                    int code = resp.code();
-                    if (code == 404) {
-                        error = "仓库尚无 Release，请先发布一个版本";
-                    } else if (!resp.isSuccessful() || resp.body() == null) {
-                        error = "检查更新失败（HTTP " + code + "）";
-                    } else {
-                        info = parseRelease(resp.body().string());
+            // 并发探测所有候选源（自定义镜像 / 直连 / 内置镜像），取最先成功的一个。
+            // 串行会让超时累加（7 个源 × 8s = 56s），并发后总耗时≈单次超时，体验好得多。
+            java.util.List<String> prefixes = apiCandidates();
+            java.util.concurrent.atomic.AtomicBoolean notFound = new java.util.concurrent.atomic.AtomicBoolean(false);
+            java.util.concurrent.atomic.AtomicReference<String> lastErr = new java.util.concurrent.atomic.AtomicReference<>(null);
+
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(
+                    Math.min(prefixes.size(), 5));
+            java.util.List<java.util.concurrent.Future<UpdateInfo>> futures = new java.util.ArrayList<>();
+            for (String prefix : prefixes) {
+                futures.add(pool.submit(() -> fetchRelease(prefix + LATEST_RELEASE_API, notFound, lastErr)));
+            }
+            String hitPrefix = null;
+            for (int i = 0; i < futures.size(); i++) {
+                try {
+                    UpdateInfo r = futures.get(i).get();
+                    if (r != null) {
+                        info = r;
+                        hitPrefix = prefixes.get(i);
+                        break;
                     }
+                } catch (Throwable ignore) {
                 }
-            } catch (Throwable t) {
-                error = "无法连接 GitHub：" + describe(t);
+            }
+            // 已拿到结果，其余探测无意义，立即中断
+            pool.shutdownNow();
+            com.github.tvbox.osc.util.RunLog.i("检查更新: 命中 " + label(hitPrefix));
+
+            if (info == null) {
+                if (notFound.get()) {
+                    error = "仓库尚无 Release，请先发布一个版本";
+                } else {
+                    error = "无法连接 GitHub（已并发尝试直连与 " + (API_MIRRORS.length - 1)
+                            + " 个镜像）：" + lastErr.get();
+                }
             }
 
             UpdateInfo finalInfo = info;
@@ -147,6 +188,81 @@ public final class UpdateManager {
                 }
             });
         }, "update-check").start();
+    }
+
+    /**
+     * 从单个地址拉取 Release 信息，失败或 404 时返回 null。
+     *
+     * @param notFound 命中 404 时置位（说明仓库/Release 确实不存在，换镜像也没意义）
+     * @param lastErr  记录最后一次错误，供最终提示使用
+     */
+    private static UpdateInfo fetchRelease(String url,
+                                           java.util.concurrent.atomic.AtomicBoolean notFound,
+                                           java.util.concurrent.atomic.AtomicReference<String> lastErr) {
+        try {
+            OkHttpClient client = HttpClients.shared().newBuilder()
+                    .connectTimeout(PER_MIRROR_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .readTimeout(PER_MIRROR_TIMEOUT_SEC, TimeUnit.SECONDS)
+                    .build();
+            Request req = new Request.Builder()
+                    .url(url)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("User-Agent", "TVBoxOS-Live/" + BuildConfig.VERSION_NAME)
+                    .get()
+                    .build();
+            try (Response resp = client.newCall(req).execute()) {
+                int code = resp.code();
+                if (code == 404) {
+                    notFound.set(true);
+                    return null;
+                }
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    lastErr.set("HTTP " + code);
+                    return null;
+                }
+                return parseRelease(resp.body().string());
+            }
+        } catch (Throwable t) {
+            lastErr.set(describe(t));
+            return null;
+        }
+    }
+
+    /** 检查更新的候选源：用户自定义镜像优先，其次直连与内置镜像 */
+    private static java.util.List<String> apiCandidates() {
+        java.util.List<String> list = new java.util.ArrayList<>();
+        String custom = normalizeMirror(Hawk.get(HawkConfig.UPDATE_MIRROR_PREFIX, ""));
+        if (!custom.isEmpty()) list.add(custom);
+        for (String m : API_MIRRORS) list.add(m);
+        return list;
+    }
+
+    /** 下载的候选链接：自定义镜像 → 直连 → 内置镜像 */
+    private static java.util.List<String> downloadCandidates(String apkUrl) {
+        java.util.List<String> list = new java.util.ArrayList<>();
+        String custom = normalizeMirror(Hawk.get(HawkConfig.UPDATE_MIRROR_PREFIX, ""));
+        if (!custom.isEmpty()) list.add(custom + apkUrl);
+        list.add(apkUrl);
+        for (String m : DOWNLOAD_MIRRORS) {
+            if (m.isEmpty()) continue;
+            list.add(m + apkUrl);
+        }
+        return list;
+    }
+
+    /** 规范化用户填写的镜像：补全 https:// 与结尾斜杠 */
+    private static String normalizeMirror(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.isEmpty()) return "";
+        if (!s.startsWith("http://") && !s.startsWith("https://")) s = "https://" + s;
+        if (!s.endsWith("/")) s = s + "/";
+        return s;
+    }
+
+    /** 日志用的可读来源名 */
+    private static String label(String prefix) {
+        return prefix.isEmpty() ? "直连" : "镜像 " + prefix;
     }
 
     /** 解析 Release JSON，挑出第一个 .apk 资产 */
@@ -221,53 +337,69 @@ public final class UpdateManager {
 
     // ============ 下载 ============
 
-    /** 下载 APK 到应用专属 Download 目录 */
+    /**
+     * 下载 APK 到应用专属 Download 目录。
+     * 直连失败时自动改用中转镜像重试（国内网络下 github.com 下载经常超时）。
+     */
     public static void download(Context ctx, UpdateInfo info, DownloadListener listener) {
         File target = targetFile(ctx, info);
         new Thread(() -> {
-            InputStream in = null;
-            FileOutputStream out = null;
-            try {
-                OkHttpClient client = HttpClients.shared().newBuilder()
-                        .connectTimeout(15, TimeUnit.SECONDS)
-                        .readTimeout(30, TimeUnit.SECONDS)
-                        .build();
-                Request req = new Request.Builder().url(info.apkUrl)
-                        .header("User-Agent", "TVBoxOS-Live/" + BuildConfig.VERSION_NAME)
-                        .build();
-                try (Response resp = client.newCall(req).execute()) {
-                    if (resp.body() == null) throw new java.io.IOException("空响应");
-                    long total = resp.body().contentLength();
-                    long done = 0L;
-                    in = resp.body().byteStream();
-                    out = new FileOutputStream(target);
-                    byte[] buf = new byte[32768];
-                    int n;
-                    long lastReport = 0L;
-                    while ((n = in.read(buf)) > 0) {
-                        out.write(buf, 0, n);
-                        done += n;
-                        long now = System.currentTimeMillis();
-                        if (total > 0 && now - lastReport > 150) {
-                            lastReport = now;
-                            int percent = (int) (done * 100 / total);
-                            postProgress(listener, percent);
-                        }
+            String lastErr = null;
+            for (String url : downloadCandidates(info.apkUrl)) {
+                try {
+                    downloadOne(url, target, listener);
+                    com.github.tvbox.osc.util.RunLog.i("更新下载: 成功 " + url);
+                    postProgress(listener, 100);
+                    postFinished(listener, target);
+                    return;
+                } catch (Throwable t) {
+                    lastErr = describe(t);
+                    com.github.tvbox.osc.util.RunLog.i("更新下载: 失败 " + url + " → " + lastErr);
+                    try {
+                        target.delete();
+                    } catch (Exception ignore) {
                     }
                 }
-                postProgress(listener, 100);
-                postFinished(listener, target);
-            } catch (Throwable t) {
-                try {
-                    target.delete();
-                } catch (Exception ignore) {
-                }
-                postFailed(listener, "下载失败：" + describe(t));
-            } finally {
-                closeQuietly(in);
-                closeQuietly(out);
             }
+            postFailed(listener, "下载失败（已尝试直连与镜像）：" + lastErr);
         }, "update-download").start();
+    }
+
+    /** 从单个地址下载到目标文件；失败抛异常由上层换源重试 */
+    private static void downloadOne(String url, File target, DownloadListener listener) throws Exception {
+        OkHttpClient client = HttpClients.shared().newBuilder()
+                .connectTimeout(15, TimeUnit.SECONDS)
+                .readTimeout(30, TimeUnit.SECONDS)
+                .build();
+        Request req = new Request.Builder().url(url)
+                .header("User-Agent", "TVBoxOS-Live/" + BuildConfig.VERSION_NAME)
+                .build();
+        InputStream in = null;
+        FileOutputStream out = null;
+        try (Response resp = client.newCall(req).execute()) {
+            if (!resp.isSuccessful() || resp.body() == null) {
+                throw new java.io.IOException("HTTP " + resp.code());
+            }
+            long total = resp.body().contentLength();
+            long done = 0L;
+            in = resp.body().byteStream();
+            out = new FileOutputStream(target);
+            byte[] buf = new byte[32768];
+            int n;
+            long lastReport = 0L;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                done += n;
+                long now = System.currentTimeMillis();
+                if (total > 0 && now - lastReport > 150) {
+                    lastReport = now;
+                    postProgress(listener, (int) (done * 100 / total));
+                }
+            }
+        } finally {
+            closeQuietly(in);
+            closeQuietly(out);
+        }
     }
 
     private static File targetFile(Context ctx, UpdateInfo info) {

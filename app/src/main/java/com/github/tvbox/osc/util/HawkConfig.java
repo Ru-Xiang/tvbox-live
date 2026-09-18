@@ -75,6 +75,9 @@ public class HawkConfig {
     /** 用户选择"跳过"的版本号，该版本不再提示 */
     public static final String UPDATE_SKIP_VERSION = "update_skip_version";
 
+    /** 更新用的中转镜像前缀（如 https://gh-proxy.com/ ），留空则自动依次尝试内置镜像 */
+    public static final String UPDATE_MIRROR_PREFIX = "update_mirror_prefix";
+
     /** 自定义源连续未入选达到该次数则自动删除 */
     public static final int MAX_SOURCE_FAIL_COUNT = 3;
 
