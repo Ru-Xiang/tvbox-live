@@ -635,8 +635,8 @@ public class LivePlayActivity extends AppCompatActivity {
         if (url == null) return false;
         String u = url.trim();
         if (u.isEmpty()) return false;
-        // 与 ProtocolFilter 保持同一套白名单：rtp/udp/igmp/rtsp/rtmp 等当前内核无法播放，
-        // 视为无效线路直接跳过，避免换源时白等超时
+        // 与 ProtocolFilter 保持同一套白名单：http(s)/rtsp(s)/rtmp(s)/file/content 可播，
+        // rtp/udp/igmp/p2p 等视为无效线路直接跳过，避免换源时白等超时
         return com.github.tvbox.osc.util.ProtocolFilter.isSupported(u);
     }
 
@@ -1279,13 +1279,23 @@ public class LivePlayActivity extends AppCompatActivity {
             } else {
                 Double cached = getSourceSpeedKbps(ch);
                 if (cached == null) {
-                    // 尚未测速：只显示线路序号，不给误导性数字
+                    // 区分两种情况：流式协议（RTSP/RTMP）天生无法测速；其余是尚未测过
+                    String tip = isStreamProtocol(ch.getCurrentSourceUrl()) ? "流式协议" : "未测速";
                     tvCornerSpeed.setText("线路 " + (ch.getSourceIndex() + 1)
-                            + "/" + Math.max(1, ch.getSourceCount()) + " · 未测速");
+                            + "/" + Math.max(1, ch.getSourceCount()) + " · " + tip);
                     tvCornerSpeed.setTextColor(getResources().getColor(R.color.text_tertiary));
                     tvCornerSpeed.setVisibility(View.VISIBLE);
                     return;
                 }
+                if (cached <= 0) {
+                    // 测过但不可用（0）：明确区分于"未测速"，避免误以为没测过
+                    tvCornerSpeed.setText("线路 " + (ch.getSourceIndex() + 1)
+                            + "/" + Math.max(1, ch.getSourceCount()) + " · 不可用");
+                    tvCornerSpeed.setTextColor(getResources().getColor(R.color.text_tertiary));
+                    tvCornerSpeed.setVisibility(View.VISIBLE);
+                    return;
+                }
+                // 该线路自己的测速值，切源即随之变化
                 speedText = formatSpeedKbps(cached);
             }
 
@@ -1312,27 +1322,48 @@ public class LivePlayActivity extends AppCompatActivity {
         }
     }
 
-    /** 当前线路的已知速度：优先该线路自身的测速缓存，其次频道最优速度 */
+    /**
+     * 当前线路自己的测速值。
+     *
+     * @return null＝尚未测速；0＝测过但不可用；>0＝该线路的测速值（KB/s）
+     */
     private Double getSourceSpeedKbps(LiveChannel ch) {
         try {
             String url = ch.getCurrentSourceUrl();
+            // RTSP/RTMP 这类流式协议无法用 HTTP 片段测速，缓存里记的是"不可测速"而非"不可用"。
+            // 必须在这里就返回 null（未测速），否则会被当成 0 显示成"不可用"，误导用户以为线路坏了。
+            if (url != null && !com.github.tvbox.osc.util.ProtocolFilter.isSpeedTestable(url)) {
+                return null;
+            }
             if (url != null && speedTestEngine != null) {
                 SpeedTestResult r = speedTestEngine.getCachedResult(url);
-                if (r != null && r.isAvailable() && r.getSpeed() > 0) {
-                    return r.getSpeed();
-                }
+                // 缓存命中即直接采用：0 也是结论（测过但不可用），
+                // 不能因为 <=0 就往下走，否则会被误判成"未测速"
+                if (r != null) return r.getSpeed();
             }
+            // 2) 按线路下标取该线路自身的测速值。
+            //    speeds 与 sourceUrls 严格一一对应（测速时按 sourceIndex 写入，
+            //    去重/过滤时也同步裁剪），所以这就是"当前线路"的测速值。
+            //
+            //    ⚠️ 这里绝不能用 getBestSpeed() 兜底：那是频道内<b>最快线路</b>的速度，
+            //    会让每条线路都显示同一个数字，正是要避免的误导。
             java.util.List<Double> speeds = ch.getSpeeds();
             int idx = ch.getSourceIndex();
             if (speeds != null && idx >= 0 && idx < speeds.size()) {
                 Double v = speeds.get(idx);
-                if (v != null && v > 0) return v;
+                // 0 也是有效信息：说明这条线路测过但不可用，需与"未测速"区分
+                if (v != null) return v;
             }
-            if (ch.getBestSpeed() > 0) return ch.getBestSpeed();
         } catch (Throwable ignore) {
             // 忽略，按未测速处理
         }
         return null;
+    }
+
+    /** 是否为无法用 HTTP 测速的流式协议（RTSP/RTMP 等） */
+    private boolean isStreamProtocol(String url) {
+        return url != null && !url.trim().isEmpty()
+                && !com.github.tvbox.osc.util.ProtocolFilter.isSpeedTestable(url);
     }
 
     /** KB/s → 人类可读文本 */
@@ -1391,9 +1422,16 @@ public class LivePlayActivity extends AppCompatActivity {
         }
         if (tvSpeedInfo != null) {
             boolean showSpeed = Hawk.get(HawkConfig.LIVE_SHOW_SPEED_INFO, true);
-            if (showSpeed && channel.getBestSpeed() > 0) {
+            // 显示"当前线路"自己的测速值（与右下角一致），而不是频道最快线路的速度，
+            // 否则切线路时这里的数字纹丝不动，看着像所有线路速度都一样。
+            Double cur = showSpeed ? getSourceSpeedKbps(channel) : null;
+            if (cur != null && cur > 0) {
                 tvSpeedInfo.setVisibility(View.VISIBLE);
-                tvSpeedInfo.setText(String.format("%.0f KB/s", channel.getBestSpeed()));
+                tvSpeedInfo.setText(String.format("%.0f KB/s", cur));
+            } else if (cur != null) {
+                // 该线路测过但不可用
+                tvSpeedInfo.setVisibility(View.VISIBLE);
+                tvSpeedInfo.setText("不可用");
             } else {
                 tvSpeedInfo.setVisibility(View.GONE);
             }

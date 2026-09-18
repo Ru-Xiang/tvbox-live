@@ -44,6 +44,7 @@ public final class ProtocolFilter {
         return lower.startsWith("http://")
                 || lower.startsWith("https://")
                 || lower.startsWith("rtsp://")
+                || lower.startsWith("rtsps://")
                 || lower.startsWith("rtmp://")
                 || lower.startsWith("rtmps://")
                 || lower.startsWith("rtmpe://")
@@ -125,7 +126,7 @@ public final class ProtocolFilter {
                 }
             }
             if (removedLines > 0 || removedChannels > 0) {
-                Timber.i("协议过滤：移除 %d 条不支持的线路(rtp/udp/rtsp/rtmp等)，"
+                Timber.i("协议过滤：移除 %d 条不支持的线路(rtp/udp/igmp/p2p 等)，"
                         + "移除 %d 个无可播线路的频道，%d 个空分组",
                         removedLines, removedChannels, removedGroups);
             }

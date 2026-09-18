@@ -362,9 +362,11 @@ public class LiveSourceParser {
     }
 
     /**
-     * 只接受播放器真正能播放的协议（HTTP(S)/file/content）。
-     * rtp/udp/igmp/rtsp/rtmp/p2p 等当前内核无法播放，在解析阶段就丢弃，
+     * 只接受播放器真正能播放的协议：HTTP(S)、RTSP(S)、RTMP(S)、file、content。
+     * rtp/udp/igmp/p2p 等内核无法播放，在解析阶段就丢弃，
      * 避免进入频道列表后浪费测速配额、拖慢换源。
+     *
+     * <p>判定统一走 {@link com.github.tvbox.osc.util.ProtocolFilter}，与测速、播放处保持一致。
      */
     private boolean isValidUrl(String url) {
         return com.github.tvbox.osc.util.ProtocolFilter.isSupported(url);
