@@ -1,5 +1,6 @@
 package com.github.tvbox.osc.service;
 
+import com.github.tvbox.osc.api.IptvApiService;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.orhanobut.hawk.Hawk;
 
@@ -28,6 +29,14 @@ public class ConfigHttpServer extends NanoHTTPD {
     public interface OnConfigSavedListener {
         void onConfigSaved();
     }
+
+    /**
+     * 更新间隔 / 最低速度的上限，必须与 TV 设置页 SeekBar 的 setMax 一致：
+     * 网页若允许更大的值，TV 端 setProgress 会被截断到 max，离开设置页时
+     * saveSettings 读 getProgress() 写回，手机提交的值被悄悄改小。
+     */
+    public static final int MAX_UPDATE_INTERVAL = 72;
+    public static final int MAX_SPEED_MIN_THRESHOLD = 500;
 
     /** 运行日志文件名（位于 filesDir/logs/，与崩溃日志不同目录） */
     private static final String RUN_LOG_NAME = "run.log";
@@ -92,7 +101,7 @@ public class ConfigHttpServer extends NanoHTTPD {
         Hawk.put(HawkConfig.IPTV_AUTO_UPDATE, p.containsKey("auto_update"));
 
         if (p.containsKey("update_interval")) {
-            Hawk.put(HawkConfig.IPTV_UPDATE_INTERVAL, parseInt(p.get("update_interval"), HawkConfig.DEFAULT_UPDATE_INTERVAL, 1, 168));
+            Hawk.put(HawkConfig.IPTV_UPDATE_INTERVAL, parseInt(p.get("update_interval"), HawkConfig.DEFAULT_UPDATE_INTERVAL, 1, MAX_UPDATE_INTERVAL));
         }
 
         if (p.containsKey("custom_sources")) {
@@ -143,15 +152,16 @@ public class ConfigHttpServer extends NanoHTTPD {
             Hawk.put(HawkConfig.SPEED_TEST_CONCURRENCY, parseInt(p.get("speed_concurrency"), HawkConfig.DEFAULT_SPEED_TEST_CONCURRENCY, 1, 20));
         }
         if (p.containsKey("min_speed")) {
-            Hawk.put(HawkConfig.SPEED_MIN_THRESHOLD, parseInt(p.get("min_speed"), HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD, 0, 1000));
+            Hawk.put(HawkConfig.SPEED_MIN_THRESHOLD, parseInt(p.get("min_speed"), HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD, 0, MAX_SPEED_MIN_THRESHOLD));
         }
         // 按速度排序 / 过滤不可用线路（与 TV 端统一）
         Hawk.put(HawkConfig.SPEED_SORT_SOURCES, p.containsKey("sort_by_speed"));
         Hawk.put(HawkConfig.SPEED_FILTER_UNAVAILABLE, p.containsKey("filter_unavailable"));
 
         // 播放器设置（与 TV 端统一）
+        // 目前只实现了 ExoPlayer，与 TV 端设置页一致固定为 2，忽略网页提交的其它值
         if (p.containsKey("player_type")) {
-            Hawk.put(HawkConfig.LIVE_PLAYER_TYPE, parseInt(p.get("player_type"), 2, 0, 2));
+            Hawk.put(HawkConfig.LIVE_PLAYER_TYPE, 2);
         }
         if (p.containsKey("scale_mode")) {
             Hawk.put(HawkConfig.LIVE_PLAYER_SCALE, parseInt(p.get("scale_mode"), 0, 0, 4));
@@ -180,18 +190,13 @@ public class ConfigHttpServer extends NanoHTTPD {
         if (multiline != null) {
             for (String line : multiline.split("\\r?\\n")) {
                 String u = line.trim();
-                if (u.startsWith("http://") || u.startsWith("https://")) {
+                if ((u.startsWith("http://") || u.startsWith("https://")) && !urls.contains(u)) {
                     urls.add(u);
                 }
             }
         }
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < urls.size(); i++) {
-            if (i > 0) sb.append(",");
-            sb.append("\"").append(urls.get(i).replace("\"", "")).append("\"");
-        }
-        sb.append("]");
-        return sb.toString();
+        // 与设置页共用同一序列化：正确转义特殊字符，格式与 parseCustomSourceUrls 对应
+        return IptvApiService.buildCustomSourcesJson(urls);
     }
 
     // ============ 网页生成 ============
@@ -219,7 +224,6 @@ public class ConfigHttpServer extends NanoHTTPD {
         int minSpeed = Hawk.get(HawkConfig.SPEED_MIN_THRESHOLD, HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD);
         boolean sortBySpeed = Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true);
         boolean filterUnavailable = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
-        int playerType = Hawk.get(HawkConfig.LIVE_PLAYER_TYPE, 2);
         int scaleMode = Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0);
         boolean showChannelInfo = Hawk.get(HawkConfig.LIVE_SHOW_CHANNEL_INFO, true);
         boolean showSpeedInfo = Hawk.get(HawkConfig.LIVE_SHOW_SPEED_INFO, true);
@@ -248,7 +252,7 @@ public class ConfigHttpServer extends NanoHTTPD {
                 + field("频道改名规则地址（alias）",
                         input("alias_url", "text", esc(aliasUrl), "https://.../alias.txt"))
                 + checkbox("auto_update", "自动更新直播源", autoUpdate)
-                + field("更新间隔（小时）", input("update_interval", "number", String.valueOf(updateInterval), "12"))
+                + field("更新间隔（小时）", numberInput("update_interval", updateInterval, "12", 1, MAX_UPDATE_INTERVAL))
 
                 + section("应用更新")
                 + field("GitHub 中转镜像（国内加速，留空自动）",
@@ -260,7 +264,7 @@ public class ConfigHttpServer extends NanoHTTPD {
                 + field("模板地址（留空或填 demo 用内置模板，或填 TXT 链接）",
                         input("template_url", "text", esc(templateUrl), "demo"))
                 + field("单频道最多线路（0=不限制）",
-                        input("urls_limit", "number", String.valueOf(urlsLimit), "5"))
+                        numberInput("urls_limit", urlsLimit, "5", 0, 20))
 
                 + section("EPG 节目单")
                 + checkbox("enable_epg", "启用 EPG 节目单", enableEpg)
@@ -276,25 +280,25 @@ public class ConfigHttpServer extends NanoHTTPD {
                 + field("测速时机", select("speed_mode", new String[][]{
                         {"manual", "仅手动测速"}, {"periodic_prompt", "周期性：打开时提示"}},
                         speedMode == HawkConfig.SPEED_MODE_PERIODIC_PROMPT ? "periodic_prompt" : "manual"))
-                + field("测速周期（小时）", input("speed_interval", "number", String.valueOf(speedInterval), "24"))
-                + field("测速超时（秒）", input("speed_timeout", "number", String.valueOf(speedTimeout), "5"))
-                + field("并发线程", input("speed_concurrency", "number", String.valueOf(speedConcurrency), "5"))
-                + field("最低速度（KB/s，0=不限制）", input("min_speed", "number", String.valueOf(minSpeed), "50"))
+                + field("测速周期（小时）", numberInput("speed_interval", speedInterval, "24", 1, 168))
+                + field("测速超时（秒）", numberInput("speed_timeout", speedTimeout, "5", 1, 30))
+                + field("并发线程", numberInput("speed_concurrency", speedConcurrency, "5", 1, 20))
+                + field("最低速度（KB/s，0=不限制）", numberInput("min_speed", minSpeed, "50", 0, MAX_SPEED_MIN_THRESHOLD))
                 + checkbox("sort_by_speed", "按速度/质量对线路排序", sortBySpeed)
                 + checkbox("filter_unavailable", "测速后移除不可用线路", filterUnavailable)
 
                 + section("播放器")
-                + field("播放器内核", select("player_type", new String[][]{
-                        {"0", "系统播放器"}, {"1", "IJK 播放器"}, {"2", "ExoPlayer"}}, String.valueOf(playerType)))
+                + field("播放器内核（当前仅支持 ExoPlayer）", select("player_type", new String[][]{
+                        {"2", "ExoPlayer"}}, "2"))
                 + field("画面缩放", select("scale_mode", new String[][]{
                         {"0", "自适应"}, {"1", "填充"}, {"2", "16:9"}, {"3", "4:3"}, {"4", "原始"}}, String.valueOf(scaleMode)))
                 + checkbox("show_channel_info", "显示频道信息栏", showChannelInfo)
-                + field("信息栏显示时长（秒）", input("info_duration", "number", String.valueOf(infoDuration), "5"))
+                + field("信息栏显示时长（秒）", numberInput("info_duration", infoDuration, "5", 1, 15))
                 + checkbox("show_speed_info", "显示测速信息", showSpeedInfo)
-                + field("播放超时换源（秒，0=关闭）", input("play_timeout", "number", String.valueOf(playTimeout), "10"))
+                + field("播放超时换源（秒，0=关闭）", numberInput("play_timeout", playTimeout, "10", 0, 60))
 
                 + section("系统")
-                + checkbox("boot_startup", "开机自动启动（部分系统还需在自启动管理中允许本应用）", bootStartup)
+                + checkbox("boot_startup", "开机自动启动（部分系统还需在自启动管理中允许本应用；Android 10+ 还需在电视上授予「显示在其他应用上层」权限）", bootStartup)
 
                 + "<button type=\"submit\">保存到电视</button>"
                 + "</form></div></body></html>";
@@ -336,6 +340,17 @@ public class ConfigHttpServer extends NanoHTTPD {
 
     private String field(String label, String control) {
         return "<label>" + esc(label) + "</label>" + control;
+    }
+
+    /**
+     * 数字输入框：带 min/max，让手机端直接提示取值范围（与 saveConfig 的截断范围一致）。
+     * 回显值先截断到范围内：旧版本可能存过超范围的值（如更新间隔 168），
+     * 不截断的话浏览器表单校验会直接拦住整页提交。
+     */
+    private String numberInput(String name, int value, String placeholder, int min, int max) {
+        int v = Math.max(min, Math.min(max, value));
+        return "<input name=\"" + name + "\" type=\"number\" min=\"" + min + "\" max=\"" + max
+                + "\" value=\"" + v + "\" placeholder=\"" + esc(placeholder) + "\">";
     }
 
     private String input(String name, String type, String value, String placeholder) {
@@ -500,18 +515,12 @@ public class ConfigHttpServer extends NanoHTTPD {
     }
 
     private String jsonToLines(String json) {
-        if (json == null || json.isEmpty()) return "";
-        json = json.trim();
-        if (json.startsWith("[") && json.endsWith("]")) {
-            json = json.substring(1, json.length() - 1);
-        }
+        // 复用 IptvApiService 的解析：原先按逗号切分，URL 含逗号会被拆断，
+        // 且设置页用 JSONArray 写入的 "https:\/\/" 转义不会被还原，网页里显示成乱码地址
         StringBuilder sb = new StringBuilder();
-        for (String part : json.split(",")) {
-            String u = part.trim().replace("\"", "").replace("'", "");
-            if (!u.isEmpty()) {
-                if (sb.length() > 0) sb.append("\n");
-                sb.append(u);
-            }
+        for (String u : IptvApiService.parseCustomSourceUrls(json)) {
+            if (sb.length() > 0) sb.append("\n");
+            sb.append(u);
         }
         return sb.toString();
     }

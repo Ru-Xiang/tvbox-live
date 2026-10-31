@@ -37,8 +37,9 @@ public class LiveSourceParser {
     private static final int MAX_LINE_LENGTH = 8192;
 
     // M3U 标签正则
-    private static final Pattern EXTINF_PATTERN = Pattern.compile(
-            "#EXTINF:\\s*-?\\d+\\s*(.*?)\\s*,\\s*(.+)$"
+    /** EXTINF 行的 "#EXTINF:时长" 前缀；其后的属性与频道名用引号感知的扫描切分 */
+    private static final Pattern EXTINF_PREFIX_PATTERN = Pattern.compile(
+            "#EXTINF:\\s*-?\\d+"
     );
     private static final Pattern GROUP_TITLE_PATTERN = Pattern.compile(
             "group-title\\s*=\\s*\"([^\"]*)\""
@@ -109,6 +110,7 @@ public class LiveSourceParser {
         List<ChannelGroup> groups = new ArrayList<>();
 
         if (content == null || content.isEmpty()) return groups;
+        content = stripBom(content);
 
         try (BufferedReader reader = new BufferedReader(new StringReader(content))) {
             String line;
@@ -178,6 +180,8 @@ public class LiveSourceParser {
         List<ChannelGroup> groups = new ArrayList<>();
 
         if (content == null || content.isEmpty()) return groups;
+        // UTF-8 BOM 不会被 trim() 去掉，残留会让首个分组/频道名带不可见前缀
+        content = stripBom(content);
 
         String currentGroupName = "未分类";
 
@@ -238,6 +242,7 @@ public class LiveSourceParser {
             return new ArrayList<>();
         }
 
+        content = stripBom(content);
         String trimmed = content.trim();
 
         // 判断是否为 M3U 格式
@@ -298,13 +303,40 @@ public class LiveSourceParser {
 
     // ============ 私有方法 ============
 
+    /** 去掉开头的 UTF-8 BOM（U+FEFF） */
+    private static String stripBom(String s) {
+        if (s != null && !s.isEmpty() && s.charAt(0) == '\ufeff') return s.substring(1);
+        return s;
+    }
+
     private void parseM3UEntry(String extInfLine, String url, Map<String, ChannelGroup> groupMap,
                                Map<String, LiveChannel> channelIndex) {
-        Matcher infMatcher = EXTINF_PATTERN.matcher(extInfLine);
-        if (!infMatcher.find()) return;
+        Matcher prefix = EXTINF_PREFIX_PATTERN.matcher(extInfLine);
+        if (!prefix.find()) return;
+        int start = prefix.end();
 
-        String attributes = infMatcher.group(1);
-        String channelName = infMatcher.group(2).trim();
+        // 按"引号外的第一个逗号"切分属性与频道名：属性值里常带逗号
+        // （如 tvg-logo="https://img/w_100,h_100/x.png"、group-title="央视,高清"），
+        // 原惰性正则会在引号内的逗号处截断，导致频道名变成乱码、分组丢失，被模板整条丢弃。
+        // 取第一个而不是最后一个：频道名本身可能含逗号，但几乎不会含引号。
+        int sep = -1;
+        boolean inQuotes = false;
+        for (int i = start; i < extInfLine.length(); i++) {
+            char c = extInfLine.charAt(i);
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ',' && !inQuotes) {
+                sep = i;
+                break;
+            }
+        }
+        // 引号不配对（畸形行）：退回旧行为，取时长之后的第一个逗号
+        if (sep < 0) sep = extInfLine.indexOf(',', start);
+        if (sep < 0) return;
+
+        String attributes = extInfLine.substring(start, sep).trim();
+        String channelName = extInfLine.substring(sep + 1).trim();
+        if (channelName.isEmpty()) return;
 
         // 提取分组名称
         String groupName = extractAttribute(attributes, GROUP_TITLE_PATTERN);

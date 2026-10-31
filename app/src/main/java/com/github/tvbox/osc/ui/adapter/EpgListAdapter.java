@@ -114,7 +114,8 @@ public class EpgListAdapter extends RecyclerView.Adapter<EpgListAdapter.VH> {
             }
         }
 
-        // 聚焦动效复用现有工具
+        // 聚焦动效复用现有工具；复用的视图可能残留放大状态，先复位
+        ChannelListAdapter.resetFocusScale(h.itemView);
         h.itemView.setOnFocusChangeListener((v, hasFocus)
                 -> ChannelListAdapter.animateFocus(v, hasFocus));
     }

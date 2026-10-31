@@ -258,8 +258,11 @@ public final class IpVersionFilter {
             return true;
         }
 
-        DnsEntry entry = resolveCapabilities(host);
-        if (entry == null || !entry.resolved) return true; // 解析失败：保守保留
+        // 只读预解析结果，不在此处发起 DNS：预解析有 500 域名上限与 8s 总超时，
+        // 漏网的域名若在拉源线程上逐个同步解析（失效域名每个 5-10s），刷新会卡住数分钟。
+        // 未解析到的域名按保守策略保留，与预解析超时的约定一致。
+        DnsEntry entry = DNS_CACHE.get(host.toLowerCase(Locale.ROOT));
+        if (entry == null || !entry.resolved) return true; // 未解析/解析失败：保守保留
         if (!entry.v4 && !entry.v6) return true;           // 无有效记录：保守保留
         return entry.v6;
     }
@@ -298,7 +301,17 @@ public final class IpVersionFilter {
     }
 
     private static void putCache(String key, DnsEntry entry) {
-        if (DNS_CACHE.size() >= MAX_DNS_CACHE) return; // 达上限后不再写入，防止无限增长
+        if (DNS_CACHE.size() >= MAX_DNS_CACHE) {
+            // 达上限：先淘汰过期的失败记录；仍满则整体清空重建。
+            // 原先满了就拒绝写入，之后新域名永远无法缓存，过滤只能全部保守保留。
+            long now = System.currentTimeMillis();
+            Iterator<java.util.Map.Entry<String, DnsEntry>> it = DNS_CACHE.entrySet().iterator();
+            while (it.hasNext()) {
+                DnsEntry e = it.next().getValue();
+                if (e != null && !e.resolved && now - e.time >= UNKNOWN_TTL_MS) it.remove();
+            }
+            if (DNS_CACHE.size() >= MAX_DNS_CACHE) DNS_CACHE.clear();
+        }
         DNS_CACHE.put(key, entry);
     }
 
@@ -333,7 +346,7 @@ public final class IpVersionFilter {
         Timber.d("DNS 预解析结束: %d 个域名", hosts.size());
     }
 
-    /** 收集所有尚未缓存、且需要 DNS 判断的域名（数量达上限即停止） */
+    /** 收集所有尚未缓存（或失败记录已过期）、且需要 DNS 判断的域名（数量达上限即停止） */
     private static void collectHosts(List<ChannelGroup> groups, Set<String> hosts) {
         for (ChannelGroup group : groups) {
             if (group == null || group.getChannels() == null) continue;
@@ -344,7 +357,12 @@ public final class IpVersionFilter {
                     String host = extractHost(url);
                     if (host == null || host.isEmpty() || isIpLiteral(host)) continue;
                     String key = host.toLowerCase(Locale.ROOT);
-                    if (!DNS_CACHE.containsKey(key)) hosts.add(host);
+                    // 过期的失败记录也要重新预解析（matches 只读缓存，不会再自行重试）
+                    DnsEntry cached = DNS_CACHE.get(key);
+                    if (cached == null || (!cached.resolved
+                            && System.currentTimeMillis() - cached.time >= UNKNOWN_TTL_MS)) {
+                        hosts.add(host);
+                    }
                 }
             }
         }

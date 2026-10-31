@@ -115,8 +115,18 @@ public final class UpdateManager {
         return System.currentTimeMillis() - last > AUTO_CHECK_INTERVAL_MS;
     }
 
-    /** 异步检查更新，回调均在主线程 */
+    /** 异步检查更新，回调均在主线程（自动检查语义：尊重「跳过此版本」） */
     public static void checkForUpdate(UpdateCallback callback) {
+        checkForUpdate(false, callback);
+    }
+
+    /**
+     * 异步检查更新，回调均在主线程。
+     *
+     * @param manual true=用户手动点「检查更新」：不再套用「跳过此版本」过滤，
+     *               否则跳过后手动检查会谎报「已是最新版本」且无法撤销跳过
+     */
+    public static void checkForUpdate(boolean manual, UpdateCallback callback) {
         new Thread(() -> {
             UpdateInfo info = null;
             String error = null;
@@ -173,13 +183,21 @@ public final class UpdateManager {
                     if (callback != null) callback.onError("最新 Release 中没有找到 APK 安装包");
                     return;
                 }
-                String skipped = Hawk.get(HawkConfig.UPDATE_SKIP_VERSION, "");
-                if (finalInfo.version.equals(skipped)) {
-                    com.github.tvbox.osc.util.RunLog.i("检查更新: 版本被用户跳过 " + finalInfo.version);
-                    if (callback != null) callback.onLatest();
-                    return;
-                }
                 boolean newer = isNewer(finalInfo.version, BuildConfig.VERSION_NAME);
+                String skipped = Hawk.get(HawkConfig.UPDATE_SKIP_VERSION, "");
+                if (newer && finalInfo.version.equals(skipped)) {
+                    if (!manual) {
+                        com.github.tvbox.osc.util.RunLog.i("检查更新: 版本被用户跳过 " + finalInfo.version);
+                        if (callback != null) callback.onLatest();
+                        return;
+                    }
+                    // 手动检查视为用户主动撤销跳过，否则该版本在下次发版前永远装不上
+                    com.github.tvbox.osc.util.RunLog.i("检查更新: 手动检查，撤销对 " + finalInfo.version + " 的跳过");
+                    try {
+                        Hawk.delete(HawkConfig.UPDATE_SKIP_VERSION);
+                    } catch (Throwable ignore) {
+                    }
+                }
                 com.github.tvbox.osc.util.RunLog.i("检查更新: 远端=" + finalInfo.version
                         + " 本地=" + BuildConfig.VERSION_NAME + " 有新版本=" + newer);
                 if (newer) {
@@ -339,35 +357,138 @@ public final class UpdateManager {
     // ============ 下载 ============
 
     /**
-     * 下载 APK 到应用专属 Download 目录。
-     * 直连失败时自动改用中转镜像重试（国内网络下 github.com 下载经常超时）。
+     * 一次下载任务的句柄，供界面在关闭/跳过时取消。
+     *
+     * <p>取消后：读循环立即退出、正在进行的 OkHttp 请求被 cancel（不再占用播放带宽），
+     * 且不会再回调 onFinished，界面也就不会在用户已选择「稍后/跳过」后弹出安装器。
      */
-    public static void download(Context ctx, UpdateInfo info, DownloadListener listener) {
-        File target = targetFile(ctx, info);
-        new Thread(() -> {
-            String lastErr = null;
-            for (String url : downloadCandidates(info.apkUrl)) {
+    public static final class DownloadTask {
+        private volatile boolean cancelled;
+        private volatile okhttp3.Call call;
+
+        public void cancel() {
+            cancelled = true;
+            okhttp3.Call c = call;
+            if (c != null) {
                 try {
-                    downloadOne(url, target, listener);
-                    com.github.tvbox.osc.util.RunLog.i("更新下载: 成功 " + url);
-                    postProgress(listener, 100);
-                    postFinished(listener, target);
-                    return;
-                } catch (Throwable t) {
-                    lastErr = describe(t);
-                    com.github.tvbox.osc.util.RunLog.i("更新下载: 失败 " + url + " → " + lastErr);
-                    try {
-                        target.delete();
-                    } catch (Exception ignore) {
-                    }
+                    c.cancel();
+                } catch (Throwable ignore) {
                 }
             }
-            postFailed(listener, "下载失败（已尝试直连与镜像）：" + lastErr);
+        }
+
+        public boolean isCancelled() {
+            return cancelled;
+        }
+    }
+
+    /** 进程内当前正在运行的下载任务；保证同一时刻只有一个写入者 */
+    private static DownloadTask currentTask;
+
+    /**
+     * 下载 APK 到应用专属 Download 目录。
+     * 直连失败时自动改用中转镜像重试（国内网络下 github.com 下载经常超时）。
+     *
+     * <p>先写入独立的 .part 临时文件，字节数校验通过后再改名为正式 APK：
+     * 失败或被取消的尝试只会删除自己的临时文件，绝不会截断/删除已下载完成的安装包，
+     * 安装器也永远看不到写了一半的文件。
+     *
+     * @return 任务句柄；已有下载在进行时返回 null（并回调 onFailed）
+     */
+    public static DownloadTask download(Context ctx, UpdateInfo info, DownloadListener listener) {
+        final File target = targetFile(ctx, info);
+        final DownloadTask task = new DownloadTask();
+        synchronized (UpdateManager.class) {
+            // 单飞：旧任务未被取消时拒绝再起一个线程写同一个文件（会把 APK 写坏）
+            if (currentTask != null && !currentTask.cancelled) {
+                com.github.tvbox.osc.util.RunLog.i("更新下载: 已有下载在进行，忽略重复请求");
+                postFailed(listener, "正在下载中，请稍候");
+                return null;
+            }
+            currentTask = task;
+        }
+
+        // 之前已完整下载过同一版本（大小与 Release 记录一致）则直接复用，免得重下几十 MB
+        if (info.sizeBytes > 0 && target.isFile() && target.length() == info.sizeBytes) {
+            com.github.tvbox.osc.util.RunLog.i("更新下载: 复用已下载的安装包 " + target.getAbsolutePath());
+            releaseTask(task);
+            postProgress(listener, 100);
+            postFinished(listener, target);
+            return task;
+        }
+
+        final File part = new File(target.getParentFile(),
+                target.getName() + "." + System.nanoTime() + ".part");
+        new Thread(() -> {
+            try {
+                cleanStaleParts(target, part);
+                String lastErr = null;
+                for (String url : downloadCandidates(info.apkUrl)) {
+                    if (task.cancelled) break;
+                    try {
+                        downloadOne(url, part, listener, task);
+                        if (task.cancelled) break;
+                        // 改名前删掉旧的（可能是 1.2.3 直接写入时残留的半截文件）
+                        if (target.exists()) target.delete();
+                        if (!part.renameTo(target)) {
+                            throw new java.io.IOException("保存安装包失败");
+                        }
+                        com.github.tvbox.osc.util.RunLog.i("更新下载: 成功 " + url);
+                        postProgress(listener, 100);
+                        postFinished(listener, target);
+                        return;
+                    } catch (Throwable t) {
+                        lastErr = describe(t);
+                        try {
+                            part.delete();
+                        } catch (Exception ignore) {
+                        }
+                        if (task.cancelled) break;
+                        com.github.tvbox.osc.util.RunLog.i("更新下载: 失败 " + url + " → " + lastErr);
+                    }
+                }
+                if (task.cancelled) {
+                    com.github.tvbox.osc.util.RunLog.i("更新下载: 用户已取消");
+                    try {
+                        part.delete();
+                    } catch (Exception ignore) {
+                    }
+                    return;
+                }
+                postFailed(listener, "下载失败（已尝试直连与镜像）：" + lastErr);
+            } finally {
+                releaseTask(task);
+            }
         }, "update-download").start();
+        return task;
+    }
+
+    private static void releaseTask(DownloadTask task) {
+        synchronized (UpdateManager.class) {
+            if (currentTask == task) currentTask = null;
+        }
+    }
+
+    /** 清理此前被杀进程/取消遗留的 .part 临时文件（不动本次任务的文件） */
+    private static void cleanStaleParts(File target, File keep) {
+        try {
+            File dir = target.getParentFile();
+            File[] files = dir == null ? null : dir.listFiles();
+            if (files == null) return;
+            String prefix = target.getName() + ".";
+            for (File f : files) {
+                String n = f.getName();
+                if (n.startsWith(prefix) && n.endsWith(".part") && !f.equals(keep)) {
+                    f.delete();
+                }
+            }
+        } catch (Throwable ignore) {
+        }
     }
 
     /** 从单个地址下载到目标文件；失败抛异常由上层换源重试 */
-    private static void downloadOne(String url, File target, DownloadListener listener) throws Exception {
+    private static void downloadOne(String url, File target, DownloadListener listener,
+                                    DownloadTask task) throws Exception {
         OkHttpClient client = HttpClients.shared().newBuilder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(30, TimeUnit.SECONDS)
@@ -375,9 +496,13 @@ public final class UpdateManager {
         Request req = new Request.Builder().url(url)
                 .header("User-Agent", "TVBoxOS-Live/" + BuildConfig.VERSION_NAME)
                 .build();
+        okhttp3.Call call = client.newCall(req);
+        task.call = call;
+        // 与 cancel() 竞争：句柄登记前已被取消则立即取消这次请求
+        if (task.cancelled) call.cancel();
         InputStream in = null;
         FileOutputStream out = null;
-        try (Response resp = client.newCall(req).execute()) {
+        try (Response resp = call.execute()) {
             if (!resp.isSuccessful() || resp.body() == null) {
                 throw new java.io.IOException("HTTP " + resp.code());
             }
@@ -389,6 +514,7 @@ public final class UpdateManager {
             int n;
             long lastReport = 0L;
             while ((n = in.read(buf)) > 0) {
+                if (task.cancelled) throw new java.io.IOException("已取消");
                 out.write(buf, 0, n);
                 done += n;
                 long now = System.currentTimeMillis();
@@ -397,20 +523,52 @@ public final class UpdateManager {
                     postProgress(listener, (int) (done * 100 / total));
                 }
             }
+            if (task.cancelled) throw new java.io.IOException("已取消");
+            // 连接中途断开时 read 也可能返回 -1，不校验长度会把半截包当成功交给安装器
+            if (total > 0 && done != total) {
+                throw new java.io.IOException("下载不完整 " + done + "/" + total);
+            }
+            if (done <= 0) throw new java.io.IOException("下载内容为空");
         } finally {
             closeQuietly(in);
             closeQuietly(out);
+            task.call = null;
         }
     }
 
     private static File targetFile(Context ctx, UpdateInfo info) {
         File dir = ctx.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS);
-        if (dir == null) dir = ctx.getFilesDir();
+        if (dir == null) {
+            // 外部存储不可用（廉价盒子常见）：必须落在 filesDir/Download/，
+            // 与 file_paths.xml 的 files-path 一致，否则 FileProvider 无法授权、安装永远失败
+            dir = new File(ctx.getFilesDir(), "Download");
+        }
         if (!dir.exists() && !dir.mkdirs()) {
             // 目录不可用时仍返回一个可用路径
         }
         String name = "tvbox-live-" + (info.version.isEmpty() ? "update" : info.version) + ".apk";
         return new File(dir, name);
+    }
+
+    /**
+     * Android 7.0 以下只能用 file:// 安装，而 filesDir 下的文件默认仅本应用可读，
+     * 系统安装器会报解析失败。这里仅对内部存储里的安装包放开读/遍历权限。
+     */
+    private static void makeInternalApkReadable(Context ctx, File apk) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) return;
+        try {
+            File filesDir = ctx.getFilesDir();
+            if (filesDir == null || !apk.getAbsolutePath().startsWith(filesDir.getAbsolutePath())) return;
+            apk.setReadable(true, false);
+            File dir = apk.getParentFile();
+            while (dir != null && !dir.equals(filesDir.getParentFile())) {
+                dir.setExecutable(true, false);
+                if (dir.equals(filesDir)) break;
+                dir = dir.getParentFile();
+            }
+        } catch (Throwable t) {
+            com.github.tvbox.osc.util.RunLog.i("放开安装包读权限失败: " + describe(t));
+        }
     }
 
     private static void postProgress(DownloadListener l, int percent) {
@@ -477,13 +635,15 @@ public final class UpdateManager {
                             Uri.parse("package:" + ctx.getPackageName()));
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     ctx.startActivity(i);
-                    ToastUtil.show(ctx, "请开启「允许安装未知应用」，然后回到文件管理器安装：" + path);
+                    // 更新弹窗会保留并提供「安装」按钮，授权后返回即可直接安装，无需文件管理器
+                    ToastUtil.show(ctx, "请开启「允许安装未知应用」，然后按返回键回到本应用点「安装」");
                 } catch (Throwable t) {
                     fallbackManual(ctx, apk, "无法打开授权设置页");
                 }
                 return;
             }
 
+            makeInternalApkReadable(ctx, apk);
             boolean ok = tryInstall(ctx, apk);
             if (!ok) {
                 // 最后再试一次系统安装专用 Action：部分电视 ROM 的 PackageInstaller

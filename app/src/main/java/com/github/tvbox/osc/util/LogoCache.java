@@ -60,9 +60,20 @@ public final class LogoCache {
             },
             new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
 
-    /** 正在下载或已确认失败的频道，避免重复请求 */
+    /** 正在下载中的频道，避免重复排队 */
     private static final Set<String> inFlight =
             Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /**
+     * 下载失败的频道 → {失败次数, 最近失败时刻(elapsedRealtime)}。
+     *
+     * 原先失败后立即清除标记，列表每次重新绑定都会再排一次死链：
+     * 单线程每个死链要耗 16s 超时，64 格队列被死链塞满，能下载的台标反而被拒绝。
+     * 这里按失败次数指数退避（2 分钟起，最长 60 分钟），期间不再请求。
+     */
+    private static final ConcurrentHashMap<String, long[]> failedAt = new ConcurrentHashMap<>();
+    private static final long FAIL_BACKOFF_BASE_MS = 2 * 60 * 1000L;
+    private static final long FAIL_BACKOFF_MAX_MS = 60 * 60 * 1000L;
 
     /**
      * "该频道本地台标已存在"的内存标记。
@@ -96,7 +107,8 @@ public final class LogoCache {
             }
 
             File local = localFile(context, channelName);
-            if (local != null && local.isFile() && local.length() > 0) {
+            if (local != null && local.isFile() && local.length() > 0
+                    && validLocalImage(local)) {
                 if (key != null && localHit.size() < MAX_MEM_ENTRIES) {
                     localHit.put(key, local);
                 }
@@ -117,30 +129,54 @@ public final class LogoCache {
     private static void cacheAsync(Context context, String channelName, String url) {
         final String key = safeName(channelName);
         if (key == null || key.isEmpty()) return;
+        if (inBackoff(key)) return; // 近期失败过，退避期内不再请求
         if (!inFlight.add(key)) return; // 已在处理中
 
         final Context appCtx = context.getApplicationContext();
         try {
             IO.execute(() -> {
+                boolean ok = false;
                 try {
-                    download(appCtx, key, url);
+                    ok = download(appCtx, key, url);
                 } catch (Throwable t) {
                     Timber.d("缓存台标失败: %s", t.getMessage());
                 } finally {
-                    // 无论成功失败都移除标记：失败后下次仍可重试（但不会在本次列表刷新中反复请求）
+                    if (ok) {
+                        failedAt.remove(key);
+                    } else {
+                        recordFailure(key);
+                    }
                     inFlight.remove(key);
                 }
             });
         } catch (Throwable t) {
+            // 队列满被拒绝不是该地址的问题，不记失败，下次绑定仍可排队
             inFlight.remove(key);
         }
     }
 
-    private static void download(Context context, String key, String url) throws Exception {
+    private static boolean inBackoff(String key) {
+        long[] f = failedAt.get(key);
+        if (f == null) return false;
+        long count = Math.max(1L, Math.min(f[0], 6L));
+        long wait = Math.min(FAIL_BACKOFF_BASE_MS << (count - 1), FAIL_BACKOFF_MAX_MS);
+        return android.os.SystemClock.elapsedRealtime() - f[1] < wait;
+    }
+
+    private static void recordFailure(String key) {
+        // 有界：频道极多时整体清空，最多多请求一轮，不会无界增长
+        if (failedAt.size() >= MAX_MEM_ENTRIES && !failedAt.containsKey(key)) failedAt.clear();
+        long[] old = failedAt.get(key);
+        long count = old == null ? 1L : old[0] + 1L;
+        failedAt.put(key, new long[]{count, android.os.SystemClock.elapsedRealtime()});
+    }
+
+    /** @return true 表示本地已有有效台标（新下载或早已存在） */
+    private static boolean download(Context context, String key, String url) throws Exception {
         File dir = cacheDir(context);
-        if (dir == null) return;
+        if (dir == null) return false;
         File target = new File(dir, key);
-        if (target.isFile() && target.length() > 0) return;
+        if (target.isFile() && target.length() > 0) return true;
 
         HttpURLConnection conn = null;
         try {
@@ -149,16 +185,28 @@ public final class LogoCache {
             conn.setReadTimeout(TIMEOUT_MS);
             conn.setInstanceFollowRedirects(true);
             conn.setRequestProperty("User-Agent", "okhttp/4.12.0");
-            if (conn.getResponseCode() / 100 != 2) return;
+            if (conn.getResponseCode() / 100 != 2) return false;
+            // 强制门户/错误页常以 200 返回 HTML，存下来会让该频道永久显示破图。
+            // 只拦 text/html：部分配置错误的台标站会把真实 PNG/JPEG 标成 text/plain，
+            // 真正的判定交给下面的文件头魔数校验
+            String ct = conn.getContentType();
+            if (ct != null && ct.toLowerCase(java.util.Locale.US).startsWith("text/html")) return false;
 
             // 先写临时文件再改名，避免中断产生半张损坏图片
             File tmp = new File(dir, key + ".tmp");
             int total = 0;
+            byte[] head = new byte[12];
+            int headLen = 0;
             try (InputStream in = conn.getInputStream();
                  FileOutputStream out = new FileOutputStream(tmp)) {
                 byte[] buf = new byte[8192];
                 int n;
                 while ((n = in.read(buf)) != -1) {
+                    if (headLen < head.length && n > 0) {
+                        int c = Math.min(head.length - headLen, n);
+                        System.arraycopy(buf, 0, head, headLen, c);
+                        headLen += c;
+                    }
                     total += n;
                     if (total > MAX_FILE_BYTES) {
                         break;
@@ -168,22 +216,71 @@ public final class LogoCache {
             }
             if (total <= 0 || total > MAX_FILE_BYTES) {
                 tmp.delete();
-                return;
+                return false;
+            }
+            // 不能只信 Content-Type（很多台标站给 octet-stream），以文件头魔数为准
+            if (!isImageHeader(head, headLen)) {
+                tmp.delete();
+                return false;
             }
             if (!tmp.renameTo(target)) {
                 tmp.delete();
-                return;
+                return false;
             }
             // 新下载完成，登记内存标记，下次绑定该频道即可直接命中本地文件
             if (localHit.size() < MAX_MEM_ENTRIES) {
                 localHit.put(key, target);
             }
             trimIfNeeded(dir);
+            return true;
         } finally {
             if (conn != null) {
                 try { conn.disconnect(); } catch (Throwable ignore) {}
             }
         }
+    }
+
+    /** 按文件头判断是否为 Glide/BitmapFactory 可解码的位图格式 */
+    private static boolean isImageHeader(byte[] b, int len) {
+        if (b == null || len < 4) return false;
+        // PNG
+        if ((b[0] & 0xFF) == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G') return true;
+        // JPEG
+        if ((b[0] & 0xFF) == 0xFF && (b[1] & 0xFF) == 0xD8 && (b[2] & 0xFF) == 0xFF) return true;
+        // GIF
+        if (b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8') return true;
+        // WEBP: "RIFF"....“WEBP”
+        if (len >= 12 && b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F'
+                && b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') return true;
+        // BMP
+        if (b[0] == 'B' && b[1] == 'M') return true;
+        // ICO
+        return b[0] == 0 && b[1] == 0 && b[2] == 1 && b[3] == 0;
+    }
+
+    /**
+     * 首次命中本地文件时校验一次文件头（之后走 localHit 不再碰磁盘），
+     * 顺带修复旧版本已存下的 HTML 等非图片文件：删掉后改走远程并重新缓存。
+     */
+    private static boolean validLocalImage(File f) {
+        byte[] head = new byte[12];
+        int len = 0;
+        try (InputStream in = new java.io.FileInputStream(f)) {
+            int n;
+            while (len < head.length && (n = in.read(head, len, head.length - len)) > 0) {
+                len += n;
+            }
+        } catch (Throwable t) {
+            // 读失败不当作坏文件删除，交给 Glide 处理
+            return true;
+        }
+        if (isImageHeader(head, len)) return true;
+        try {
+            f.delete();
+        } catch (Throwable ignore) {
+        }
+        Timber.d("本地台标不是有效图片，已删除: %s", f.getName());
+        return false;
     }
 
     /** 文件数超上限时删除最旧的一批 */
@@ -245,6 +342,8 @@ public final class LogoCache {
         try {
             // 先清内存标记，避免清盘后仍返回已删除的文件
             localHit.clear();
+            // 用户主动清缓存时也给失败过的台标一次重新下载的机会
+            failedAt.clear();
             File dir = cacheDir(context);
             if (dir == null) return;
             File[] files = dir.listFiles();

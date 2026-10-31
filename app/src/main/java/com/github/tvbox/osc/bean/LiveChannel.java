@@ -68,11 +68,17 @@ public class LiveChannel implements Serializable {
     /** 当前最优源的综合质量评分（0-100） */
     private int bestQualityScore;
 
+    /*
+     * 线路与速度列表采用"写时复制"：测速线程、数据库线程与主线程会同时访问同一频道，
+     * 所有删除/重排都生成新列表后整体替换，读方拿到的旧列表不会被并发修改
+     * （避免主线程 IndexOutOfBounds / ConcurrentModification 闪退）。
+     * 例外：addSourceUrl 仅在频道发布给界面之前的解析/合并阶段使用，原地追加。
+     */
     @Ignore
-    private List<String> sourceUrls;
+    private volatile List<String> sourceUrls;
 
     @Ignore
-    private List<Double> speeds;
+    private volatile List<Double> speeds;
 
     /**
      * 线路 URL 去重索引（与 sourceUrls 同步维护）。
@@ -101,15 +107,19 @@ public class LiveChannel implements Serializable {
 
     /** 获取当前播放源URL */
     public String getCurrentSourceUrl() {
-        if (sourceUrls != null && sourceIndex >= 0 && sourceIndex < sourceUrls.size()) {
-            return sourceUrls.get(sourceIndex);
+        // 读本地快照：避免判断与取值之间列表被其它线程替换
+        List<String> urls = sourceUrls;
+        int idx = sourceIndex;
+        if (urls != null && idx >= 0 && idx < urls.size()) {
+            return urls.get(idx);
         }
         return null;
     }
 
     /** 切换到下一个源 */
     public boolean switchToNextSource() {
-        if (sourceUrls != null && sourceIndex < sourceUrls.size() - 1) {
+        List<String> urls = sourceUrls;
+        if (urls != null && sourceIndex < urls.size() - 1) {
             sourceIndex++;
             return true;
         }
@@ -156,7 +166,8 @@ public class LiveChannel implements Serializable {
 
     /** 获取源数量 */
     public int getSourceCount() {
-        return sourceUrls != null ? sourceUrls.size() : 0;
+        List<String> urls = sourceUrls;
+        return urls != null ? urls.size() : 0;
     }
 
     /**
@@ -165,16 +176,21 @@ public class LiveChannel implements Serializable {
      *
      * @return 是否发生了移动
      */
-    public boolean moveSourceToTop(String url) {
-        if (url == null || sourceUrls == null) return false;
-        int idx = sourceUrls.indexOf(url);
+    public synchronized boolean moveSourceToTop(String url) {
+        List<String> urls = sourceUrls;
+        if (url == null || urls == null) return false;
+        int idx = urls.indexOf(url);
         if (idx <= 0) return false; // 不存在或已在首位
-        String u = sourceUrls.remove(idx);
-        sourceUrls.add(0, u);
-        if (speeds != null && idx < speeds.size()) {
-            Double s = speeds.remove(idx);
-            speeds.add(0, s);
+        // 写时复制：生成新列表后整体替换（URL 集合不变，urlSet 无需调整）
+        List<String> newUrls = new ArrayList<>(urls);
+        newUrls.add(0, newUrls.remove(idx));
+        List<Double> sp = speeds;
+        if (sp != null && idx < sp.size()) {
+            List<Double> newSpeeds = new ArrayList<>(sp);
+            newSpeeds.add(0, newSpeeds.remove(idx));
+            speeds = newSpeeds;
         }
+        sourceUrls = newUrls;
         sourceIndex = 0;
         return true;
     }
@@ -184,18 +200,26 @@ public class LiveChannel implements Serializable {
      *
      * @return 是否成功移除
      */
-    public boolean removeSource(String url) {
-        if (url == null || sourceUrls == null) return false;
-        int idx = sourceUrls.indexOf(url);
+    public synchronized boolean removeSource(String url) {
+        List<String> urls = sourceUrls;
+        if (url == null || urls == null) return false;
+        int idx = urls.indexOf(url);
         if (idx < 0) return false;
-        sourceUrls.remove(idx);
-        if (urlSet != null) urlSet.remove(url);
-        if (speeds != null && idx < speeds.size()) {
-            speeds.remove(idx);
+        // 写时复制：生成新列表后整体替换
+        List<String> newUrls = new ArrayList<>(urls);
+        newUrls.remove(idx);
+        List<Double> sp = speeds;
+        if (sp != null && idx < sp.size()) {
+            List<Double> newSpeeds = new ArrayList<>(sp);
+            newSpeeds.remove(idx);
+            speeds = newSpeeds;
         }
+        sourceUrls = newUrls;
+        // 去重索引失效，下次 addSourceUrl 时按新列表懒重建（HashSet 非线程安全，不在此原地修改）
+        urlSet = null;
         // 修正当前索引，保持指向有效范围
-        if (sourceIndex >= sourceUrls.size()) {
-            sourceIndex = Math.max(0, sourceUrls.size() - 1);
+        if (sourceIndex >= newUrls.size()) {
+            sourceIndex = Math.max(0, newUrls.size() - 1);
         } else if (idx < sourceIndex) {
             sourceIndex--;
         }
@@ -206,7 +230,10 @@ public class LiveChannel implements Serializable {
      * 按给定 URL 顺序重排线路（仅重排列表中已存在的 URL，未列出的保持在其后，
      * speeds 同步跟随）。用于恢复用户自定义的线路置顶顺序。
      */
-    public void reorderSourcesBy(java.util.List<String> orderedUrls) {
+    public synchronized void reorderSourcesBy(java.util.List<String> orderedUrls) {
+        // 读本地快照，下面只读旧列表、生成新列表后整体替换（写时复制）
+        List<String> sourceUrls = this.sourceUrls;
+        List<Double> speeds = this.speeds;
         if (orderedUrls == null || orderedUrls.isEmpty()
                 || sourceUrls == null || sourceUrls.isEmpty()) {
             return;
@@ -241,10 +268,70 @@ public class LiveChannel implements Serializable {
                 if (hasSpeeds) newSpeeds.add(speeds.get(i));
             }
         }
-        sourceUrls = newUrls;
-        urlSet = added;
-        if (hasSpeeds) speeds = newSpeeds;
-        sourceIndex = 0;
+        // 顺序未变（每次重建展示列表都会重新应用置顶顺序）：保持当前索引，不打断正在播的线路
+        if (newUrls.equals(sourceUrls)) {
+            if (this.urlSet == null) this.urlSet = added;
+            return;
+        }
+        int newIndex = remapIndex(sourceUrls, newUrls);
+        this.sourceUrls = newUrls;
+        this.urlSet = added;
+        if (hasSpeeds) this.speeds = newSpeeds;
+        sourceIndex = newIndex;
+    }
+
+    /*
+     * 正在播放的频道与线路提示（由播放界面在真正加载某条线路时调用 setPlayingHint 设置）。
+     * 测速排序/重排会作用于所有频道，但只有正在播放的频道需要让索引跟随播放器实际所在的 URL；
+     * 其它频道应像 v1.2.3 一样回到新的首条（测速最优/置顶线路），否则下次切到它时会从旧的慢线路开始。
+     * 用静态字段而非实例字段：切台时只需覆盖一次，旧频道无需手动清除；static 不参与 Room/序列化。
+     */
+    private static volatile String sPlayingKey;
+    private static volatile String sPlayingUrl;
+
+    /**
+     * 记录当前正在播放的频道及其实际加载的线路 URL（播放界面在 initPlayer 时调用；停止播放可传 null 清除）。
+     * 设置后，排序/重排仅对该频道按此 URL 重新定位索引，其它频道一律复位到 0。
+     */
+    public static void setPlayingHint(LiveChannel channel, String url) {
+        // 先写 URL 再写 key：读方以 key 匹配为准，避免读到新 key + 旧 URL
+        sPlayingUrl = channel == null ? null : url;
+        sPlayingKey = channel == null ? null : channel.getKey();
+    }
+
+    /**
+     * 让当前索引指向给定 URL（用于播放界面按播放器实际加载的 URL 重新同步，例如测速完成或换源前）。
+     *
+     * @return URL 存在于当前线路列表并已同步时返回 true
+     */
+    public boolean syncSourceIndexTo(String url) {
+        List<String> urls = sourceUrls;
+        if (url == null || urls == null) return false;
+        int i = urls.indexOf(url);
+        if (i < 0) return false;
+        sourceIndex = i;
+        return true;
+    }
+
+    /**
+     * 重排后重新定位当前线路索引。
+     * <p>已设置播放提示时：仅提示中正在播放的频道按其实际播放 URL 在新列表中定位（含索引 0 的情况），
+     * 原线路已不在列表时回落 0；其它频道一律复位到 0（新的最优/置顶线路），与 v1.2.3 一致。
+     * <p>未设置播放提示时（兼容旧调用方）：sourceIndex == 0 视为"默认从首条开始"，仍指向新的首条；
+     * sourceIndex > 0 说明手动切过线路或已自动换源，按 URL 重新定位，避免"▶"标错行、换源重复/跳过线路。
+     */
+    private int remapIndex(List<String> oldUrls, List<String> newUrls) {
+        String playingKey = sPlayingKey;
+        if (playingKey != null) {
+            if (!playingKey.equals(getKey())) return 0;
+            String playing = sPlayingUrl;
+            int ni = playing == null ? -1 : newUrls.indexOf(playing);
+            return ni < 0 ? 0 : ni;
+        }
+        int idx = sourceIndex;
+        if (idx <= 0 || oldUrls == null || idx >= oldUrls.size()) return 0;
+        int ni = newUrls.indexOf(oldUrls.get(idx));
+        return ni < 0 ? 0 : ni;
     }
 
     /**
@@ -255,31 +342,32 @@ public class LiveChannel implements Serializable {
         return (groupName == null ? "" : groupName) + "\u0001" + (channelName == null ? "" : channelName);
     }
 
-    /** 根据速度排序源（最快的排在前面） */
-    public void sortSourcesBySpeed() {
-        if (sourceUrls == null || speeds == null || sourceUrls.size() != speeds.size()) return;
-        // 简单冒泡排序
-        for (int i = 0; i < speeds.size() - 1; i++) {
-            for (int j = 0; j < speeds.size() - 1 - i; j++) {
-                // 用 speedAt 取值：speeds 是 List<Double>，元素可能为 null
-                // （JSON 反序列化或外部 setSpeeds 传入），直接比较/赋给 double 会拆箱 NPE
-                if (speedAt(j) < speedAt(j + 1)) {
-                    // 交换速度
-                    Double tempSpeed = speeds.get(j);
-                    speeds.set(j, speeds.get(j + 1));
-                    speeds.set(j + 1, tempSpeed);
-                    // 同时交换URL
-                    String tempUrl = sourceUrls.get(j);
-                    sourceUrls.set(j, sourceUrls.get(j + 1));
-                    sourceUrls.set(j + 1, tempUrl);
-                }
-            }
+    /**
+     * 根据速度排序源（最快的排在前面，同速保持原顺序）。
+     * 稳定排序，结果与原冒泡排序（仅在严格小于时交换）完全一致；
+     * 生成新列表整体替换（写时复制），不在读方持有的列表上原地交换。
+     */
+    public synchronized void sortSourcesBySpeed() {
+        List<String> urls = sourceUrls;
+        List<Double> sp = speeds;
+        if (urls == null || sp == null || urls.size() != sp.size()) return;
+        int n = sp.size();
+        // 预取排序键：speeds 元素可能为 null（JSON 反序列化或外部 setSpeeds 传入），统一视为 0 避免拆箱 NPE；
+        // NaN 也视为 0，保证比较器满足全序（否则 TimSort 可能抛 "Comparison method violates its general contract"）
+        final double[] keys = new double[n];
+        for (int i = 0; i < n; i++) {
+            double v = speedAt(sp, i);
+            keys[i] = Double.isNaN(v) ? 0d : v;
         }
-        sourceIndex = 0;
+        applyOrder(urls, sp, sortedIndices(n, (a, b) -> {
+            // 降序；与原冒泡的 "<" 判定保持一致（-0.0 与 0.0 视为相等，不用 Double.compare）
+            double x = keys[a], y = keys[b];
+            return x < y ? 1 : (y < x ? -1 : 0);
+        }));
     }
 
     /** 安全读取速度值，null 视为 0（避免 Double 拆箱 NPE） */
-    private double speedAt(int index) {
+    private static double speedAt(List<Double> speeds, int index) {
         if (speeds == null || index < 0 || index >= speeds.size()) return 0d;
         Double v = speeds.get(index);
         return v == null ? 0d : v;
@@ -293,33 +381,42 @@ public class LiveChannel implements Serializable {
     }
 
     /**
-     * 按给定的质量评分数组重排线路（得分越高越靠前）。
+     * 按给定的质量评分数组重排线路（得分越高越靠前，同分保持原顺序）。
      * scores 长度必须与 sourceUrls 相同。speeds 也会同步跟随。
+     * 不再修改传入的 scores 列表（调用方均为临时构造的列表）。
      */
-    public void sortSourcesByScores(List<Integer> scores) {
-        if (sourceUrls == null || scores == null || sourceUrls.size() != scores.size()) return;
-        boolean hasSpeeds = speeds != null && speeds.size() == sourceUrls.size();
+    public synchronized void sortSourcesByScores(List<Integer> scores) {
+        List<String> urls = sourceUrls;
+        if (urls == null || scores == null || urls.size() != scores.size()) return;
         int n = scores.size();
-        // 简单冒泡（源数量通常 <= 10，性能足够）
-        for (int i = 0; i < n - 1; i++) {
-            for (int j = 0; j < n - 1 - i; j++) {
-                // scores/speeds 元素均可能为 null，统一走安全取值避免拆箱 NPE
-                if (scoreAt(scores, j) < scoreAt(scores, j + 1)) {
-                    Integer ts = scores.get(j);
-                    scores.set(j, scores.get(j + 1));
-                    scores.set(j + 1, ts);
-                    String tu = sourceUrls.get(j);
-                    sourceUrls.set(j, sourceUrls.get(j + 1));
-                    sourceUrls.set(j + 1, tu);
-                    if (hasSpeeds) {
-                        Double td = speeds.get(j);
-                        speeds.set(j, speeds.get(j + 1));
-                        speeds.set(j + 1, td);
-                    }
-                }
-            }
+        final int[] keys = new int[n];
+        for (int i = 0; i < n; i++) keys[i] = scoreAt(scores, i);
+        applyOrder(urls, speeds, sortedIndices(n, (a, b) -> Integer.compare(keys[b], keys[a])));
+    }
+
+    /** 生成按比较器排序后的下标序列（Collections.sort 为稳定排序） */
+    private static List<Integer> sortedIndices(int n, java.util.Comparator<Integer> cmp) {
+        List<Integer> order = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) order.add(i);
+        java.util.Collections.sort(order, cmp);
+        return order;
+    }
+
+    /** 按下标序列由旧列表生成新的 urls/speeds 并整体替换（写时复制；URL 集合不变，urlSet 无需调整） */
+    private void applyOrder(List<String> urls, List<Double> sp, List<Integer> order) {
+        if (urls == null || order.size() != urls.size()) return;
+        boolean hasSpeeds = sp != null && sp.size() == urls.size();
+        List<String> newUrls = new ArrayList<>(urls.size());
+        List<Double> newSpeeds = hasSpeeds ? new ArrayList<>(urls.size()) : null;
+        for (int i : order) {
+            newUrls.add(urls.get(i));
+            if (hasSpeeds) newSpeeds.add(sp.get(i));
         }
-        sourceIndex = 0;
+        // 测速排序可能作用于正在播放的频道：仅该频道按实际播放 URL 重新定位，其它频道复位到最优线路（见 remapIndex）
+        int newIndex = remapIndex(urls, newUrls);
+        sourceUrls = newUrls;
+        if (hasSpeeds) speeds = newSpeeds;
+        sourceIndex = newIndex;
     }
 
     // ============ Getter / Setter ============

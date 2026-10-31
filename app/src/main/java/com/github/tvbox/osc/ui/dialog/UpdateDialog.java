@@ -57,6 +57,12 @@ public final class UpdateDialog {
         private final ProgressBar progress;
         private final TextView tvState;
         private boolean downloading = false;
+        /** 当前下载任务；弹窗关闭（稍后/跳过/返回键）时取消，避免后台继续下载并弹出安装器 */
+        private UpdateManager.DownloadTask task;
+        /** 弹窗已关闭：之后的下载回调一律忽略 */
+        private volatile boolean closed = false;
+        /** 已下载完成、但因缺少「安装未知应用」授权尚未安装的安装包 */
+        private File downloadedApk;
 
         Builder(Context ctx, UpdateManager.UpdateInfo info) {
             this.ctx = ctx;
@@ -131,7 +137,14 @@ public final class UpdateDialog {
             row.addView(btnLater, rowLp());
             root.addView(row);
 
-            btnInstall.setOnClickListener(v -> startDownload());
+            btnInstall.setOnClickListener(v -> {
+                // 已下载好（等待授权）时直接安装，不再重新下载
+                if (downloadedApk != null && downloadedApk.isFile()) {
+                    installDownloaded(downloadedApk);
+                } else {
+                    startDownload();
+                }
+            });
             btnSkip.setOnClickListener(v -> {
                 Hawk.put(com.github.tvbox.osc.util.HawkConfig.UPDATE_SKIP_VERSION, info.version);
                 ToastUtil.show(ctx, "已跳过该版本");
@@ -147,6 +160,65 @@ public final class UpdateDialog {
                 dialog.getWindow().setLayout(dp(560), ViewGroup.LayoutParams.WRAP_CONTENT);
             }
             dialog.setCancelable(true);
+            // 稍后 / 跳过 / 返回键都会走到这里：统一取消下载
+            dialog.setOnDismissListener(d -> {
+                closed = true;
+                cancelTask();
+            });
+        }
+
+        private void cancelTask() {
+            UpdateManager.DownloadTask t = task;
+            task = null;
+            if (t != null) {
+                t.cancel();
+                if (downloading) com.github.tvbox.osc.util.RunLog.i("更新弹窗关闭，已取消下载");
+            }
+        }
+
+        /** 宿主页面已销毁（弹窗窗口随之失效，DismissListener 不一定会回调） */
+        private boolean hostGone() {
+            if (ctx instanceof android.app.Activity) {
+                android.app.Activity act = (android.app.Activity) ctx;
+                return act.isFinishing() || act.isDestroyed();
+            }
+            return false;
+        }
+
+        /** 回调是否已失效；失效时顺带取消下载 */
+        private boolean stale() {
+            if (closed || hostGone()) {
+                closed = true;
+                cancelTask();
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * 安装已下载的包。Android 8+ 未授权「安装未知应用」时 installApk 只会跳转授权页，
+         * 此时保留弹窗并把按钮改为「安装」，用户授权后按返回即可直接安装，无需重新下载。
+         */
+        private void installDownloaded(File apkFile) {
+            boolean needPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                    && !ctx.getPackageManager().canRequestPackageInstalls();
+            if (!needPermission) {
+                tvState.setVisibility(android.view.View.VISIBLE);
+                tvState.setText("下载完成，正在唤起安装器");
+                dismiss();
+                UpdateManager.installApk(ctx, apkFile);
+                return;
+            }
+            downloadedApk = apkFile;
+            downloading = false;
+            progress.setVisibility(android.view.View.GONE);
+            tvState.setVisibility(android.view.View.VISIBLE);
+            tvState.setText("需要允许「安装未知应用」：授权后按返回键回到这里，再点「安装」");
+            btnInstall.setText("安装");
+            btnInstall.setEnabled(true);
+            btnInstall.setFocusable(true);
+            btnInstall.requestFocus();
+            UpdateManager.installApk(ctx, apkFile);
         }
 
         void show() {
@@ -171,22 +243,26 @@ public final class UpdateDialog {
             tvState.setVisibility(android.view.View.VISIBLE);
             tvState.setText("正在下载...");
 
-            UpdateManager.download(ctx, info, new UpdateManager.DownloadListener() {
+            task = UpdateManager.download(ctx, info, new UpdateManager.DownloadListener() {
                 @Override
                 public void onProgress(int percent) {
+                    if (stale()) return;
                     progress.setProgress(percent);
                     tvState.setText("正在下载... " + percent + "%");
                 }
 
                 @Override
                 public void onFinished(File apkFile) {
-                    tvState.setText("下载完成，正在唤起安装器");
-                    dismiss();
-                    UpdateManager.installApk(ctx, apkFile);
+                    // 用户已选择稍后/跳过/返回，或页面已销毁：不再弹安装器
+                    if (stale()) return;
+                    task = null;
+                    installDownloaded(apkFile);
                 }
 
                 @Override
                 public void onFailed(String message) {
+                    if (stale()) return;
+                    task = null;
                     downloading = false;
                     btnInstall.setEnabled(true);
                     btnInstall.setFocusable(true);

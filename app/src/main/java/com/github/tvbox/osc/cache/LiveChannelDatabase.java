@@ -94,6 +94,13 @@ public abstract class LiveChannelDatabase extends RoomDatabase {
         @Query("UPDATE live_channels SET lastPlayTime = :time WHERE id = :channelId")
         void updateLastPlayTime(long channelId, long time);
 
+        /**
+         * 按 频道名 + 分组 更新播放时间。
+         * 网络拉取的频道对象 id 恒为 0（写库后 Room 不回填自增 id），按 id 更新不会命中任何行。
+         */
+        @Query("UPDATE live_channels SET lastPlayTime = :time WHERE channelName = :name AND groupName = :group")
+        void updateLastPlayTimeByName(String name, String group, long time);
+
         @Query("SELECT * FROM live_channels ORDER BY lastPlayTime DESC LIMIT :limit")
         List<LiveChannel> getRecentChannels(int limit);
 

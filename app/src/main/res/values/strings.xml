@@ -20,6 +20,7 @@
     <string name="switching_source">切换源中…</string>
     <string name="source_format">源 %1$d/%2$d</string>
     <string name="exit_confirm">确定要退出直播吗？</string>
+    <string name="channel_list_hint">OK 播放 · 长按 线路管理 · 左右 切换分组/频道 · 返回 关闭</string>
 
     <!-- 分组 -->
     <string name="group_cctv">央视</string>
@@ -93,4 +94,9 @@
     <string name="unit_seconds">%d 秒</string>
     <string name="unit_threads">%d 线程</string>
     <string name="unit_kbps">%d KB/s</string>
+    <!-- 开机自启通知（Android 10+ 后台无法直接拉起界面时使用） -->
+    <string name="boot_channel_name">开机自动启动</string>
+    <string name="boot_channel_desc">开机后提示打开直播界面</string>
+    <string name="boot_notify_title">开机自动启动</string>
+    <string name="boot_notify_text">点击打开直播</string>
 </resources>

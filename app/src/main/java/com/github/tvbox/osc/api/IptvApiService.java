@@ -10,17 +10,21 @@ import com.orhanobut.hawk.Hawk;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import okhttp3.OkHttpClient;
@@ -79,6 +83,58 @@ public class IptvApiService {
     /** 低内存设备上子仓并发展开的最大线程数（正常设备用 {@link #REPO_FETCH_CONCURRENCY}） */
     private static final int REPO_FETCH_CONCURRENCY_LOW = 3;
 
+    /**
+     * 外部源并发拉取数（滑动窗口大小）：正常设备 / 低内存设备。
+     * 合并仍按源的原始顺序进行，窗口只决定"最多领先合并游标几个源"，
+     * 因此同时驻留堆上的已下载未合并结果最多为窗口大小个，低内存设备收紧到 2。
+     */
+    private static final int SOURCE_FETCH_CONCURRENCY = 6;
+    private static final int SOURCE_FETCH_CONCURRENCY_LOW = 2;
+
+    /**
+     * 单次 HTTP 调用（含读完响应体）的整体超时（秒）。
+     *
+     * <p>只作为"涓流服务器永远读不完"的兜底：真正的卡死检测靠 readTimeout（无数据到达即触发）。
+     * 原先 60s 在 6 路并发分带宽时，会把慢速主机上数 MB 的有效大源硬生生掐断；
+     * 且这类超时不计入自动删除（见 {@link #isTotalTimeout}）。
+     */
+    private static final long CALL_TIMEOUT_SEC = 300L;
+
+    /** 并发拦截时回调的错误信息；ChannelManager 据此识别"忙"并排队等待当前任务结束 */
+    public static final String ERROR_BUSY = "正在获取直播源，请稍候";
+
+    /**
+     * 当前聚合任务结束（fetching 复位）后需要执行的回调。
+     * 由 {@link #runAfterCurrentFetch} 注册，在拉源线程 finally 中统一执行。
+     */
+    private final List<Runnable> afterFetchActions = new ArrayList<>();
+
+    /**
+     * 最近一次聚合是否"网络受损"：拉源期间设备处于断网状态，或"上次拉取成功的源"
+     * 本轮超过一半因网络原因（DNS/连接/超时）失败。
+     * 典型场景是开机自启时 Wi-Fi 尚未连好、或刷新中途断网。
+     * 供 ChannelManager 判断是否用这份残缺结果覆盖完整缓存。
+     *
+     * <p>不能按"全部展开源的失败比例"判定：公共聚合订阅/多仓展开出的数百个子源里
+     * 大部分主机本就已失效（DNS 失败/拒绝连接），网络正常时也会过半失败，
+     * 那样每轮都会被误判为受损（新结果永远不被采用、每次启动都全量重拉、失效域名永不清理）。
+     */
+    private volatile boolean lastFetchDegraded = false;
+
+    /**
+     * 上次拉取成功的外部源（URL 的 hashCode 十六进制，逗号分隔）。
+     * 只有"之前能拉到、这次却因网络失败"才说明网络本身出了问题；一直失效的源不参与判定。
+     * 存哈希而非完整 URL：订阅展开后成功源可达数百个，完整 URL 每轮写入 Hawk 开销偏大。
+     */
+    private static final String KEY_HEALTHY_SOURCES = "iptv_healthy_source_hashes";
+
+    /**
+     * TXT 频道行特征片段："名称,http(s)://"。
+     * 用 find() 定位即可；原 matches("(?s).*\\w+,https?://.*") 需整体匹配，
+     * 在数 MB 文本上 .* 回溯极慢。
+     */
+    private static final Pattern TXT_LINE_PATTERN = Pattern.compile("\\w,https?://");
+
     /** 获取状态回调接口 */
     public interface FetchCallback {
         void onSuccess(List<ChannelGroup> groups, int totalChannels);
@@ -87,8 +143,13 @@ public class IptvApiService {
     }
 
     private IptvApiService() {
-        // 复用全局共享客户端，避免每个服务各自持有一套连接池与 Dispatcher 线程池
-        httpClient = com.github.tvbox.osc.util.HttpClients.shared();
+        // 复用全局共享客户端，避免每个服务各自持有一套连接池与 Dispatcher 线程池。
+        // 派生实例只额外加整体超时兜底：connect/read 超时只约束单次等待，
+        // 慢速服务器持续"涓流"返回数据时永远不会触发，拉源线程会被无限期挂住。
+        // 派生客户端复用同一套连接池与线程池；不直接改共享客户端，避免影响 EPG 等大文件下载。
+        httpClient = com.github.tvbox.osc.util.HttpClients.shared().newBuilder()
+                .callTimeout(CALL_TIMEOUT_SEC, TimeUnit.SECONDS)
+                .build();
         parser = new LiveSourceParser();
     }
 
@@ -119,13 +180,13 @@ public class IptvApiService {
 
         try (Response response = httpClient.newCall(request).execute()) {
             if (!response.isSuccessful()) {
-                throw new IOException("请求失败: HTTP " + response.code() + " " + response.message());
+                throw new SourceContentException("请求失败: HTTP " + response.code() + " " + response.message());
             }
 
             // 有上限地读取响应体，避免个别源返回超大/异常内容导致 OOM（尤其在低内存电视上）
             String body = readBodyLimited(response, sourceBodyLimit());
             if (body.isEmpty()) {
-                throw new IOException("返回数据为空");
+                throw new SourceContentException("返回数据为空");
             }
 
             Timber.d("获取到直播源数据，大小: %d 字节", body.length());
@@ -217,6 +278,10 @@ public class IptvApiService {
             byte[] buf = new byte[8192];
             int n;
             while ((n = in.read(buf)) != -1) {
+                // 被取消（内存吃紧提前收尾时 cancel(true)）后立即停止下载，不再继续占用堆
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new java.io.InterruptedIOException("cancelled");
+                }
                 if (bos.size() + n > maxBytes) {
                     bos.write(buf, 0, maxBytes - bos.size());
                     Timber.w("源内容过大，已截断至 %d MB", maxBytes / 1024 / 1024);
@@ -224,7 +289,150 @@ public class IptvApiService {
                 }
                 bos.write(buf, 0, n);
             }
-            return bos.toString("UTF-8");
+            // 直接按字节解码不会像 OkHttp body.string() 那样去掉 UTF-8 BOM，
+            // 且 String.trim() 不会删 U+FEFF：残留时首个分组/频道名带不可见前缀，
+            // 会出现两个同名分组、或频道名与模板对不上被丢弃
+            return stripBom(bos.toString("UTF-8"));
+        }
+    }
+
+    /** 去掉字符串开头的 UTF-8 BOM（U+FEFF） */
+    static String stripBom(String s) {
+        if (s != null && !s.isEmpty() && s.charAt(0) == '\ufeff') return s.substring(1);
+        return s;
+    }
+
+    /**
+     * 源内容层面的失败（HTTP 错误码、返回空内容）：服务器明确给出了"无效"的答复，
+     * 与网络不通/超时区分开，前者计入连续未入选，后者在网络受损时不计。
+     */
+    static final class SourceContentException extends IOException {
+        SourceContentException(String msg) {
+            super(msg);
+        }
+    }
+
+    /**
+     * 是否为 callTimeout 整体超时 / 被取消：OkHttp 对此抛出非 SocketTimeoutException 的
+     * InterruptedIOException。这只说明"源太大或主机慢"，源本身是有效的，绝不计入自动删除。
+     */
+    private static boolean isTotalTimeout(Throwable t) {
+        return t instanceof java.io.InterruptedIOException
+                && !(t instanceof java.net.SocketTimeoutException);
+    }
+
+    /**
+     * 若当前有聚合任务在执行，则在其结束（结果已回调、fetching 已复位）后执行 action；
+     * 否则立即在调用线程执行。
+     *
+     * <p>用于测速准备阶段：被并发拦截时不能拿"即将被后台刷新替换的旧列表"去测速，
+     * 否则测速排序作用在随后被丢弃的旧对象上，持久化时却裁剪了未排序的新列表。
+     */
+    public void runAfterCurrentFetch(Runnable action) {
+        if (action == null) return;
+        synchronized (afterFetchActions) {
+            if (fetching.get()) {
+                afterFetchActions.add(action);
+                return;
+            }
+        }
+        action.run();
+    }
+
+    /** 最近一次聚合是否网络受损（见 {@link #lastFetchDegraded}） */
+    public boolean isLastFetchDegraded() {
+        return lastFetchDegraded;
+    }
+
+    /**
+     * 系统是否报告存在已连接的网络。无法判断（无 Context / 异常）时按已连接处理，
+     * 只把明确的"断网"作为网络受损信号。
+     */
+    @SuppressWarnings("deprecation")
+    private static boolean isNetworkConnected() {
+        try {
+            android.content.Context ctx = com.github.tvbox.osc.App.getInstance();
+            if (ctx == null) return true;
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    ctx.getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            // getActiveNetworkInfo 在 API 21 起可用；API 29 起废弃但仍正常返回
+            android.net.NetworkInfo info = cm.getActiveNetworkInfo();
+            if (info != null && info.isConnected()) return true;
+            // 个别盒子 ROM 的有线网络（以太网）不会成为"默认网络"，只看 active 会把每次拉源都判成断网：
+            // 网络受损后不再自动删除失效源、后台刷新结果全被丢弃且每次启动都全量重拉。
+            // 因此再遍历所有网络，任一可用即视为在线；只有明确全部断开才返回 false。
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                android.net.Network[] all = cm.getAllNetworks();
+                if (all != null) {
+                    for (android.net.Network n : all) {
+                        if (n == null) continue;
+                        android.net.NetworkCapabilities caps = cm.getNetworkCapabilities(n);
+                        if (caps != null && caps.hasCapability(
+                                android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                            return true;
+                        }
+                        android.net.NetworkInfo ni = cm.getNetworkInfo(n);
+                        if (ni != null && ni.isConnected()) return true;
+                    }
+                }
+            } else {
+                android.net.NetworkInfo[] infos = cm.getAllNetworkInfo();
+                if (infos != null) {
+                    for (android.net.NetworkInfo ni : infos) {
+                        if (ni != null && ni.isConnected()) return true;
+                    }
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            // 无法判断时按在线处理：不单凭这一项把本次拉源标成网络受损
+            return true;
+        }
+    }
+
+    /** 读取"上次拉取成功的源"哈希集合（见 {@link #KEY_HEALTHY_SOURCES}） */
+    private static Set<String> loadHealthySources() {
+        Set<String> set = new HashSet<>();
+        try {
+            String s = Hawk.get(KEY_HEALTHY_SOURCES, "");
+            if (s != null && !s.isEmpty()) {
+                for (String h : s.split(",")) {
+                    if (!h.isEmpty()) set.add(h);
+                }
+            }
+        } catch (Throwable t) {
+            Timber.w(t, "读取上次成功源集合失败");
+        }
+        return set;
+    }
+
+    /**
+     * 写回"上次拉取成功的源"：本轮处理过的以本轮结果为准，未处理的保留旧状态，
+     * 不在当前外部源列表中的剔除。
+     */
+    private static void saveHealthySources(Set<String> before, Set<String> processed,
+                                           Set<String> fetchedOk, Set<String> currentUrls) {
+        try {
+            Set<String> current = new HashSet<>();
+            if (currentUrls != null) {
+                for (String u : currentUrls) {
+                    if (u != null) current.add(Integer.toHexString(u.hashCode()));
+                }
+            }
+            Set<String> result = new LinkedHashSet<>();
+            for (String h : before) {
+                if (!processed.contains(h) && current.contains(h)) result.add(h);
+            }
+            result.addAll(fetchedOk);
+            StringBuilder sb = new StringBuilder();
+            for (String h : result) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(h);
+            }
+            Hawk.put(KEY_HEALTHY_SOURCES, sb.toString());
+        } catch (Throwable t) {
+            Timber.w(t, "保存成功源集合失败");
         }
     }
 
@@ -262,24 +470,31 @@ public class IptvApiService {
         if (!fetching.compareAndSet(false, true)) {
             Timber.w("已有直播源聚合任务在执行，忽略本次请求");
             if (callback != null) {
-                try { callback.onError("正在获取直播源，请稍候"); } catch (Throwable ignore) {}
+                try { callback.onError(ERROR_BUSY); } catch (Throwable ignore) {}
             }
             return;
         }
+        lastFetchDegraded = false;
         Thread worker = new Thread(() -> {
+            ExecutorService pool = null;
             try {
                 com.github.tvbox.osc.util.RunLog.i("fetchAndMergeSources: 开始");
                 // 0) 加载频道改名（别名）规则，解析阶段即按规则改名
                 loadAliasRules(callback);
 
                 List<ChannelGroup> allGroups = new ArrayList<>();
+                // 分组名 -> 分组内频道索引，跨所有源复用，避免每合并一个源都重建一次索引
+                Map<String, GroupIndex> groupIndex = new HashMap<>();
 
                 // 记录每个"可删除源"（自定义源 / 订阅源）产出的 URL 集合，用于入选判定
                 Map<String, Set<String>> sourceUrlMap = new LinkedHashMap<>();
 
-                // 自定义源（其中的多仓链接会被展开为具体直播源）
-                List<String> customUrls = expandCustomSources(
-                        parseCustomSourceUrls(Hawk.get(HawkConfig.IPTV_CUSTOM_SOURCES, "")), callback);
+                // 自定义源（其中的多仓链接会被展开为具体直播源）。
+                // 保留用户原始填写的列表：自动删除只能作用在原始地址上，绝不能把展开后的
+                // 子直播源写回设置（否则用户的多仓链接会被替换成成百上千个固化的子地址）
+                List<String> rawCustomUrls =
+                        parseCustomSourceUrls(Hawk.get(HawkConfig.IPTV_CUSTOM_SOURCES, ""));
+                List<String> customUrls = expandCustomSources(rawCustomUrls, callback);
                 com.github.tvbox.osc.util.RunLog.i("自定义源展开完成: " + customUrls.size() + " 个");
                 // 多仓链接（配置页/手机配置页显式指定，其中的子仓会被展开为具体直播源）
                 List<String> multiRepoUrls = expandCustomSources(
@@ -290,28 +505,71 @@ public class IptvApiService {
                 com.github.tvbox.osc.util.RunLog.i("订阅列表展开完成: " + subscribeUrls.size() + " 个");
 
                 // 所有"外部源"（自定义 + 多仓 + 订阅），它们都参与连续未入选自动删除统计
+                // 用 Set 去重：订阅/多仓展开后可达数百个地址，List#contains 去重为 O(n²)
                 List<String> externalUrls = new ArrayList<>();
-                externalUrls.addAll(customUrls);
+                Set<String> externalSet = new HashSet<>();
+                for (String u : customUrls) {
+                    if (externalSet.add(u)) externalUrls.add(u);
+                }
                 for (String u : multiRepoUrls) {
-                    if (!externalUrls.contains(u)) externalUrls.add(u);
+                    if (externalSet.add(u)) externalUrls.add(u);
                 }
                 for (String u : subscribeUrls) {
-                    if (!externalUrls.contains(u)) externalUrls.add(u);
+                    if (externalSet.add(u)) externalUrls.add(u);
                 }
 
                 com.github.tvbox.osc.util.RunLog.i("待拉取外部源合计: " + externalUrls.size() + " 个"
                         + "（低内存设备=" + isLowMemoryDevice() + "，单源上限="
                         + sourceBodyLimit() / 1024 + "KB）");
                 int totalSteps = externalUrls.size();
-                int step = 0;
+                boolean anyFetched = false;
+                // 开始拉源时设备是否断网（开机自启时 Wi-Fi/有线尚未就绪的典型信号）
+                boolean sawOffline = !isNetworkConnected();
+                // 上次拉取成功的源（哈希），以及本轮实际拉取成功的源
+                Set<String> healthyBefore = loadHealthySources();
+                Set<String> fetchedOk = new HashSet<>();
+                Set<String> processedSet = new HashSet<>();
+                // "上次成功"的源本轮的处理数 / 因网络原因失败数，用于判定网络受损
+                int healthyProcessed = 0;
+                int healthyNetFailed = 0;
+                // 网络原因（DNS/连接/读超时等）拉取失败的源：仅在本轮网络整体正常时才计入未入选
+                List<String> netFailed = new ArrayList<>();
+                // 整体超时/被取消的源：只说明源大或主机慢，任何情况下都不计入未入选
+                int timeoutFailed = 0;
+                // 实际处理过（已取结果）的源数，仅用于日志
+                int processed = 0;
 
                 // 直播源仅来自外部源（自定义 + 订阅列表）合并的整体订阅源，
-                // 内容格式自动识别（TXT / M3U），无需再从 IPTV-API 拉取
-                for (String srcUrl : externalUrls) {
+                // 内容格式自动识别（TXT / M3U），无需再从 IPTV-API 拉取。
+                //
+                // 并发拉取 + 按原顺序合并：串行拉取时每个慢源/失效源都要等满超时，
+                // 数十个源累加起来"正在获取直播源"会卡上好几分钟。这里用滑动窗口
+                // 最多领先合并游标 window 个源预取，合并顺序与结果仍与串行完全一致；
+                // 窗口大小同时限制了"已下载未合并"结果的堆驻留量（低内存设备收紧）。
+                int window = isLowMemoryDevice() ? SOURCE_FETCH_CONCURRENCY_LOW : SOURCE_FETCH_CONCURRENCY;
+                if (totalSteps > 0) {
+                    pool = Executors.newFixedThreadPool(Math.min(window, totalSteps), r -> {
+                        Thread t = new Thread(r, "SourceFetch");
+                        t.setDaemon(true);
+                        return t;
+                    });
+                }
+                List<Future<List<ChannelGroup>>> futures = new ArrayList<>(totalSteps);
+
+                for (int step = 0; step < totalSteps; step++) {
                     // 内存兜底阀：可用堆触线时提前收尾，用已拉到的源继续后续流程。
                     // 否则在低内存盒子上会一路拉到被系统杀掉，表现为"正在获取直播源"时闪退。
                     if (step > 0 && isHeapCritical()) {
                         Timber.w("可用内存不足，提前结束拉源（已处理 %d/%d 个源）", step, totalSteps);
+                        // 立即取消已预取但尚未合并的源并关闭线程池：否则它们会在后续模板/去重/写库
+                        // 这一内存峰值阶段继续下载解析，且结果一直被 futures 引用，反而加剧 OOM。
+                        // 未合并的源不进 sourceUrlMap，不会被记"未入选"。
+                        for (int i = step; i < futures.size(); i++) {
+                            Future<List<ChannelGroup>> f = futures.get(i);
+                            if (f != null) f.cancel(true);
+                        }
+                        futures.clear();
+                        if (pool != null) pool.shutdownNow();
                         try {
                             if (callback != null) {
                                 callback.onProgress(totalSteps, totalSteps, "内存不足，已提前结束拉源");
@@ -320,15 +578,29 @@ public class IptvApiService {
                         }
                         break;
                     }
+                    // 补满预取窗口；当前源必提交，超前预取前再探测一次内存，吃紧就不再超前
+                    while (futures.size() < totalSteps && futures.size() < step + window) {
+                        if (futures.size() > step && isHeapCritical()) break;
+                        final String fetchUrl = externalUrls.get(futures.size());
+                        futures.add(pool.submit(() -> fetchFromUrl(fetchUrl, "auto")));
+                    }
+
+                    String srcUrl = externalUrls.get(step);
                     // 进度按"即将处理第 step+1 个"展示，与总数对齐更直观。
                     // 消息里不再重复计数：UI 会自行附加 (current/total)
                     if (callback != null) {
                         callback.onProgress(step + 1, totalSteps, "正在获取直播源");
                     }
+                    processed++;
+                    String srcHash = Integer.toHexString(srcUrl.hashCode());
+                    boolean wasHealthy = healthyBefore.contains(srcHash);
+                    processedSet.add(srcHash);
+                    if (wasHealthy) healthyProcessed++;
                     try {
                         com.github.tvbox.osc.util.RunLog.i("拉源 [" + (step + 1) + "/" + totalSteps + "] "
                                 + srcUrl);
-                        List<ChannelGroup> srcGroups = fetchFromUrl(srcUrl, "auto");
+                        // 单个请求受 callTimeout 约束，get() 不会无限期阻塞
+                        List<ChannelGroup> srcGroups = futures.get(step).get();
                         // 收集该源贡献的所有 URL
                         Set<String> urls = new HashSet<>();
                         for (ChannelGroup g : srcGroups) {
@@ -337,13 +609,67 @@ public class IptvApiService {
                             }
                         }
                         sourceUrlMap.put(srcUrl, urls);
-                        mergeGroups(allGroups, srcGroups, srcUrl);
+                        mergeGroups(allGroups, groupIndex, srcGroups, srcUrl);
+                        anyFetched = true;
+                        fetchedOk.add(srcHash);
                     } catch (Exception e) {
-                        Timber.w(e, "获取源失败: %s", srcUrl);
-                        sourceUrlMap.put(srcUrl, new HashSet<>()); // 拉取失败视为未入选
+                        // 拉取线程里的异常（含 OOM 等 Error）被 Future 包装为 ExecutionException
+                        Throwable cause = (e instanceof ExecutionException && e.getCause() != null)
+                                ? e.getCause() : e;
+                        Timber.w(cause, "获取源失败: %s", srcUrl);
+                        if (cause instanceof SourceContentException) {
+                            // HTTP 错误码 / 空内容：服务器明确答复无效，视为未入选
+                            sourceUrlMap.put(srcUrl, new HashSet<>());
+                        } else if (isTotalTimeout(cause)) {
+                            // 整体超时：源有效只是大/慢，不计入（否则慢速大源 3 次后被误删）
+                            timeoutFailed++;
+                            if (wasHealthy) healthyNetFailed++;
+                        } else if (cause instanceof IOException) {
+                            // 网络原因：先记下，循环结束后视本轮网络状况决定是否计入
+                            netFailed.add(srcUrl);
+                            if (wasHealthy) healthyNetFailed++;
+                            // 失败当下顺带探测一次连通性（开销极小），捕捉刷新中途断网
+                            if (!sawOffline && !isNetworkConnected()) sawOffline = true;
+                        }
+                        // 其余（OOM 等 Error、解析异常）与源本身无关，不计入未入选
+                    } finally {
+                        // 已合并的源结果立即释放引用，不让 futures 列表持有整份解析结果
+                        futures.set(step, null);
                     }
-                    step++;
                 }
+
+                // 所有源都失败或结果为空（通常是断网）：按错误处理，交给上层回退本地缓存。
+                // 否则空结果会经 onSuccess 覆盖数据库缓存，且所有自定义源都会被记一次
+                // "未入选"，离线几次后被自动删除。
+                if (!anyFetched || allGroups.isEmpty()) {
+                    throw new IOException("未获取到任何直播源，请检查网络或源地址");
+                }
+
+                // 网络受损判定（开机 Wi-Fi 未就绪、刷新中途断网）：
+                //  1) 拉源开始/中途/结束时系统报告断网；或
+                //  2) 上次拉取成功的源，本轮超过一半因网络原因失败。
+                // 一直失效的源（公共订阅里大量死域名）不在"上次成功"集合中，不会把正常网络误判为受损。
+                // 受损时网络失败的源不计"未入选"，避免用户可用的自定义源被连续几次开机误删；
+                // 网络正常时网络失败仍照旧计入（保留对失效域名的自动清理）。
+                if (!sawOffline && !isNetworkConnected()) sawOffline = true;
+                int networkFailures = netFailed.size() + timeoutFailed;
+                boolean degraded = sawOffline
+                        || (healthyProcessed > 0 && healthyNetFailed * 2 > healthyProcessed);
+                lastFetchDegraded = degraded;
+                if (degraded) {
+                    Timber.w("本轮拉源网络受损（断网=%b，上次成功的源 %d/%d 因网络失败），"
+                                    + "%d 个网络失败的源不计入未入选",
+                            sawOffline, healthyNetFailed, healthyProcessed, networkFailures);
+                    com.github.tvbox.osc.util.RunLog.i("拉源网络受损: offline=" + sawOffline
+                            + " healthy=" + healthyNetFailed + "/" + healthyProcessed
+                            + " net=" + networkFailures + "/" + processed);
+                } else {
+                    for (String u : netFailed) sourceUrlMap.put(u, new HashSet<>());
+                }
+                // 更新"上次成功"集合：本轮处理过的源以本轮结果为准（失败即移出，避免一个永久失效的
+                // 旧源让之后每轮都被判为受损）；未处理到的（内存阀提前结束）保留原状态；
+                // 已不在源列表中的剔除，防止无限增长
+                saveHealthySources(healthyBefore, processedSet, fetchedOk, externalSet);
 
                 // 应用频道列表模板（过滤+排序+合并多源），否则仅按最大线路数裁剪
                 List<ChannelGroup> finalGroups = applyTemplateAndLimit(allGroups, callback, totalSteps);
@@ -375,9 +701,11 @@ public class IptvApiService {
                     }
                 }
 
-                // 更新连续未入选计数，并自动删除连续 N 次失败的自定义源
-                updateSourceFailCounts(customUrls, subscribeUrls, sourceUrlMap, finalUrls);
+                // 更新连续未入选计数，并自动删除连续 N 次失败的自定义源。
+                // 仅用户原始填写、且未被展开为多仓/单仓的地址可被删除（见 rawCustomUrls）
+                updateSourceFailCounts(rawCustomUrls, customUrls, sourceUrlMap, finalUrls, externalSet);
 
+                // 网络受损且结果被上层弃用时，ChannelManager 会把该时间复位，让下次启动重试
                 Hawk.put(HawkConfig.IPTV_LAST_UPDATE_TIME, System.currentTimeMillis());
 
                 if (callback != null) {
@@ -405,8 +733,22 @@ public class IptvApiService {
                     try { callback.onError("获取直播源失败: " + e.getMessage()); } catch (Throwable ignore) {}
                 }
             } finally {
-                // 无论成功失败都必须复位，否则后续刷新会被永久拦截
-                fetching.set(false);
+                if (pool != null) pool.shutdownNow();
+                // 无论成功失败都必须复位，否则后续刷新会被永久拦截。
+                // 与 runAfterCurrentFetch 同锁：保证"判断忙 → 排队"与"复位 → 取队列"不会错过
+                List<Runnable> pending;
+                synchronized (afterFetchActions) {
+                    fetching.set(false);
+                    pending = new ArrayList<>(afterFetchActions);
+                    afterFetchActions.clear();
+                }
+                for (Runnable r : pending) {
+                    try {
+                        r.run();
+                    } catch (Throwable t) {
+                        Timber.w(t, "拉源结束后的排队回调执行失败");
+                    }
+                }
             }
         }, "IptvFetch");
         // 设为守护线程：进程退出时不被这个长耗时任务拖住
@@ -450,7 +792,8 @@ public class IptvApiService {
         }
 
         // TXT 格式通常包含逗号分隔的频道名和URL
-        if (trimmed.contains(",#genre#") || trimmed.matches("(?s).*\\w+,https?://.*")) {
+        // 用预编译 find() 定位特征片段，避免 matches("(?s).*...") 在大文本上的整体回溯
+        if (trimmed.contains(",#genre#") || TXT_LINE_PATTERN.matcher(trimmed).find()) {
             return "txt";
         }
 
@@ -493,52 +836,46 @@ public class IptvApiService {
      */
     private void mergeGroups(List<ChannelGroup> target, List<ChannelGroup> source, String origin) {
         if (source == null || source.isEmpty()) return;
+        mergeGroups(target, buildGroupIndex(target), source, origin);
+    }
 
-        // 分组名 → 目标分组
-        Map<String, ChannelGroup> groupIndex = new java.util.HashMap<>(Math.max(16, target.size() * 2));
-        for (ChannelGroup g : target) {
-            if (g == null || g.getGroupName() == null) continue;
-            if (!groupIndex.containsKey(g.getGroupName())) {
-                groupIndex.put(g.getGroupName(), g);
-            }
-        }
-
-        // 目标分组 → (归一化频道名 → 频道)，按需构建并在合并过程中持续复用
-        Map<ChannelGroup, Map<String, LiveChannel>> channelIndexCache =
-                new java.util.HashMap<>(Math.max(16, target.size() * 2));
+    /**
+     * 合并频道分组（复用调用方持有的索引）。
+     *
+     * <p>聚合全部外部源时由 {@link #fetchAndMergeSources} 持有同一份索引贯穿所有源，
+     * 不再每合并一个源就把目标列表重新扫描、重新归一化一遍。
+     *
+     * @param index 分组名 → 分组内频道索引；必须与 target 同步（只经由本方法修改 target）
+     */
+    private void mergeGroups(List<ChannelGroup> target, Map<String, GroupIndex> index,
+                             List<ChannelGroup> source, String origin) {
+        if (source == null || source.isEmpty()) return;
 
         for (ChannelGroup srcGroup : source) {
             if (srcGroup == null) continue;
-            ChannelGroup existingGroup = srcGroup.getGroupName() == null
-                    ? null : groupIndex.get(srcGroup.getGroupName());
+            String groupName = srcGroup.getGroupName();
+            GroupIndex existing = groupName == null ? null : index.get(groupName);
 
-            if (existingGroup == null) {
+            if (existing == null) {
                 // 新分组，标记来源
                 for (LiveChannel ch : srcGroup.getChannels()) {
                     if (ch != null) ch.setSourceOrigin(origin);
                 }
                 target.add(srcGroup);
-                if (srcGroup.getGroupName() != null) {
-                    groupIndex.put(srcGroup.getGroupName(), srcGroup);
+                if (groupName != null) {
+                    index.put(groupName, new GroupIndex(srcGroup));
                 }
                 continue;
             }
 
-            // 合并到已有分组（用归一化名索引关联同一频道）
-            Map<String, LiveChannel> channelIndex = channelIndexCache.get(existingGroup);
-            if (channelIndex == null) {
-                channelIndex = buildChannelIndex(existingGroup);
-                channelIndexCache.put(existingGroup, channelIndex);
-            }
-
+            // 合并到已有分组（精确名 / 归一化名索引关联同一频道）
             for (LiveChannel srcChannel : srcGroup.getChannels()) {
                 if (srcChannel == null) continue;
-                String key = ChannelNameMatcher.normalizeKey(srcChannel.getChannelName());
-                LiveChannel existingChannel = key.isEmpty() ? null : channelIndex.get(key);
+                LiveChannel existingChannel = existing.find(srcChannel.getChannelName());
                 if (existingChannel == null) {
                     srcChannel.setSourceOrigin(origin);
-                    existingGroup.addChannel(srcChannel);
-                    if (!key.isEmpty()) channelIndex.put(key, srcChannel);
+                    existing.group.addChannel(srcChannel);
+                    existing.add(srcChannel);
                 } else {
                     // 合并播放源
                     List<String> urls = srcChannel.getSourceUrls();
@@ -552,17 +889,66 @@ public class IptvApiService {
         }
     }
 
-    /** 构建"归一化频道名 → 频道"索引（同名冲突时保留首个，与原线性查找行为一致） */
-    private Map<String, LiveChannel> buildChannelIndex(ChannelGroup group) {
-        List<LiveChannel> channels = group.getChannels();
-        Map<String, LiveChannel> index = new java.util.HashMap<>(Math.max(16, channels.size() * 2));
-        for (LiveChannel ch : channels) {
-            if (ch == null) continue;
-            String key = ChannelNameMatcher.normalizeKey(ch.getChannelName());
-            if (key.isEmpty()) continue;
-            if (!index.containsKey(key)) index.put(key, ch);
+    /** 为已有目标列表构建分组索引（同名分组保留首个，与原线性查找行为一致） */
+    private static Map<String, GroupIndex> buildGroupIndex(List<ChannelGroup> target) {
+        Map<String, GroupIndex> index = new HashMap<>(Math.max(16, target.size() * 2));
+        for (ChannelGroup g : target) {
+            if (g == null || g.getGroupName() == null) continue;
+            if (!index.containsKey(g.getGroupName())) {
+                index.put(g.getGroupName(), new GroupIndex(g));
+            }
         }
         return index;
+    }
+
+    /**
+     * 单个分组的频道索引：精确频道名 + 归一化 key。
+     *
+     * <p>查找语义与"逐个 {@link ChannelNameMatcher#isSameChannel} 比较"一致：
+     * 先精确同名，再取首个归一化 key 相同的频道（归一化为空的名字只能精确匹配）。
+     * 索引在首次查找时才构建（只出现在单个源里的分组无需付出归一化代价），
+     * 之后通过 {@link #add} 与分组内容保持同步。
+     */
+    private static final class GroupIndex {
+        final ChannelGroup group;
+        private Map<String, LiveChannel> byName;
+        private Map<String, LiveChannel> byKey;
+
+        GroupIndex(ChannelGroup group) {
+            this.group = group;
+        }
+
+        private void ensureBuilt() {
+            if (byName != null) return;
+            List<LiveChannel> channels = group.getChannels();
+            int cap = Math.max(16, channels.size() * 2);
+            byName = new HashMap<>(cap);
+            byKey = new HashMap<>(cap);
+            for (LiveChannel ch : channels) put(ch);
+        }
+
+        private void put(LiveChannel ch) {
+            if (ch == null) return;
+            String name = ch.getChannelName();
+            if (name == null || name.isEmpty()) return;
+            if (!byName.containsKey(name)) byName.put(name, ch);
+            String key = ChannelNameMatcher.normalizeKey(name);
+            if (!key.isEmpty() && !byKey.containsKey(key)) byKey.put(key, ch);
+        }
+
+        LiveChannel find(String name) {
+            if (name == null || name.isEmpty()) return null;
+            ensureBuilt();
+            LiveChannel exact = byName.get(name);
+            if (exact != null) return exact;
+            String key = ChannelNameMatcher.normalizeKey(name);
+            return key.isEmpty() ? null : byKey.get(key);
+        }
+
+        /** 新频道追加到分组后同步索引；索引尚未构建时无需处理（构建时会扫描到） */
+        void add(LiveChannel ch) {
+            if (byName != null) put(ch);
+        }
     }
 
     /**
@@ -810,13 +1196,20 @@ public class IptvApiService {
     /**
      * 更新外部源的连续未入选计数；自定义源连续达到上限则自动删除。
      *
-     * @param customUrls    用户自定义源（可被自动删除）
-     * @param subscribeUrls 订阅列表源（仅统计，不删除原始列表，删除无意义）
-     * @param sourceUrlMap  每个源产出的 URL 集合
-     * @param finalUrls     最终保留的所有线路 URL
+     * <p>只有"用户原始填写、且没有被展开为多仓/单仓配置"的自定义地址可被自动删除：
+     * 多仓展开出的子直播源只统计不删除，删除后写回的也是原始列表（重新读取 Hawk 再剔除），
+     * 绝不会把展开结果固化进设置。拉取失败但未进入 sourceUrlMap 的源（网络受损、
+     * 整体超时、被取消）计数保持不变。
+     *
+     * @param rawCustomUrls      用户原始填写的自定义源（未展开）
+     * @param expandedCustomUrls 展开后的自定义源（原始地址未被展开时原样出现在其中）
+     * @param sourceUrlMap       每个源产出的 URL 集合（仅含本轮有明确结论的源）
+     * @param finalUrls          最终保留的所有线路 URL
+     * @param knownSources       本轮全部外部源地址，用于清理已不存在的源的历史计数
      */
-    private void updateSourceFailCounts(List<String> customUrls, List<String> subscribeUrls,
-                                        Map<String, Set<String>> sourceUrlMap, Set<String> finalUrls) {
+    private void updateSourceFailCounts(List<String> rawCustomUrls, List<String> expandedCustomUrls,
+                                        Map<String, Set<String>> sourceUrlMap, Set<String> finalUrls,
+                                        Set<String> knownSources) {
         JSONObject counts;
         try {
             counts = new JSONObject(Hawk.get(HawkConfig.IPTV_SOURCE_FAIL_COUNT, "{}"));
@@ -824,7 +1217,12 @@ public class IptvApiService {
             counts = new JSONObject();
         }
 
-        Set<String> customSet = new HashSet<>(customUrls);
+        // 可删除集合 = 原始自定义源中未被展开（展开后仍原样存在）的地址
+        Set<String> expandedSet = new HashSet<>(expandedCustomUrls);
+        Set<String> deletable = new HashSet<>();
+        for (String u : rawCustomUrls) {
+            if (expandedSet.contains(u)) deletable.add(u);
+        }
         List<String> toRemove = new ArrayList<>();
 
         // 遍历所有外部源，判断是否"入选"（其产出 URL 与最终结果有交集）
@@ -844,17 +1242,29 @@ public class IptvApiService {
                 int c = counts.optInt(src, 0) + 1;
                 try { counts.put(src, c); } catch (Exception ignored) {}
                 // 仅对用户自定义源执行自动删除（订阅列表为远程文件，本地删除无意义）
-                if (customSet.contains(src) && c >= HawkConfig.MAX_SOURCE_FAIL_COUNT) {
+                if (deletable.contains(src) && c >= HawkConfig.MAX_SOURCE_FAIL_COUNT) {
                     toRemove.add(src);
                 }
             }
         }
 
-        // 执行自动删除
+        // 清理本轮已不存在的源的历史计数，避免多仓子地址不断累积撑大该配置
+        if (knownSources != null) {
+            List<String> stale = new ArrayList<>();
+            java.util.Iterator<String> it = counts.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                if (!knownSources.contains(k)) stale.add(k);
+            }
+            for (String k : stale) counts.remove(k);
+        }
+
+        // 执行自动删除：基于当前设置重新读取再剔除，不覆盖用户在刷新期间做的修改
         if (!toRemove.isEmpty()) {
+            Set<String> removeSet = new HashSet<>(toRemove);
             List<String> remain = new ArrayList<>();
-            for (String u : customUrls) {
-                if (!toRemove.contains(u)) remain.add(u);
+            for (String u : parseCustomSourceUrls(Hawk.get(HawkConfig.IPTV_CUSTOM_SOURCES, ""))) {
+                if (!removeSet.contains(u)) remain.add(u);
             }
             Hawk.put(HawkConfig.IPTV_CUSTOM_SOURCES, buildCustomSourcesJson(remain));
             for (String u : toRemove) counts.remove(u);
@@ -865,15 +1275,20 @@ public class IptvApiService {
         Hawk.put(HawkConfig.IPTV_SOURCE_FAIL_COUNT, counts.toString());
     }
 
-    /** 把自定义源列表序列化为 JSON 数组字符串 */
-    private String buildCustomSourcesJson(List<String> urls) {
-        StringBuilder sb = new StringBuilder("[");
-        for (int i = 0; i < urls.size(); i++) {
-            if (i > 0) sb.append(",");
-            sb.append("\"").append(urls.get(i).replace("\"", "")).append("\"");
+    /**
+     * 把自定义源列表序列化为 JSON 数组字符串（与 {@link #parseCustomSourceUrls} 对应）。
+     *
+     * <p>用 JSONArray 生成，正确转义引号/反斜杠等字符；原手拼字符串会直接删掉 URL 里的引号。
+     * 设置页 / 手机配置页共用，保证各处写入的格式一致。
+     */
+    public static String buildCustomSourcesJson(List<String> urls) {
+        JSONArray arr = new JSONArray();
+        if (urls != null) {
+            for (String u : urls) {
+                if (u != null) arr.put(u);
+            }
         }
-        sb.append("]");
-        return sb.toString();
+        return arr.toString();
     }
 
     /**
@@ -937,16 +1352,16 @@ public class IptvApiService {
     }
 
     /**
-     * 解析自定义源URL列表
-     * 优先按标准 JSON 数组解析，兜底再走简单字符串切分。
+     * 解析自定义源URL列表（静态，供设置页 / 手机配置页复用）
+     * 优先按标准 JSON 数组解析（能正确处理 URL 中的逗号与 "\/" 等转义），兜底再走简单字符串切分。
      */
-    private List<String> parseCustomSourceUrls(String json) {
+    public static List<String> parseCustomSourceUrls(String json) {
         List<String> urls = new ArrayList<>();
         if (json == null || json.isEmpty()) return urls;
 
         // 优先按标准 JSON 数组解析（能正确处理带逗号/引号的 URL）
         try {
-            org.json.JSONArray arr = new org.json.JSONArray(json.trim());
+            JSONArray arr = new JSONArray(json.trim());
             for (int i = 0; i < arr.length(); i++) {
                 String url = arr.optString(i, "").trim();
                 if (!url.isEmpty() && (url.startsWith("http://") || url.startsWith("https://"))) {

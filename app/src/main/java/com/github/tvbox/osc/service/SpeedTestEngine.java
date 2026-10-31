@@ -27,6 +27,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -47,11 +48,58 @@ public class SpeedTestEngine {
 
     private static volatile SpeedTestEngine instance;
 
-    private ExecutorService executorService;
+    /**
+     * 是否有测速轮次在进行（含"已登记、等待上一轮收尾后才真正开始"的轮次）。
+     * 只允许当前轮次（currentRound）清除，旧轮次收尾时不得改动它。
+     */
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
-    private final AtomicBoolean isCancelled = new AtomicBoolean(false);
-    private final AtomicInteger completedCount = new AtomicInteger(0);
-    private int totalCount = 0;
+
+    /** 保护 currentRound / isRunning 的切换，保证"登记新一轮"与"旧一轮收尾清标记"互斥 */
+    private final Object roundLock = new Object();
+
+    /** 当前（最新登记的）测速轮次；null 表示没有测速 */
+    private volatile Round currentRound;
+
+    /**
+     * 控制线程：串行执行"等待上一轮收尾 → 收集线路 → 启动新一轮"。
+     * testChannels 可能在主线程（Service.onStartCommand / 拉源回调）被调用，
+     * 等待旧一轮的 join 不能放在调用线程上，否则遥控器按键无响应甚至 ANR。
+     * 单线程保证连续多次"重新测速"按调用顺序处理。
+     */
+    private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "SpeedTestControl");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /** 重新测速时最多等待上一轮收尾的时间；超时后新一轮照常开始（各轮状态已隔离，不会互相干扰） */
+    private static final long PREV_ROUND_WAIT_MS = 5000;
+
+    /**
+     * 单轮测速的全部可变状态。
+     * 以前线程池 / 取消标志 / 计数器都是引擎共享字段，"重新测速"时新一轮会把旧一轮
+     * 的取消标志重置为 false（旧一轮随后误报"测速完成"），旧一轮的 finally 又会关掉
+     * 新一轮的线程池并清除 isRunning。现在每轮各持一份，旧一轮只能碰自己的状态。
+     */
+    private static final class Round {
+        final SpeedTestCallback callback;
+        final AtomicBoolean cancelled = new AtomicBoolean(false);
+        final AtomicInteger completed = new AtomicInteger(0);
+        /**
+         * 被新一轮顶替。顶替后仍会派发一次 onCancelled（而不是静默结束）：
+         * 新一轮可能由另一个入口发起（如 Service 的一轮被 Worker 顶替），旧入口若收不到终态回调，
+         * 前台通知、UI 进度条、Worker 的 latch 都会一直挂着。
+         * 同一入口"重新测速"引起的闪跳由回调方自行判断（如 Service 用 activeCallback 区分）。
+         */
+        volatile boolean superseded;
+        volatile ExecutorService pool;
+        volatile Thread runner;
+        volatile int total;
+
+        Round(SpeedTestCallback callback) {
+            this.callback = callback;
+        }
+    }
 
     /** 测速结果缓存最大条数（LRU，防止长时间运行后内存无界增长） */
     private static final int MAX_RESULT_CACHE = 4000;
@@ -64,12 +112,6 @@ public class SpeedTestEngine {
      * 这类线路仍可播放，测速后不应作为"不可用线路"被移除。
      */
     public static final String UNTESTABLE = "UNTESTABLE";
-
-    /** 当前测速工作线程（用于"重新测速"时等待上一轮结束） */
-    private volatile Thread runnerThread;
-
-    /** 是否处于"取消旧任务以重启新一轮"状态：此时不派发 onCancelled，避免UI 误判为已结束 */
-    private volatile boolean restarting;
 
     /**
      * 测速结果缓存（LRU，按访问顺序淘汰最久未用项）。
@@ -204,7 +246,9 @@ public class SpeedTestEngine {
                 arr.put(o);
             }
             Hawk.put(HawkConfig.SPEED_TEST_RESULT_CACHE, arr.toString());
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // 全量 JSON 序列化在低内存盒子上可能 OOM（Error 而非 Exception），也必须兜住，
+            // 否则会打断测速线程的收尾（终态回调 / 清除运行标记）
             Timber.w(e, "持久化测速缓存失败");
         }
     }
@@ -235,45 +279,167 @@ public class SpeedTestEngine {
     }
 
     /**
-     * 对多个频道的所有源进行测速
+     * 对多个频道的所有源进行测速。
+     *
+     * <p>本方法不阻塞调用线程：已有测速在进行时，旧一轮被标记为"被顶替"并取消，
+     * 等待旧一轮收尾与启动新一轮都在控制线程上完成（调用方可能是主线程）。
+     * 被顶替的旧一轮在收尾后会收到一次 onCancelled（新一轮的回调已登记之后）。
+     * 回调可能在控制线程或测速线程上触发。
      */
     public void testChannels(List<LiveChannel> channels, SpeedTestCallback callback) {
-        // 已有测速在进行：取消它并等待结束，然后从头开始新一轮
-        // （用户再次点击"立即测速"时应重新开始，而不是被拒绝）
-        if (isRunning.get()) {
+        final Round round = new Round(callback);
+        final Round prev;
+        // 同步登记新一轮：调用返回后 isRunning() 立即为 true（Service / EPG 延迟加载依赖这一点），
+        // 且旧一轮收尾时发现自己已不是 currentRound，不会清除运行标记
+        synchronized (roundLock) {
+            prev = currentRound;
+            currentRound = round;
+            isRunning.set(true);
+        }
+        if (prev != null) {
+            // 已有测速在进行：顶替并取消它，然后从头开始新一轮
+            // （用户再次点击"立即测速"时应重新开始，而不是被拒绝）
             Timber.i("已有测速任务在运行，取消后重新开始");
-            restarting = true;
-            cancel();
-            Thread prev = runnerThread;
-            if (prev != null && prev != Thread.currentThread()) {
-                try {
-                    prev.join(3000);
-                } catch (InterruptedException ignore) {
-                    Thread.currentThread().interrupt();
-                }
-            }
-            // 兜底等待运行标志归位，避免两轮测速叠加
-            long deadline = System.currentTimeMillis() + 2000;
-            while (isRunning.get() && System.currentTimeMillis() < deadline) {
-                try {
-                    Thread.sleep(50);
-                } catch (InterruptedException ignore) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+            prev.superseded = true;
+            prev.cancelled.set(true);
         }
 
         if (channels == null || channels.isEmpty()) {
-            restarting = false;
-            if (callback != null) callback.onError("没有需要测速的频道");
+            finishRound(round);
+            if (callback != null) {
+                try {
+                    callback.onError("没有需要测速的频道");
+                } catch (Throwable ignore) {
+                    Timber.w(ignore, "onError 回调异常");
+                }
+            }
             return;
         }
 
-        isRunning.set(true);
-        isCancelled.set(false);
-        completedCount.set(0);
+        try {
+            controlExecutor.execute(() -> runRound(prev, round, channels));
+        } catch (Throwable t) {
+            // 控制线程不可用（线程创建失败等）：按启动失败处理，释放运行标记
+            failStart(round, t);
+        }
+    }
 
+    /** 控制线程：等待上一轮收尾后启动本轮 */
+    private void runRound(Round prev, Round round, List<LiveChannel> channels) {
+        try {
+            if (prev != null) {
+                waitRoundFinished(prev, PREV_ROUND_WAIT_MS);
+            }
+            // 等待期间本轮已被取消/顶替：不再启动
+            if (round.cancelled.get()) {
+                finishRound(round);
+                // 被顶替同样派发 onCancelled：发起方可能不是新一轮的发起方，需要据此收尾
+                if (round.callback != null) {
+                    try {
+                        round.callback.onCancelled(0, 0);
+                    } catch (Throwable cbErr) {
+                        Timber.w(cbErr, "onCancelled 回调异常");
+                    }
+                }
+                return;
+            }
+            startTestRound(channels, round);
+        } catch (Throwable t) {
+            failStart(round, t);
+        }
+    }
+
+    /**
+     * 等待上一轮的测速线程结束（仅在控制线程上调用）。
+     * 被顶替的轮次会在 500ms 级别内停止等待在途任务并跳过排序，通常很快结束；
+     * 超时后不再等待——各轮状态已隔离，旧一轮无法再影响新一轮。
+     */
+    private void waitRoundFinished(Round prev, long maxWaitMs) {
+        Thread t = prev.runner;
+        if (t == null || t == Thread.currentThread()) return;
+        try {
+            t.join(maxWaitMs);
+        } catch (InterruptedException ignore) {
+            Thread.currentThread().interrupt();
+        }
+        if (t.isAlive()) {
+            Timber.w("上一轮测速 %d ms 内未结束，直接开始新一轮", maxWaitMs);
+        }
+    }
+
+    /** 启动阶段失败：释放本轮的运行标记与线程池并回调 onError */
+    private void failStart(Round round, Throwable t) {
+        // 启动阶段异常（如线程池/线程创建失败、收集线路时异常）也必须释放运行标记，
+        // 否则 isRunning 永远为 true，之后再也无法测速
+        Timber.e(t, "启动测速失败");
+        shutdownPool(round.pool);
+        finishRound(round);
+        if (round.callback == null) return;
+        if (round.superseded) {
+            // 已被新一轮顶替：按"已取消"收尾，不报错误
+            notifyCancelledQuietly(round.callback, round.completed.get(), round.total);
+            return;
+        }
+        try {
+            round.callback.onError("启动测速失败: " + String.valueOf(t.getMessage()));
+        } catch (Throwable ignore) {
+            Timber.w(ignore, "onError 回调异常");
+        }
+    }
+
+    /** 派发 onCancelled，回调异常不外泄 */
+    private static void notifyCancelledQuietly(SpeedTestCallback callback, int completed, int total) {
+        if (callback == null) return;
+        try {
+            callback.onCancelled(completed, total);
+        } catch (Throwable cbErr) {
+            Timber.w(cbErr, "onCancelled 回调异常");
+        }
+    }
+
+    /** 本轮结束：只有仍是当前轮次时才清除运行标记（旧一轮不能清掉新一轮的标记） */
+    private void finishRound(Round round) {
+        synchronized (roundLock) {
+            if (currentRound == round) {
+                currentRound = null;
+                isRunning.set(false);
+            }
+        }
+    }
+
+    /**
+     * 等待单个任务结束。按短间隔轮询，以便本轮被取消后能尽快停止等待，
+     * 而不是对每个在途任务都等满 awaitMs。
+     *
+     * @return false 表示因本轮被取消而放弃等待
+     */
+    private static boolean awaitTask(Future<?> future, long awaitMs, AtomicBoolean cancelled) {
+        long deadline = System.currentTimeMillis() + awaitMs;
+        while (true) {
+            if (cancelled.get()) return false;
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) {
+                Timber.w("测速任务超时");
+                return true;
+            }
+            try {
+                future.get(Math.min(left, 500L), TimeUnit.MILLISECONDS);
+                return true;
+            } catch (TimeoutException te) {
+                // 继续轮询
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            } catch (Exception e) {
+                Timber.w("测速任务失败");
+                return true;
+            }
+        }
+    }
+
+    /** 收集线路、创建本轮线程池并启动本轮测速线程（调用方已登记本轮并置位 isRunning） */
+    private void startTestRound(List<LiveChannel> channels, final Round round) {
+        final SpeedTestCallback callback = round.callback;
         // 收集所有需要测试的URL。
         // 为控制单轮测速时长，总线路数以 MAX_TEST_LINES 为上限，按频道数均摊每个频道的线路配额，
         // 保证每个频道至少测1 条，不会整段跳过后面的频道。
@@ -281,23 +447,30 @@ public class SpeedTestEngine {
         int perChannel = Math.max(1, MAX_TEST_LINES / Math.max(1, channelCount));
         List<SpeedTestTask> tasks = new ArrayList<>();
         for (LiveChannel channel : channels) {
-            if (channel == null || channel.getSourceUrls() == null) continue;
-            int size = Math.min(channel.getSourceUrls().size(), perChannel);
+            if (channel == null) continue;
+            // 取一次线路列表快照，避免 size 与 get 之间列表被替换/修改
+            List<String> sourceUrls = channel.getSourceUrls();
+            if (sourceUrls == null) continue;
+            int size = Math.min(sourceUrls.size(), perChannel);
             for (int i = 0; i < size; i++) {
-                String url = channel.getSourceUrls().get(i);
+                String url = sourceUrls.get(i);
                 if (url != null && !url.isEmpty()) {
                     tasks.add(new SpeedTestTask(channel, url, i));
                 }
             }
         }
 
-        totalCount = tasks.size();
+        final int totalCount = tasks.size();
+        round.total = totalCount;
         Timber.i("开始测速: %d 个频道, %d 个源(每频道上限 %d)", channelCount, totalCount, perChannel);
 
         if (totalCount == 0) {
-            isRunning.set(false);
-            restarting = false;
-            if (callback != null) callback.onError("没有可测速的线路");
+            finishRound(round);
+            if (round.superseded) {
+                notifyCancelledQuietly(callback, 0, 0);
+            } else if (callback != null) {
+                callback.onError("没有可测速的线路");
+            }
             return;
         }
 
@@ -310,23 +483,25 @@ public class SpeedTestEngine {
         int timeoutRaw = Hawk.get(HawkConfig.SPEED_TEST_TIMEOUT, HawkConfig.DEFAULT_SPEED_TEST_TIMEOUT);
         final int timeout = timeoutRaw > 0 ? timeoutRaw : HawkConfig.DEFAULT_SPEED_TEST_TIMEOUT;
 
-        executorService = Executors.newFixedThreadPool(concurrency);
-        // 新一轮已就绪，解除重启抑制标志
-        restarting = false;
+        // 本轮私有线程池：runner 只向它提交、finally 只关闭它，绝不碰其它轮次的线程池
+        final ExecutorService pool = Executors.newFixedThreadPool(concurrency);
+        round.pool = pool;
+        final AtomicBoolean cancelled = round.cancelled;
+        final AtomicInteger completedCount = round.completed;
 
-        runnerThread = new Thread(() -> {
+        Thread runner = new Thread(() -> {
             long startTime = System.currentTimeMillis();
             List<SpeedTestResult> allResults = Collections.synchronizedList(new ArrayList<>());
             List<Future<?>> futures = new ArrayList<>();
 
             try {
                 for (SpeedTestTask task : tasks) {
-                    if (isCancelled.get()) break;
+                    if (cancelled.get()) break;
 
-                    Future<?> future = executorService.submit(() -> {
+                    Future<?> future = pool.submit(() -> {
                         // 单个任务完全隔离：任何异常都不允许扩散到线程池，避免"一个源坏了拖垮整轮测速"
                         try {
-                            if (isCancelled.get()) return;
+                            if (cancelled.get()) return;
 
                             // 首次测速
                             SpeedTestResult result = performSpeedTest(task.url, task.channel.getChannelName(), timeout);
@@ -334,12 +509,17 @@ public class SpeedTestEngine {
                             // 智能重试（对齐 ISEP：仅对超时失败自动重试，避免对确定无效源浪费资源）
                             int maxRetry = Hawk.get(HawkConfig.SPEED_TEST_RETRY, HawkConfig.DEFAULT_SPEED_TEST_RETRY);
                             int retry = 0;
-                            while (retry < maxRetry && !isCancelled.get() && result.isTimeoutFailure()) {
+                            while (retry < maxRetry && !cancelled.get() && result.isTimeoutFailure()) {
                                 retry++;
                                 Timber.d("超时重试 %d/%d: %s", retry, maxRetry, task.url);
                                 result = performSpeedTest(task.url, task.channel.getChannelName(), timeout);
                                 result.setRetried(true);
                             }
+
+                            // 本轮已取消/被顶替：结果不再写入缓存与频道。
+                            // 收尾时线程池会被 shutdownNow 中断，被中断的请求会被误判为失败，
+                            // 若写入缓存会让新一轮/线路过滤把好线路当成不可用
+                            if (cancelled.get()) return;
 
                             // 计算综合评分
                             try { StreamQualityScorer.score(result); } catch (Exception ignore) {}
@@ -348,9 +528,19 @@ public class SpeedTestEngine {
 
                             // 更新频道速度信息
                             try {
+                                // 与 LiveChannel 的写时复制重排/删除方法同锁（均 synchronized 在频道对象上）。
+                                // 测速期间用户可能置顶/删除线路导致下标漂移，下标不匹配时按 URL 重新定位
                                 synchronized (task.channel) {
-                                    if (task.channel.getSpeeds() != null && task.sourceIndex < task.channel.getSpeeds().size()) {
-                                        task.channel.getSpeeds().set(task.sourceIndex, result.getSpeed());
+                                    List<String> urls = task.channel.getSourceUrls();
+                                    List<Double> sp = task.channel.getSpeeds();
+                                    if (urls != null && sp != null) {
+                                        int idx = task.sourceIndex;
+                                        if (idx < 0 || idx >= urls.size() || !task.url.equals(urls.get(idx))) {
+                                            idx = urls.indexOf(task.url);
+                                        }
+                                        if (idx >= 0 && idx < sp.size()) {
+                                            sp.set(idx, result.getSpeed());
+                                        }
                                     }
                                 }
                             } catch (Exception ignore) {}
@@ -360,7 +550,10 @@ public class SpeedTestEngine {
                             try { persistCacheIncremental(); } catch (Exception ignore) {}
 
                             int completed = completedCount.incrementAndGet();
-                            if (callback != null) {
+                            // 取消后 runner 不再等待在途任务、可能已派发 onCancelled；
+                            // 写缓存/持久化期间被取消的任务不能再回调进度，否则进度事件晚于终态事件，
+                            // UI 会重新出现一条不会消失的进度条
+                            if (callback != null && !cancelled.get()) {
                                 try {
                                     callback.onItemComplete(result, completed, totalCount);
                                     callback.onProgress(completed, totalCount, task.channel.getChannelName());
@@ -374,7 +567,7 @@ public class SpeedTestEngine {
                             int completed = completedCount.incrementAndGet();
                             // 异常任务也要上报进度，否则这些线路的进度永久缺失，
                             // UI 进度条会停在不足 100% 的位置直到测速结束
-                            if (callback != null) {
+                            if (callback != null && !cancelled.get()) {
                                 try {
                                     callback.onProgress(completed, totalCount,
                                             task.channel != null ? task.channel.getChannelName() : "");
@@ -387,39 +580,46 @@ public class SpeedTestEngine {
 
                 // 等待所有任务完成
                 // HLS 单源会嗅探播放列表并采样下载多个分片，整体最长约 timeout*(分片采样+1)，
-                // 这里给出充足的等待上限，避免误判超时
-                long awaitSeconds = (long) timeout * (MAX_SEGMENT_SAMPLE + 1) + 10;
+                // 这里给出充足的等待上限，避免误判超时。
+                // 本轮被取消后立即停止等待：排队中的任务会在开头检查取消标志直接返回，
+                // 在途任务的结果也不再写入（见任务内检查），无需逐个等满超时
+                long awaitMs = ((long) timeout * (MAX_SEGMENT_SAMPLE + 1) + 10) * 1000L;
                 for (Future<?> future : futures) {
-                    try {
-                        future.get(awaitSeconds, TimeUnit.SECONDS);
-                    } catch (Exception e) {
-                        Timber.w("测速任务超时或失败");
-                    }
+                    if (!awaitTask(future, awaitMs, cancelled)) break;
                 }
 
                 long totalTime = System.currentTimeMillis() - startTime;
 
-                // 更新频道的最佳速度/评分/分辨率，并按配置模式排序
-                boolean sortSources = Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true);
-                int sortMode = Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE);
-                boolean filterUnavailable = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
-                for (LiveChannel channel : channels) {
-                    if (filterUnavailable) {
-                        try { removeUnavailableSources(channel); } catch (Exception ignore) {}
-                    }
-                    updateChannelBestMetrics(channel);
-                    if (sortSources) {
-                        if (sortMode == HawkConfig.SORT_MODE_QUALITY_SCORE) {
-                            sortChannelByScores(channel);
-                        } else {
-                            channel.sortSourcesBySpeed();
+                // 被新一轮顶替：新一轮会重新测速并重排，这里跳过全量排序/过滤，
+                // 既让本线程尽快结束，也避免与新一轮同时改动频道线路
+                if (!round.superseded) {
+                    // 更新频道的最佳速度/评分/分辨率，并按配置模式排序
+                    boolean sortSources = Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true);
+                    int sortMode = Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE);
+                    boolean filterUnavailable = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
+                    for (LiveChannel channel : channels) {
+                        if (filterUnavailable) {
+                            try { removeUnavailableSources(channel); } catch (Exception ignore) {}
                         }
+                        updateChannelBestMetrics(channel);
+                        if (sortSources) {
+                            if (sortMode == HawkConfig.SORT_MODE_QUALITY_SCORE) {
+                                sortChannelByScores(channel);
+                            } else {
+                                channel.sortSourcesBySpeed();
+                            }
+                        }
+                        channel.setLastSpeedTestTime(System.currentTimeMillis());
                     }
-                    channel.setLastSpeedTestTime(System.currentTimeMillis());
                 }
 
-                // 记录测速时间 & 持久化缓存
-                Hawk.put(HawkConfig.SPEED_TEST_LAST_TIME, System.currentTimeMillis());
+                // 只有完整跑完的一轮才记录测速时间：中途取消若也记录，
+                // "周期性打开时提示"会在整个周期内不再提醒，设置页也显示"上次测速: 刚刚"
+                boolean roundCancelled = cancelled.get() || round.superseded;
+                if (!roundCancelled) {
+                    Hawk.put(HawkConfig.SPEED_TEST_LAST_TIME, System.currentTimeMillis());
+                }
+                // 持久化缓存（取消时也保存已完成的部分结果；finally 中还会兜底再存一次）
                 persistCacheToHawk();
 
                 // 回调前对结果做快照拷贝，避免调用方遍历时后台仍有 in-flight 任务写入导致
@@ -430,10 +630,10 @@ public class SpeedTestEngine {
                     snapshot = new ArrayList<>(allResults);
                 }
                 try {
-                    if (isCancelled.get()) {
-                        // 因"重新测速"而取消时不派发 onCancelled，
-                        // 否则UI 会先收到"已取消"而隐藏进度，随后新一轮才开始，造成闪跳
-                        if (callback != null && !restarting) {
+                    if (roundCancelled) {
+                        // 被顶替也派发 onCancelled：新一轮可能来自其它入口，旧入口需要收尾
+                        // （停服务 / 撤通知 / 释放 latch）；同入口重测的闪跳由回调方判断规避
+                        if (callback != null) {
                             callback.onCancelled(completedCount.get(), totalCount);
                         }
                     } else {
@@ -445,13 +645,19 @@ public class SpeedTestEngine {
                     Timber.e(cbErr, "测速完成回调执行异常");
                 }
 
-                Timber.i("测速完成: %d/%d, 耗时 %d ms", completedCount.get(), totalCount, totalTime);
+                Timber.i("测速%s: %d/%d, 耗时 %d ms", roundCancelled ? "结束(已取消)" : "完成",
+                        completedCount.get(), totalCount, totalTime);
 
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // 捕获 Throwable：收尾阶段（全量排序 / JSON 序列化）在低内存盒子上可能 OOM，
+                // 若只捕获 Exception，终态回调永远不触发，前台通知与 UI 进度条会一直卡住
                 Timber.e(e, "测速引擎异常");
                 try {
-                    if (callback != null) {
-                        callback.onError("测速异常: " + e.getMessage());
+                    if (round.superseded) {
+                        // 已被顶替：按"已取消"收尾即可
+                        notifyCancelledQuietly(callback, completedCount.get(), totalCount);
+                    } else if (callback != null) {
+                        callback.onError("测速异常: " + String.valueOf(e.getMessage()));
                     }
                 } catch (Throwable ignore) {
                     Timber.w(ignore, "onError 回调异常");
@@ -460,24 +666,44 @@ public class SpeedTestEngine {
                 // 无论正常完成 / 取消 / 异常，都强制把已完成的结果落盘，避免丢失
                 try {
                     persistCacheToHawk();
-                } catch (Exception ex) {
+                } catch (Throwable ex) {
                     Timber.w(ex, "最终持久化测速缓存失败");
+                } finally {
+                    // 放在内层 finally：即便持久化再次 OOM，也一定释放运行标记与本轮线程池
+                    finishRound(round);
+                    shutdownPool(pool);
                 }
-                isRunning.set(false);
-                shutdownExecutor();
             }
         }, "SpeedTestRunner");
-        runnerThread.start();
+        round.runner = runner;
+        runner.start();
     }
 
     /**
      * 取消正在进行的测速
      */
     public void cancel() {
-        if (isRunning.get()) {
-            isCancelled.set(true);
+        Round r = currentRound;
+        if (r != null) {
+            r.cancelled.set(true);
             Timber.i("用户取消测速");
         }
+    }
+
+    /**
+     * 仅当当前轮次由 callback 发起时才取消。
+     * 供后台 Worker 等入口在超时时使用，避免误取消其它入口（如用户手动）后来发起的测速。
+     *
+     * @return 是否取消了某一轮
+     */
+    public boolean cancel(SpeedTestCallback callback) {
+        Round r = currentRound;
+        if (r != null && callback != null && r.callback == callback) {
+            r.cancelled.set(true);
+            Timber.i("取消指定测速轮次");
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -1107,14 +1333,13 @@ public class SpeedTestEngine {
         channel.sortSourcesByScores(scores);
     }
 
-    private void shutdownExecutor() {
+    /** 关闭指定轮次的线程池（只关自己那一轮的，绝不经共享字段关到别的轮次） */
+    private static void shutdownPool(ExecutorService pool) {
         try {
-            if (executorService != null && !executorService.isShutdown()) {
-                executorService.shutdownNow();
+            if (pool != null && !pool.isShutdown()) {
+                pool.shutdownNow();
             }
-        } catch (Exception ignore) {}
-        // 释放线程池引用，让其在任务结束后可被 GC 回收，避免低内存设备上残留引用
-        executorService = null;
+        } catch (Throwable ignore) {}
     }
 
     /**

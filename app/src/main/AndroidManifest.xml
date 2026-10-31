@@ -13,6 +13,12 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Android 8+ 应用内安装 APK 需要此权限，否则会跳转到"允许安装未知应用"设置页或直接失败 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Android 10+ 后台（开机自启）拉起 Activity 需用户授予「显示在其他应用上层」，
+         不声明则系统设置里根本没有该授权开关 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Android 10+ 开机自启的兜底：未授予悬浮窗权限时改发带全屏 Intent 的高优先级通知，
+         全屏 Intent 属于系统允许的后台启动 Activity 豁免；普通权限，安装即授予 -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <!-- 电视特性声明 -->
     <uses-feature
@@ -68,15 +74,15 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- 开机自启（默认关闭，仅在设置中开启后生效） -->
+        <!-- 开机自启（默认关闭，仅在设置中开启后生效）。
+             不声明 directBootAware / LOCKED_BOOT_COMPLETED：应用数据都在凭据加密存储里，
+             用户解锁前拉起进程只会让 Hawk/SharedPreferences 初始化失败；解锁后的 BOOT_COMPLETED 已足够 -->
         <receiver
             android:name=".receiver.BootReceiver"
-            android:directBootAware="true"
             android:enabled="true"
             android:exported="true">
             <intent-filter android:priority="1000">
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
-                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
                 <category android:name="android.intent.category.DEFAULT" />

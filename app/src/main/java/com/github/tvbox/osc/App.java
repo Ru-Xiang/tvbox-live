@@ -9,6 +9,7 @@ import androidx.work.WorkManager;
 
 import com.github.tvbox.osc.util.HawkConfig;
 import com.orhanobut.hawk.Hawk;
+import com.orhanobut.hawk.NoEncryption;
 
 import timber.log.Timber;
 
@@ -48,14 +49,8 @@ public class App extends Application {
             // 日志系统失败不应影响启动
         }
 
-        try {
-            // 初始化 Hawk 配置存储
-            Hawk.init(this).build();
-            initDefaultConfig();
-            migrateConfig();
-        } catch (Exception e) {
-            Timber.w(e, "Hawk 初始化失败，将使用默认值");
-        }
+        // 初始化 Hawk 配置存储
+        initHawk();
 
         try {
             // 测速改为手动或"周期性打开时提示"，取消任何已注册的后台周期任务
@@ -65,6 +60,47 @@ public class App extends Application {
         }
 
         Timber.i("TVBoxOS-Live 应用启动");
+    }
+
+    /**
+     * 初始化 Hawk。Hawk 未构建成功时，之后每一次 Hawk.get/put 都会抛 IllegalStateException，
+     * 等于整个 App 必然闪退；因此默认加密方式失败（如 Conceal 的 native 库在部分盒子上加载失败）
+     * 时降级为不加密存储。降级后读不出的旧加密数据会按默认值处理。
+     */
+    private void initHawk() {
+        // 用本地标记判断是否构建成功：两次 build 都失败时 Hawk 内部 facade 为 null，
+        // 此时调用 Hawk.isBuilt() 本身会抛 NPE，直接让 Application.onCreate 崩溃
+        boolean built = false;
+        try {
+            Hawk.init(this).build();
+            built = true;
+        } catch (Throwable e) {
+            Timber.w(e, "Hawk 初始化失败，改用不加密存储重试");
+            try {
+                Hawk.init(this).setEncryption(new NoEncryption()).build();
+                built = true;
+            } catch (Throwable e2) {
+                Timber.e(e2, "Hawk 降级初始化仍失败");
+            }
+        }
+        if (built) {
+            try {
+                built = Hawk.isBuilt();
+            } catch (Throwable t) {
+                built = false;
+            }
+        }
+        if (!built) return;
+        try {
+            initDefaultConfig();
+        } catch (Exception e) {
+            Timber.w(e, "写入默认配置失败");
+        }
+        try {
+            migrateConfig();
+        } catch (Exception e) {
+            Timber.w(e, "配置迁移失败");
+        }
     }
 
     /**

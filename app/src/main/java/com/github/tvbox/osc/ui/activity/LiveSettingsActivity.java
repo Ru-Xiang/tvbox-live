@@ -4,6 +4,7 @@ import com.github.tvbox.osc.util.ToastUtil;
 
 import android.app.AlertDialog;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.text.InputType;
 import android.view.View;
 import android.widget.ArrayAdapter;
@@ -23,6 +24,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.api.ChannelManager;
 import com.github.tvbox.osc.service.BackgroundSpeedTestService;
+import com.github.tvbox.osc.service.ConfigHttpServer;
 import com.github.tvbox.osc.service.SpeedTestEngine;
 import com.github.tvbox.osc.ui.dialog.ScanConfigDialog;
 import com.github.tvbox.osc.util.ActivityCallbacks;
@@ -102,6 +104,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
     private Spinner spScaleMode;
     private CheckBox cbShowChannelInfo;
     private SeekBar sbInfoDuration;
+    private TextView tvInfoDurationValue;
     private CheckBox cbShowSpeedInfo;
     private SeekBar sbPlayTimeout;
     private TextView tvPlayTimeoutValue;
@@ -113,6 +116,25 @@ public class LiveSettingsActivity extends AppCompatActivity {
     private View speedTestBar;
     private ProgressBar speedTestProgress;
     private TextView tvSpeedTestInfo;
+    /**
+     * 是否已收到测速进度事件（即已越过"拉取全量线路"的准备阶段、进入正式测速）。
+     * 用于 onStart 判断：页面停止期间测速结束时完成/失败事件收不到（EventBus 在 onStop 反注册，
+     * 事件非粘性），返回页面后需据此判断是否该收起右上角进度条。
+     */
+    private boolean speedTestInTestPhase = false;
+    /**
+     * 本轮测速开始时（点击"立即测速"/收到准备事件）记下的"上次测速时间"。
+     * 准备阶段就离开页面时，整轮测速可能在停止期间跑完且一条进度事件都收不到，
+     * 返回后若 SPEED_TEST_LAST_TIME 已比它新，说明测速已在后台完成。
+     */
+    private long speedTestStartLastTime = -1L;
+    /** 最近一次收到测速相关事件（或点击测速）的时刻（elapsedRealtime），用于兜底判断准备阶段失败 */
+    private long speedTestLastEventAt = 0L;
+    /**
+     * 引擎未运行且超过该时长没有任何测速事件，视为本轮已结束（多为准备阶段失败、错误事件在停止期间丢失）。
+     * 若实际仍在拉取线路，后续准备/进度事件会重新显示进度条，误收起无副作用。
+     */
+    private static final long SPEED_TEST_STALE_MS = 3 * 60 * 1000L;
 
     private ChannelManager channelManager;
 
@@ -174,6 +196,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
         spScaleMode = findViewById(R.id.sp_scale_mode);
         cbShowChannelInfo = findViewById(R.id.cb_show_channel_info);
         sbInfoDuration = findViewById(R.id.sb_info_duration);
+        tvInfoDurationValue = findViewById(R.id.tv_info_duration_value);
         cbShowSpeedInfo = findViewById(R.id.cb_show_speed_info);
         sbPlayTimeout = findViewById(R.id.sb_play_timeout);
         tvPlayTimeoutValue = findViewById(R.id.tv_play_timeout_value);
@@ -244,15 +267,21 @@ public class LiveSettingsActivity extends AppCompatActivity {
         int urlsLimit = Hawk.get(HawkConfig.IPTV_URLS_LIMIT, HawkConfig.DEFAULT_URLS_LIMIT);
         if (sbUrlsLimit != null) {
             sbUrlsLimit.setMax(20); // 0=不限制, 1-20
+            sbUrlsLimit.setKeyProgressIncrement(1);  // 遥控器左右键每次步进（默认按 max/20 取整，步子过大）
             sbUrlsLimit.setProgress(urlsLimit);
         }
         if (tvUrlsLimitValue != null) {
             tvUrlsLimitValue.setText(urlsLimit == 0 ? "不限制" : urlsLimit + " 条");
         }
 
-        int updateInterval = Hawk.get(HawkConfig.IPTV_UPDATE_INTERVAL, HawkConfig.DEFAULT_UPDATE_INTERVAL);
+        // 先截断到 SeekBar 范围再显示：setProgress 会把超范围值截到 max，
+        // 而离开页面时保存的是 getProgress()，标签必须显示真正会被保存的值
+        int updateInterval = Math.max(1, Math.min(ConfigHttpServer.MAX_UPDATE_INTERVAL,
+                Hawk.get(HawkConfig.IPTV_UPDATE_INTERVAL, HawkConfig.DEFAULT_UPDATE_INTERVAL)));
         if (sbUpdateInterval != null) {
-            sbUpdateInterval.setMax(72);
+            // 上限与扫码网页共用同一常量，避免网页可提交、TV 端却存不下的值
+            sbUpdateInterval.setMax(ConfigHttpServer.MAX_UPDATE_INTERVAL);
+            sbUpdateInterval.setKeyProgressIncrement(1);
             sbUpdateInterval.setProgress(updateInterval);
         }
         if (tvUpdateIntervalValue != null) tvUpdateIntervalValue.setText(updateInterval + " 小时");
@@ -264,7 +293,12 @@ public class LiveSettingsActivity extends AppCompatActivity {
         }
 
         // 测速设置
-        if (cbSpeedTestEnabled != null) cbSpeedTestEnabled.setChecked(Hawk.get(HawkConfig.SPEED_TEST_ENABLED, true));
+        if (cbSpeedTestEnabled != null) {
+            boolean speedEnabled = Hawk.get(HawkConfig.SPEED_TEST_ENABLED, true);
+            cbSpeedTestEnabled.setChecked(speedEnabled);
+            // 勾选监听只在状态变化时触发，初始状态需主动同步一次
+            updateSpeedTestSettingsVisibility(speedEnabled);
+        }
 
         int mode = Hawk.get(HawkConfig.SPEED_TEST_MODE, HawkConfig.SPEED_MODE_MANUAL);
         if (mode == HawkConfig.SPEED_MODE_PERIODIC_PROMPT) {
@@ -276,6 +310,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
         int speedTestInterval = Hawk.get(HawkConfig.SPEED_TEST_INTERVAL, HawkConfig.DEFAULT_SPEED_TEST_INTERVAL);
         if (sbSpeedTestInterval != null) {
             sbSpeedTestInterval.setMax(168); // 最长7天
+            sbSpeedTestInterval.setKeyProgressIncrement(6);
             sbSpeedTestInterval.setProgress(speedTestInterval);
         }
         if (tvSpeedTestIntervalValue != null) tvSpeedTestIntervalValue.setText(speedTestInterval + " 小时");
@@ -286,6 +321,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
         int timeout = Hawk.get(HawkConfig.SPEED_TEST_TIMEOUT, HawkConfig.DEFAULT_SPEED_TEST_TIMEOUT);
         if (sbSpeedTestTimeout != null) {
             sbSpeedTestTimeout.setMax(30);
+            sbSpeedTestTimeout.setKeyProgressIncrement(1);
             sbSpeedTestTimeout.setProgress(timeout);
         }
         if (tvTimeoutValue != null) tvTimeoutValue.setText(timeout + " 秒");
@@ -293,13 +329,16 @@ public class LiveSettingsActivity extends AppCompatActivity {
         int concurrency = Hawk.get(HawkConfig.SPEED_TEST_CONCURRENCY, HawkConfig.DEFAULT_SPEED_TEST_CONCURRENCY);
         if (sbConcurrency != null) {
             sbConcurrency.setMax(20);
+            sbConcurrency.setKeyProgressIncrement(1);
             sbConcurrency.setProgress(concurrency);
         }
         if (tvConcurrencyValue != null) tvConcurrencyValue.setText(concurrency + " 线程");
 
-        int minSpeed = Hawk.get(HawkConfig.SPEED_MIN_THRESHOLD, HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD);
+        int minSpeed = Math.max(0, Math.min(ConfigHttpServer.MAX_SPEED_MIN_THRESHOLD,
+                Hawk.get(HawkConfig.SPEED_MIN_THRESHOLD, HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD)));
         if (sbMinSpeed != null) {
-            sbMinSpeed.setMax(500);
+            sbMinSpeed.setMax(ConfigHttpServer.MAX_SPEED_MIN_THRESHOLD);
+            sbMinSpeed.setKeyProgressIncrement(10);
             sbMinSpeed.setProgress(minSpeed);
         }
         if (tvMinSpeedValue != null) tvMinSpeedValue.setText(minSpeed + " KB/s");
@@ -315,7 +354,12 @@ public class LiveSettingsActivity extends AppCompatActivity {
         }
 
         // 播放器设置
-        if (spPlayerType != null) spPlayerType.setSelection(Hawk.get(HawkConfig.LIVE_PLAYER_TYPE, 2));
+        if (spPlayerType != null) {
+            // 目前只实现了 ExoPlayer：固定显示且不可选，避免用户以为切换会生效
+            spPlayerType.setSelection(2);
+            spPlayerType.setEnabled(false);
+            spPlayerType.setFocusable(false);
+        }
         if (spScaleMode != null) spScaleMode.setSelection(Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0));
         if (cbShowChannelInfo != null) cbShowChannelInfo.setChecked(Hawk.get(HawkConfig.LIVE_SHOW_CHANNEL_INFO, true));
         if (cbShowSpeedInfo != null) cbShowSpeedInfo.setChecked(Hawk.get(HawkConfig.LIVE_SHOW_SPEED_INFO, true));
@@ -323,12 +367,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
         int infoDuration = Hawk.get(HawkConfig.LIVE_CHANNEL_INFO_DURATION, 5);
         if (sbInfoDuration != null) {
             sbInfoDuration.setMax(15);
+            sbInfoDuration.setKeyProgressIncrement(1);
             sbInfoDuration.setProgress(infoDuration);
         }
+        if (tvInfoDurationValue != null) tvInfoDurationValue.setText(Math.max(1, infoDuration) + " 秒");
 
         int playTimeout = Hawk.get(HawkConfig.LIVE_PLAY_TIMEOUT, HawkConfig.DEFAULT_LIVE_PLAY_TIMEOUT);
         if (sbPlayTimeout != null) {
             sbPlayTimeout.setMax(60); // 0=关闭, 1-60 秒
+            sbPlayTimeout.setKeyProgressIncrement(1);
             sbPlayTimeout.setProgress(playTimeout);
         }
         if (tvPlayTimeoutValue != null) {
@@ -350,6 +397,38 @@ public class LiveSettingsActivity extends AppCompatActivity {
      *
      * @param showToast 是否需要在完成/失败时给出提示（"重置线路"场景不需要）
      */
+    /** Android 10+ 未授予悬浮窗权限时，引导用户开启，否则开机自启多半会被系统拦截 */
+    private void promptOverlayPermissionIfNeeded() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) return;
+        if (android.provider.Settings.canDrawOverlays(this)) return;
+        if (isFinishing() || isDestroyed()) return;
+        try {
+            new AlertDialog.Builder(this)
+                    .setTitle("开机自启需要额外权限")
+                    .setMessage("Android 10 及以上系统会拦截开机后自动打开界面。\n"
+                            + "请为本应用开启「显示在其他应用的上层」权限；未开启时开机后只会弹出一条通知，需手动点击打开。")
+                    .setPositiveButton("去开启", (d, w) -> openOverlayPermissionSettings())
+                    .setNegativeButton("暂不", null)
+                    .show();
+        } catch (Exception e) {
+            Timber.w(e, "显示悬浮窗权限提示失败");
+        }
+    }
+
+    private void openOverlayPermissionSettings() {
+        try {
+            android.content.Intent intent = new android.content.Intent(
+                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Exception e) {
+            // 不少电视盒子精简掉了该设置页（ActivityNotFoundException）：给出 adb 授权方式
+            Timber.w(e, "打开悬浮窗权限设置失败");
+            ToastUtil.show(this, "本机无权限设置页，可用 adb 授权：adb shell appops set "
+                    + getPackageName() + " SYSTEM_ALERT_WINDOW allow");
+        }
+    }
+
     private static class RefreshCallback implements ChannelManager.ChannelCallback {
         private final java.lang.ref.WeakReference<LiveSettingsActivity> ref;
         private final boolean showToast;
@@ -379,7 +458,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
 
         @Override
         public void onError(String errorMsg) {
-            if (!showToast) return;
+            // 失败始终提示（含"重置线路"）：网络不稳定时会保留原有列表，不告知用户会以为重置已生效
             ActivityCallbacks.runOnUiThreadIfAlive(ref, () -> {
                 LiveSettingsActivity a = ref.get();
                 if (a == null) return;
@@ -389,6 +468,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
     }
 
     private void setupListeners() {
+        // 开机自启：Android 10+ 禁止后台直接拉起界面，需要"显示在其他应用上层"权限才可靠
+        if (cbBootStartup != null) {
+            cbBootStartup.setOnCheckedChangeListener((buttonView, isChecked) -> {
+                // 仅在用户从"关"切到"开"时提示（loadSettings 按已保存值回填不会触发）
+                if (isChecked && !Hawk.get(HawkConfig.LIVE_BOOT_STARTUP, false)) {
+                    promptOverlayPermissionIfNeeded();
+                }
+            });
+        }
         // 刷新直播源按钮
         if (btnRefreshSource != null) {
             btnRefreshSource.setOnClickListener(v -> {
@@ -420,6 +508,8 @@ public class LiveSettingsActivity extends AppCompatActivity {
                 // 不再拦截"正在测速"：再次点击表示重新测速，
                 // 测速引擎会取消当前任务并从头开始
                 // 立刻在右上角给出反馈，覆盖联网拉取全量源的空窗期
+                speedTestInTestPhase = false;
+                markSpeedTestStarted();
                 if (speedTestBar != null) speedTestBar.setVisibility(View.VISIBLE);
                 if (speedTestProgress != null) {
                     speedTestProgress.setMax(1);
@@ -480,11 +570,14 @@ public class LiveSettingsActivity extends AppCompatActivity {
         }
 
         // SeekBar 监听
-        setupSeekBarListener(sbUpdateInterval, tvUpdateIntervalValue, " 小时");
-        setupSeekBarListener(sbSpeedTestInterval, tvSpeedTestIntervalValue, " 小时");
-        setupSeekBarListener(sbSpeedTestTimeout, tvTimeoutValue, " 秒");
-        setupSeekBarListener(sbConcurrency, tvConcurrencyValue, " 线程");
-        setupSeekBarListener(sbMinSpeed, tvMinSpeedValue, " KB/s");
+        // 显示的最小值需与 saveSettingsInternal 保存时的下限一致
+        // （最低速度允许 0，旧实现统一按 1 显示，拖到 0 时显示 1 但实际保存 0）
+        setupSeekBarListener(sbUpdateInterval, tvUpdateIntervalValue, " 小时", 1);
+        setupSeekBarListener(sbSpeedTestInterval, tvSpeedTestIntervalValue, " 小时", 1);
+        setupSeekBarListener(sbSpeedTestTimeout, tvTimeoutValue, " 秒", 1);
+        setupSeekBarListener(sbConcurrency, tvConcurrencyValue, " 线程", 1);
+        setupSeekBarListener(sbMinSpeed, tvMinSpeedValue, " KB/s", 0);
+        setupSeekBarListener(sbInfoDuration, tvInfoDurationValue, " 秒", 1);
 
         // 最大线路数（0 显示"不限制"）
         if (sbUrlsLimit != null) {
@@ -522,12 +615,12 @@ public class LiveSettingsActivity extends AppCompatActivity {
         }
     }
 
-    private void setupSeekBarListener(SeekBar seekBar, TextView valueText, String suffix) {
+    private void setupSeekBarListener(SeekBar seekBar, TextView valueText, String suffix, int min) {
         if (seekBar == null) return;
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                int value = Math.max(1, progress);
+                int value = Math.max(min, progress);
                 if (valueText != null) valueText.setText(value + suffix);
             }
             @Override
@@ -537,11 +630,61 @@ public class LiveSettingsActivity extends AppCompatActivity {
         });
     }
 
+    /**
+     * 测速关闭时把相关设置整行置灰禁用。
+     * 旧实现只隐藏单选组、测速周期滑块与"立即测速"按钮本身，会留下孤零零的标题/数值，
+     * 而超时、并发、最低速度等同属测速的项却仍可操作。
+     * 注意：Android 8.0 以下 addFocusables 不检查 isEnabled()，仅 setEnabled(false) 的控件
+     * 仍会抢到遥控器焦点，所以 setEnabledRecursive 同时切换 focusable，遥控器才能真正跳过。
+     * 注意"清除测速缓存"按钮不在此列：它同时清理台标与 EPG 缓存，关闭测速时也需要可用。
+     */
     private void updateSpeedTestSettingsVisibility(boolean enabled) {
-        int visibility = enabled ? View.VISIBLE : View.GONE;
-        if (rgSpeedTestMode != null) rgSpeedTestMode.setVisibility(visibility);
-        if (sbSpeedTestInterval != null) sbSpeedTestInterval.setVisibility(visibility);
-        if (btnStartSpeedTest != null) btnStartSpeedTest.setVisibility(visibility);
+        View[] rows = {
+                rgSpeedTestMode,
+                parentOf(sbSpeedTestInterval),
+                parentOf(sbSpeedTestTimeout),
+                parentOf(sbConcurrency),
+                cbSortBySpeed,
+                cbFilterUnavailable,
+                parentOf(sbMinSpeed),
+                btnStartSpeedTest,
+        };
+        for (View row : rows) {
+            if (row == null) continue;
+            // 兼容旧版本曾经设置过的 GONE
+            row.setVisibility(View.VISIBLE);
+            setEnabledRecursive(row, enabled);
+            row.setAlpha(enabled ? 1f : 0.4f);
+        }
+    }
+
+    private static View parentOf(View v) {
+        return v != null && v.getParent() instanceof View ? (View) v.getParent() : v;
+    }
+
+    /**
+     * 控件第一次被禁用前记录的原始可聚焦状态 [focusable, focusableInTouchMode]。
+     * 恢复时只还原原本可聚焦的控件，避免把行容器 LinearLayout、RadioGroup、
+     * 数值 TextView 等原本不可聚焦的视图误设为可聚焦。
+     */
+    private final java.util.Map<View, boolean[]> origFocusable = new java.util.HashMap<>();
+
+    private void setEnabledRecursive(View v, boolean enabled) {
+        v.setEnabled(enabled);
+        boolean[] orig = origFocusable.get(v);
+        if (orig == null) {
+            orig = new boolean[]{v.isFocusable(), v.isFocusableInTouchMode()};
+            origFocusable.put(v, orig);
+        }
+        if (orig[0]) {
+            v.setFocusable(enabled);
+            // setFocusable(false) 会顺带清掉 focusableInTouchMode，启用时按原值还原
+            if (enabled && orig[1]) v.setFocusableInTouchMode(true);
+        }
+        if (v instanceof android.view.ViewGroup) {
+            android.view.ViewGroup g = (android.view.ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) setEnabledRecursive(g.getChildAt(i), enabled);
+        }
     }
 
 
@@ -565,7 +708,8 @@ public class LiveSettingsActivity extends AppCompatActivity {
         if (isFinishing() || isDestroyed()) return;
         if (tvUpdateState != null) tvUpdateState.setText("正在检查更新...");
 
-        com.github.tvbox.osc.util.UpdateManager.checkForUpdate(
+        // 手动检查（manual=true）不受"跳过此版本"过滤，否则跳过后点"检查更新"会误报已是最新版本
+        com.github.tvbox.osc.util.UpdateManager.checkForUpdate(manual,
                 new com.github.tvbox.osc.util.UpdateManager.UpdateCallback() {
                     @Override
                     public void onUpdate(com.github.tvbox.osc.util.UpdateManager.UpdateInfo info) {
@@ -772,6 +916,28 @@ public class LiveSettingsActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 仅在值变化时写入 Hawk。
+     * Hawk 默认加密使用随机 IV，同值重复写入也会产生不同密文，SharedPreferences 无法识别"未变化"；
+     * 且每次 put 都是 commit() 同步重写整个 Hawk XML（含本地播放列表、测速缓存等大块数据），
+     * onPause 里二十多次全量重写在低端盒子上可达数秒，导致退出卡顿甚至 ANR。
+     * 仍保持同步写入：播放页在设置页关闭后会立即读取这些配置，异步写可能读到旧值。
+     * 仅当 key 已存在且值相等时跳过；key 不存在时照常写入，保证与旧逻辑落盘结果一致。
+     */
+    private static void putIfChanged(String key, Object value) {
+        if (value == null) return;
+        try {
+            if (Hawk.contains(key)) {
+                Object old = Hawk.get(key);
+                if (value.equals(old)) return;
+            }
+        } catch (Throwable t) {
+            // 读取/解密失败时退回直接写入，保证保存语义不变
+            Timber.w(t, "读取旧配置失败，直接写入: %s", key);
+        }
+        Hawk.put(key, value);
+    }
+
     private void saveSettingsInternal() {
         // 直播源设置
         if (spIpVersion != null) {
@@ -780,48 +946,48 @@ public class LiveSettingsActivity extends AppCompatActivity {
             int pos = spIpVersion.getSelectedItemPosition();
             String[] ipVersions = {"all", "ipv4", "ipv6"};
             if (pos >= 0 && pos < ipVersions.length) {
-                Hawk.put(HawkConfig.IPTV_IP_VERSION, ipVersions[pos]);
+                putIfChanged(HawkConfig.IPTV_IP_VERSION, ipVersions[pos]);
             }
         }
-        if (cbAutoUpdate != null) Hawk.put(HawkConfig.IPTV_AUTO_UPDATE, cbAutoUpdate.isChecked());
-        if (sbUpdateInterval != null) Hawk.put(HawkConfig.IPTV_UPDATE_INTERVAL, Math.max(1, sbUpdateInterval.getProgress()));
-        if (cbEnableEpg != null) Hawk.put(HawkConfig.IPTV_ENABLE_EPG, cbEnableEpg.isChecked());
-        if (cbTemplateEnabled != null) Hawk.put(HawkConfig.IPTV_TEMPLATE_ENABLED, cbTemplateEnabled.isChecked());
-        if (sbUrlsLimit != null) Hawk.put(HawkConfig.IPTV_URLS_LIMIT, sbUrlsLimit.getProgress());
+        if (cbAutoUpdate != null) putIfChanged(HawkConfig.IPTV_AUTO_UPDATE, cbAutoUpdate.isChecked());
+        if (sbUpdateInterval != null) putIfChanged(HawkConfig.IPTV_UPDATE_INTERVAL, Math.max(1, sbUpdateInterval.getProgress()));
+        if (cbEnableEpg != null) putIfChanged(HawkConfig.IPTV_ENABLE_EPG, cbEnableEpg.isChecked());
+        if (cbTemplateEnabled != null) putIfChanged(HawkConfig.IPTV_TEMPLATE_ENABLED, cbTemplateEnabled.isChecked());
+        if (sbUrlsLimit != null) putIfChanged(HawkConfig.IPTV_URLS_LIMIT, sbUrlsLimit.getProgress());
 
         // 测速设置
-        if (cbSpeedTestEnabled != null) Hawk.put(HawkConfig.SPEED_TEST_ENABLED, cbSpeedTestEnabled.isChecked());
+        if (cbSpeedTestEnabled != null) putIfChanged(HawkConfig.SPEED_TEST_ENABLED, cbSpeedTestEnabled.isChecked());
 
         if (rgSpeedTestMode != null) {
             int mode = HawkConfig.SPEED_MODE_MANUAL;
             int checkedId = rgSpeedTestMode.getCheckedRadioButtonId();
             if (checkedId == R.id.rb_periodic_prompt) mode = HawkConfig.SPEED_MODE_PERIODIC_PROMPT;
             else if (checkedId == R.id.rb_manual_only) mode = HawkConfig.SPEED_MODE_MANUAL;
-            Hawk.put(HawkConfig.SPEED_TEST_MODE, mode);
+            putIfChanged(HawkConfig.SPEED_TEST_MODE, mode);
         }
 
-        if (sbSpeedTestInterval != null) Hawk.put(HawkConfig.SPEED_TEST_INTERVAL, Math.max(1, sbSpeedTestInterval.getProgress()));
-        if (sbSpeedTestTimeout != null) Hawk.put(HawkConfig.SPEED_TEST_TIMEOUT, Math.max(1, sbSpeedTestTimeout.getProgress()));
-        if (sbConcurrency != null) Hawk.put(HawkConfig.SPEED_TEST_CONCURRENCY, Math.max(1, sbConcurrency.getProgress()));
-        if (cbSortBySpeed != null) Hawk.put(HawkConfig.SPEED_SORT_SOURCES, cbSortBySpeed.isChecked());
-        if (cbFilterUnavailable != null) Hawk.put(HawkConfig.SPEED_FILTER_UNAVAILABLE, cbFilterUnavailable.isChecked());
-        if (sbMinSpeed != null) Hawk.put(HawkConfig.SPEED_MIN_THRESHOLD, sbMinSpeed.getProgress());
+        if (sbSpeedTestInterval != null) putIfChanged(HawkConfig.SPEED_TEST_INTERVAL, Math.max(1, sbSpeedTestInterval.getProgress()));
+        if (sbSpeedTestTimeout != null) putIfChanged(HawkConfig.SPEED_TEST_TIMEOUT, Math.max(1, sbSpeedTestTimeout.getProgress()));
+        if (sbConcurrency != null) putIfChanged(HawkConfig.SPEED_TEST_CONCURRENCY, Math.max(1, sbConcurrency.getProgress()));
+        if (cbSortBySpeed != null) putIfChanged(HawkConfig.SPEED_SORT_SOURCES, cbSortBySpeed.isChecked());
+        if (cbFilterUnavailable != null) putIfChanged(HawkConfig.SPEED_FILTER_UNAVAILABLE, cbFilterUnavailable.isChecked());
+        if (sbMinSpeed != null) putIfChanged(HawkConfig.SPEED_MIN_THRESHOLD, sbMinSpeed.getProgress());
 
         // 播放器设置
         // 同样过滤 INVALID_POSITION(-1)，避免把 -1 写入配置导致播放器初始化取到非法值
         if (spPlayerType != null && spPlayerType.getSelectedItemPosition() >= 0) {
-            Hawk.put(HawkConfig.LIVE_PLAYER_TYPE, spPlayerType.getSelectedItemPosition());
+            putIfChanged(HawkConfig.LIVE_PLAYER_TYPE, spPlayerType.getSelectedItemPosition());
         }
         if (spScaleMode != null && spScaleMode.getSelectedItemPosition() >= 0) {
-            Hawk.put(HawkConfig.LIVE_PLAYER_SCALE, spScaleMode.getSelectedItemPosition());
+            putIfChanged(HawkConfig.LIVE_PLAYER_SCALE, spScaleMode.getSelectedItemPosition());
         }
-        if (cbShowChannelInfo != null) Hawk.put(HawkConfig.LIVE_SHOW_CHANNEL_INFO, cbShowChannelInfo.isChecked());
-        if (cbShowSpeedInfo != null) Hawk.put(HawkConfig.LIVE_SHOW_SPEED_INFO, cbShowSpeedInfo.isChecked());
-        if (sbInfoDuration != null) Hawk.put(HawkConfig.LIVE_CHANNEL_INFO_DURATION, Math.max(1, sbInfoDuration.getProgress()));
-        if (sbPlayTimeout != null) Hawk.put(HawkConfig.LIVE_PLAY_TIMEOUT, sbPlayTimeout.getProgress());
+        if (cbShowChannelInfo != null) putIfChanged(HawkConfig.LIVE_SHOW_CHANNEL_INFO, cbShowChannelInfo.isChecked());
+        if (cbShowSpeedInfo != null) putIfChanged(HawkConfig.LIVE_SHOW_SPEED_INFO, cbShowSpeedInfo.isChecked());
+        if (sbInfoDuration != null) putIfChanged(HawkConfig.LIVE_CHANNEL_INFO_DURATION, Math.max(1, sbInfoDuration.getProgress()));
+        if (sbPlayTimeout != null) putIfChanged(HawkConfig.LIVE_PLAY_TIMEOUT, sbPlayTimeout.getProgress());
 
         // 系统：开机自启
-        if (cbBootStartup != null) Hawk.put(HawkConfig.LIVE_BOOT_STARTUP, cbBootStartup.isChecked());
+        if (cbBootStartup != null) putIfChanged(HawkConfig.LIVE_BOOT_STARTUP, cbBootStartup.isChecked());
 
         Timber.d("设置已保存");
     }
@@ -863,6 +1029,49 @@ public class LiveSettingsActivity extends AppCompatActivity {
         } catch (Throwable t) {
             Timber.w(t, "注册 EventBus 失败");
         }
+        syncSpeedTestBarOnStart();
+    }
+
+    /**
+     * 返回页面时校正测速进度条：停止期间测速若已结束，完成/失败事件已丢失，
+     * 进度条会一直停留在旧的"测速 87%"。
+     * 仅在已进入正式测速阶段（收到过进度事件）且引擎已不在运行时才收起：
+     * 准备阶段引擎尚未 isRunning，此时收起会误把仍在拉取线路的任务隐藏掉。
+     */
+    private void syncSpeedTestBarOnStart() {
+        try {
+            if (speedTestBar == null || speedTestBar.getVisibility() != View.VISIBLE) return;
+            if (SpeedTestEngine.getInstance().isRunning()) return;
+            // 引擎未运行时，满足以下任一条件才收起（仅凭 !isRunning 会误伤仍在准备阶段的任务）：
+            // 1. 已进入正式测速阶段，引擎停了即本轮结束；
+            // 2. 准备阶段就离开，但"上次测速时间"已更新 => 整轮在停止期间跑完；
+            // 3. 长时间无任何测速事件 => 多为准备阶段失败，错误事件已丢失。
+            long lastTime = Hawk.get(HawkConfig.SPEED_TEST_LAST_TIME, 0L);
+            boolean finishedWhileStopped = speedTestStartLastTime >= 0 && lastTime > speedTestStartLastTime;
+            boolean stale = speedTestLastEventAt > 0
+                    && SystemClock.elapsedRealtime() - speedTestLastEventAt > SPEED_TEST_STALE_MS;
+            // 4. 测速服务已发出终态事件（完成/错误）而本页当时已注销、没收到 => 直接收起
+            boolean serviceIdle = !BackgroundSpeedTestService.isBusy();
+            if (!speedTestInTestPhase && !finishedWhileStopped && !stale && !serviceIdle) return;
+            speedTestInTestPhase = false;
+            speedTestBar.setVisibility(View.GONE);
+            if (tvLastSpeedTestTime != null) {
+                tvLastSpeedTestTime.setText(SpeedTestEngine.getInstance().getLastTestTimeDescription());
+            }
+            Timber.d("测速已在页面停止期间结束，收起进度条");
+        } catch (Throwable t) {
+            Timber.w(t, "同步测速进度条失败");
+        }
+    }
+
+    /** 记录本轮测速起点，供 syncSpeedTestBarOnStart 判断停止期间测速是否已结束 */
+    private void markSpeedTestStarted() {
+        try {
+            speedTestStartLastTime = Hawk.get(HawkConfig.SPEED_TEST_LAST_TIME, 0L);
+        } catch (Throwable t) {
+            speedTestStartLastTime = -1L;
+        }
+        speedTestLastEventAt = SystemClock.elapsedRealtime();
     }
 
     @Override
@@ -886,6 +1095,9 @@ public class LiveSettingsActivity extends AppCompatActivity {
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onSpeedTestPrepare(BackgroundSpeedTestService.SpeedTestPrepareEvent event) {
         if (isFinishing() || isDestroyed()) return;
+        // 准备事件可能来自其他页面发起的测速，同样登记本轮起点（准备阶段内上次测速时间不变，重复登记无害）
+        markSpeedTestStarted();
+        speedTestInTestPhase = false;
         if (speedTestBar != null) speedTestBar.setVisibility(View.VISIBLE);
         if (speedTestProgress != null) {
             if (event.total > 0) {
@@ -912,6 +1124,8 @@ public class LiveSettingsActivity extends AppCompatActivity {
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onSpeedTestProgress(BackgroundSpeedTestService.SpeedTestProgressEvent event) {
         if (isFinishing() || isDestroyed()) return;
+        speedTestInTestPhase = true;
+        speedTestLastEventAt = SystemClock.elapsedRealtime();
         if (speedTestBar != null) speedTestBar.setVisibility(View.VISIBLE);
         if (speedTestProgress != null) {
             speedTestProgress.setMax(Math.max(1, event.total));
@@ -928,6 +1142,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onSpeedTestComplete(BackgroundSpeedTestService.SpeedTestCompleteEvent event) {
         if (isFinishing() || isDestroyed()) return;
+        speedTestInTestPhase = false;
         if (speedTestBar != null) speedTestBar.setVisibility(View.GONE);
         if (event.cancelled) return;
         int available = 0;
@@ -950,6 +1165,7 @@ public class LiveSettingsActivity extends AppCompatActivity {
     @Subscribe(threadMode = ThreadMode.MAIN)
     public void onSpeedTestError(BackgroundSpeedTestService.SpeedTestErrorEvent event) {
         if (isFinishing() || isDestroyed()) return;
+        speedTestInTestPhase = false;
         if (speedTestBar != null) speedTestBar.setVisibility(View.GONE);
         ToastUtil.show(this, "测速失败: " + event.errorMsg);
     }

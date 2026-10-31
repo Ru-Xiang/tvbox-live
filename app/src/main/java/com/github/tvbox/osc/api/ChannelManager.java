@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 
 import timber.log.Timber;
 
@@ -44,6 +45,15 @@ public class ChannelManager {
     private final LiveChannelDatabase database;
     private final Gson gson;
     private final ExecutorService ioExecutor;
+
+    /**
+     * 记录"上次播放频道"的专用线程：换台发生在主线程，Hawk 写入含序列化与磁盘 IO；
+     * 也不与 ioExecutor 上耗时的整表写库排队（否则测速后写库期间换台记录会被延迟很久）。
+     */
+    private final ExecutorService prefsExecutor;
+
+    /** 待写入的"上次播放频道"；快速连续换台时只落盘最后停留的那个 */
+    private final AtomicReference<LiveChannel> pendingLastChannel = new AtomicReference<>();
 
     /**
      * 原始频道分组列表（来自直播源，未过滤）。
@@ -71,6 +81,23 @@ public class ChannelManager {
     /** 当前选中的频道索引 */
     private int currentChannelIndex = 0;
 
+    /**
+     * 列表刷新后在新列表中找不到的"正在播放频道"（被订阅删除/改名/移组）。
+     *
+     * <p>此时若仍沿用旧索引，getCurrentChannel 会指向同位置的另一个频道，
+     * 换源/自动切源/EPG 都会作用到错误频道上（画面跳台）。因此暂时钉住正在播放的对象，
+     * 直到用户下次主动换台（上下切台/选台/同步/恢复）或它在后续刷新中重新出现。
+     */
+    private volatile LiveChannel lostPlaying;
+
+    /**
+     * 测速后持久化任务重排/裁剪线路并重建展示列表"之后"在主线程回调。
+     * SpeedTestCompleteEvent 在持久化任务入队后就已发出，界面在那时的重同步往往早于重建，
+     * 看不到裁剪/隐藏后的列表；界面据此回调再同步一次。
+     */
+    private volatile Runnable speedTestPersistedListener;
+    private final android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+
     /** 频道管理回调 */
     public interface ChannelCallback {
         void onChannelsLoaded(List<ChannelGroup> groups);
@@ -88,6 +115,12 @@ public class ChannelManager {
         // 非守护线程会阻止进程退出；写库/持久化也不应与播放抢 CPU。
         this.ioExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "ChannelManagerIO");
+            t.setDaemon(true);
+            t.setPriority(Thread.MIN_PRIORITY);
+            return t;
+        });
+        this.prefsExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "ChannelManagerPrefs");
             t.setDaemon(true);
             t.setPriority(Thread.MIN_PRIORITY);
             return t;
@@ -128,7 +161,8 @@ public class ChannelManager {
 
     /**
      * 初始化加载频道
-     * 优先从本地缓存加载，若缓存过期或不存在则从网络获取
+     * 优先从本地缓存加载：有缓存时立即展示（秒开），缓存过期再在后台静默刷新，
+     * 刷新成功通过 onChannelsUpdated 通知；无缓存时才阻塞等待网络获取。
      */
     public void loadChannels(ChannelCallback callback) {
         ioExecutor.execute(() -> {
@@ -138,12 +172,18 @@ public class ChannelManager {
                 // 已存在测速生成的本地列表时，默认直接使用它（下次打开仍可用），
                 // 不因自动更新周期而重新联网覆盖，保证优先使用最佳线路本地列表。
                 boolean hasLocal = hasLocalPlaylist();
-                if (!cachedGroups.isEmpty() && (hasLocal || !iptvApiService.needsUpdate())) {
+                if (!cachedGroups.isEmpty()) {
                     rawGroups = cachedGroups;
                     rebuildDisplayGroups();
                     Timber.d("从%s加载: %d 个分组",
                             hasLocal ? "本地测速列表" : "缓存", cachedGroups.size());
                     if (callback != null) callback.onChannelsLoaded(channelGroups);
+                    // 缓存过期（且不是测速生成的本地列表）：界面先用缓存，后台再刷新。
+                    // 原先直接阻塞联网，数十个源拉完前一直转圈，断网时还要等全部超时。
+                    if (!hasLocal && iptvApiService.needsUpdate()) {
+                        Timber.d("缓存已过期，后台刷新直播源...");
+                        refreshInBackground(callback);
+                    }
                     return;
                 }
 
@@ -178,9 +218,35 @@ public class ChannelManager {
      * 强制从网络刷新频道
      */
     public void refreshChannels(ChannelCallback callback) {
+        refreshChannels(callback, false);
+    }
+
+    /**
+     * @param background 是否为启动时的后台静默刷新（用户没有主动要求刷新）
+     */
+    private void refreshChannels(ChannelCallback callback, final boolean background) {
         iptvApiService.fetchAndMergeSources(new IptvApiService.FetchCallback() {
             @Override
             public void onSuccess(List<ChannelGroup> groups, int totalChannels) {
+                // 后台静默刷新期间若测速正在进行：不替换 rawGroups。测速对象被换掉后，
+                // 测速排序作用在被丢弃的旧对象上、持久化却裁剪新列表，会丢掉最佳线路；
+                // 测速自身会联网拉取全量源，这份结果丢弃即可。
+                if (background && speedTestEngine.isRunning()) {
+                    Timber.w("测速进行中，丢弃本次后台刷新结果（%d 个频道）", totalChannels);
+                    return;
+                }
+                // 网络受损（断网/之前可用的源多数因网络失败）且结果比现有列表更少：
+                // 保留现有缓存，不让残缺结果覆盖完整列表与数据库（并复位更新时间，下次启动会重试）。
+                // 用户主动刷新同样保护：网络受损时的残缺结果不覆盖完整缓存，并明确告知已保留旧列表。
+                // 网络正常时 shouldKeepCurrentOnDegraded 恒为 false，上游缩减/重置线路仍照常替换。
+                if (shouldKeepCurrentOnDegraded(groups, totalChannels)) {
+                    if (callback != null) {
+                        callback.onError(background
+                                ? "网络不稳定，多数直播源获取失败，已保留原有频道列表"
+                                : "网络不稳定，多数直播源获取失败，已保留原有频道列表，请稍后重试");
+                    }
+                    return;
+                }
                 rawGroups = groups;
                 rebuildDisplayGroups();
                 // 异步保存到数据库
@@ -202,6 +268,68 @@ public class ChannelManager {
         });
     }
 
+    /** 后台静默刷新：成功时回调 onChannelsUpdated；失败仅记录日志（界面已在展示缓存） */
+    private void refreshInBackground(ChannelCallback callback) {
+        refreshChannels(new ChannelCallback() {
+            @Override
+            public void onChannelsLoaded(List<ChannelGroup> groups) {}
+
+            @Override
+            public void onChannelsUpdated(List<ChannelGroup> groups, int newCount) {
+                if (callback != null) callback.onChannelsUpdated(groups, newCount);
+            }
+
+            @Override
+            public void onError(String errorMsg) {
+                Timber.w("后台刷新直播源失败，继续使用缓存: %s", errorMsg);
+            }
+        }, true);
+    }
+
+    /**
+     * 本次拉源"网络受损"且结果比现有列表更少（频道或线路）时返回 true，调用方应保留现有列表。
+     * 现有列表为空时永远返回 false（没有可保留的东西）。
+     */
+    private boolean shouldKeepCurrentOnDegraded(List<ChannelGroup> groups, int totalChannels) {
+        try {
+            if (!iptvApiService.isLastFetchDegraded()) return false;
+            int oldChannels = getTotalChannelCount();
+            if (oldChannels <= 0) return false;
+            int newLines = 0;
+            if (groups != null) {
+                for (ChannelGroup g : groups) {
+                    if (g == null) continue;
+                    for (LiveChannel ch : g.snapshotChannels()) {
+                        if (ch != null) newLines += ch.getSourceCount();
+                    }
+                }
+            }
+            int oldLines = getTotalSourceCount();
+            if (totalChannels < oldChannels || newLines < oldLines) {
+                Timber.w("拉源网络受损，结果(%d 频道/%d 线路)少于现有列表(%d/%d)，保留现有列表",
+                        totalChannels, newLines, oldChannels, oldLines);
+                // 复位上次更新时间：残缺结果未被采用，下次启动应重新尝试，而不是再等一个更新周期
+                try {
+                    Hawk.put(HawkConfig.IPTV_LAST_UPDATE_TIME, 0L);
+                } catch (Throwable ignore) {
+                }
+                return true;
+            }
+        } catch (Throwable t) {
+            Timber.w(t, "比较拉源结果与现有列表失败");
+        }
+        return false;
+    }
+
+    /**
+     * 把当前原始频道数据（含测速后的线路排序/过滤结果）写回数据库。
+     * 供测速服务在测速结束后调用；写库在 IO 线程异步执行。
+     */
+    public void persistChannels() {
+        List<ChannelGroup> groups = rawGroups;
+        if (groups != null && !groups.isEmpty()) saveToDatabase(groups);
+    }
+
     /**
      * 测速前重新拉取全量直播源。
      *
@@ -217,7 +345,8 @@ public class ChannelManager {
             @Override
             public void onSuccess(List<ChannelGroup> groups, int totalChannels) {
                 try {
-                    if (groups != null && !groups.isEmpty()) {
+                    if (groups != null && !groups.isEmpty()
+                            && !shouldKeepCurrentOnDegraded(groups, totalChannels)) {
                         rawGroups = groups;
                         rebuildDisplayGroups();
                         saveToDatabase(groups);
@@ -230,6 +359,20 @@ public class ChannelManager {
 
             @Override
             public void onError(String errorMsg) {
+                if (IptvApiService.ERROR_BUSY.equals(errorMsg)) {
+                    // 已有拉源任务在跑（典型：启动时缓存过期触发的后台刷新）。此时内存中的列表
+                    // 马上会被它替换，拿旧对象测速会让测速结果作用在被丢弃的对象上。
+                    // 等它结束（结果已装入 rawGroups）后再交出待测列表。
+                    Timber.w("测速前已有拉源任务在执行，等待其完成后再测速");
+                    if (callback != null) {
+                        try {
+                            callback.onProgress(0, 0, "正在等待当前直播源获取完成...");
+                        } catch (Throwable ignore) {
+                        }
+                    }
+                    iptvApiService.runAfterCurrentFetch(() -> notifyReadySafely(callback));
+                    return;
+                }
                 Timber.w("测速前刷新源失败，使用当前列表测速: %s", errorMsg);
                 // 刷新失败不阻断测速，回退到当前内存中的频道
                 notifyReadySafely(callback);
@@ -328,6 +471,15 @@ public class ChannelManager {
         return currentChannelIndex;
     }
 
+    /**
+     * 正在播放的频道是否处于"钉住"状态（刷新后在新列表中找不到）。
+     * 此时 currentGroupIndex/currentChannelIndex 仍是旧位置、已被别的频道占据，
+     * 界面高亮"正在播放"时应视为不在列表中（传 -1），否则会把无关频道标成正在播放。
+     */
+    public boolean isCurrentPinned() {
+        return lostPlaying != null;
+    }
+
     /** 获取当前分组 */
     public ChannelGroup getCurrentGroup() {
         try {
@@ -347,6 +499,8 @@ public class ChannelManager {
 
     /** 获取当前频道 */
     public LiveChannel getCurrentChannel() {
+        LiveChannel lost = lostPlaying;
+        if (lost != null) return lost;
         try {
             ChannelGroup group = getCurrentGroup();
             if (group == null) return null;
@@ -366,13 +520,19 @@ public class ChannelManager {
 
     /** 切换到下一个频道 */
     public synchronized LiveChannel nextChannel() {
+        // 钉住期间旧位置已被"顶上来"的下一个频道占据：直接播放该位置的频道，
+        // 再自增会把它跳过
+        final boolean wasPinned = lostPlaying != null;
+        lostPlaying = null;
         try {
             ChannelGroup group = getCurrentGroup();
             if (group == null) return null;
             List<LiveChannel> channels = group.getChannels();
             if (channels == null) return null;
 
-            currentChannelIndex++;
+            if (!wasPinned || currentChannelIndex < 0 || currentChannelIndex >= channels.size()) {
+                currentChannelIndex++;
+            }
             if (currentChannelIndex >= channels.size()) {
                 // 切换到下一个分组的第一个频道
                 currentChannelIndex = 0;
@@ -399,6 +559,7 @@ public class ChannelManager {
 
     /** 切换到上一个频道 */
     public synchronized LiveChannel prevChannel() {
+        lostPlaying = null;
         try {
             ChannelGroup group = getCurrentGroup();
             if (group == null || group.getChannels() == null) return null;
@@ -434,6 +595,7 @@ public class ChannelManager {
 
     /** 选择指定分组和频道 */
     public synchronized LiveChannel selectChannel(int groupIndex, int channelIndex) {
+        lostPlaying = null;
         try {
             // 只读一次 volatile 引用，避免 size 校验与 get 落在不同快照上
             List<ChannelGroup> groups = channelGroups;
@@ -468,6 +630,9 @@ public class ChannelManager {
      */
     public synchronized boolean syncCurrentTo(LiveChannel target) {
         if (target == null) return false;
+        // 主动同步到某频道：若找到则以新位置为准；找不到时若正是被钉住的频道则保持钉住
+        LiveChannel prevLost = lostPlaying;
+        lostPlaying = null;
         // 只取一次引用，两轮匹配都基于同一快照，避免中途被后台替换
         List<ChannelGroup> groups = channelGroups;
         if (groups == null) return false;
@@ -506,11 +671,13 @@ public class ChannelManager {
         } catch (Exception e) {
             Timber.w(e, "syncCurrentTo 异常");
         }
+        if (prevLost == target) lostPlaying = prevLost;
         return false;
     }
 
     /** 恢复上次播放的频道 */
     public LiveChannel restoreLastChannel() {
+        lostPlaying = null;
         try {
             String lastChannelName = Hawk.get(HawkConfig.LIVE_LAST_CHANNEL, "");
             String lastGroupName = Hawk.get(HawkConfig.LIVE_LAST_GROUP, "");
@@ -598,6 +765,7 @@ public class ChannelManager {
      */
     public synchronized LiveChannel jumpToFirstLetter(char letter) {
         char target = Character.toUpperCase(letter);
+        lostPlaying = null;
         ChannelGroup group = getCurrentGroup();
         if (group == null) return null;
         // 用快照：原先在循环外读一次 size 再 list.get(idx)，
@@ -773,6 +941,17 @@ public class ChannelManager {
      */
     public synchronized void rebuildDisplayGroups() {
         try {
+            // 记住正在播放的频道：重建后分组/频道顺序可能变化（刷新源、测速隐藏不可用频道），
+            // 仅保留旧索引会让"当前频道"指向别的频道，导致换源/上下切台/EPG 错位
+            LiveChannel playing = null;
+            String playingUrl = null;
+            List<ChannelGroup> oldGroups = channelGroups;
+            if (oldGroups != null && !oldGroups.isEmpty()) {
+                playing = getCurrentChannel();
+                // 先记下正在播放的线路：重建过程中 applySourcePrefs 等可能重排线路并复位 sourceIndex
+                if (playing != null) playingUrl = playing.getCurrentSourceUrl();
+            }
+
             List<ChannelGroup> display = new ArrayList<>();
             List<ChannelGroup> src = rawGroups;
             if (src == null) src = new ArrayList<>();
@@ -805,12 +984,76 @@ public class ChannelManager {
             }
 
             this.channelGroups = display;
+            if (playing != null) relocateCurrent(display, playing, playingUrl);
             if (hidden > 0) {
                 Timber.i("展示列表已隐藏 %d 个无可用播放源的频道", hidden);
             }
         } catch (Throwable e) {
             // 低内存设备重建展示列表可能 OOM（Error），必须一并兜住避免闪退
             Timber.w(e, "rebuildDisplayGroups 异常");
+        }
+    }
+
+    /**
+     * 在新列表中重新定位正在播放的频道：先按频道 key（分组+名称）精确匹配，
+     * 再按频道名跨分组匹配（与 {@link #syncCurrentTo} 一致，应对模板/去重移组）。
+     *
+     * <p>定位到新对象时，把"正在播放的线路"按 URL 对应到新对象的 sourceIndex，
+     * 让后续自动切源从实际在播的线路继续，而不是从新对象的第 0 条重来。
+     * 都找不到时钉住原播放对象（见 {@link #lostPlaying}），不让旧索引指向别的频道。
+     */
+    private void relocateCurrent(List<ChannelGroup> groups, LiveChannel playing, String playingUrl) {
+        String key = playing.getKey();
+        String name = playing.getChannelName();
+        int foundG = -1, foundC = -1;
+        LiveChannel found = null;
+        for (int g = 0; g < groups.size() && found == null; g++) {
+            ChannelGroup group = groups.get(g);
+            if (group == null) continue;
+            List<LiveChannel> channels = group.getChannels();
+            if (channels == null) continue;
+            for (int c = 0; c < channels.size(); c++) {
+                LiveChannel ch = channels.get(c);
+                if (ch != null && key.equals(ch.getKey())) {
+                    found = ch;
+                    foundG = g;
+                    foundC = c;
+                    break;
+                }
+            }
+        }
+        if (found == null && name != null) {
+            for (int g = 0; g < groups.size() && found == null; g++) {
+                ChannelGroup group = groups.get(g);
+                if (group == null) continue;
+                List<LiveChannel> channels = group.getChannels();
+                if (channels == null) continue;
+                for (int c = 0; c < channels.size(); c++) {
+                    LiveChannel ch = channels.get(c);
+                    if (ch != null && name.equals(ch.getChannelName())) {
+                        found = ch;
+                        foundG = g;
+                        foundC = c;
+                        break;
+                    }
+                }
+            }
+        }
+        if (found == null) {
+            lostPlaying = playing;
+            Timber.w("刷新后的列表中找不到正在播放的频道 %s，保持当前播放对象", name);
+            return;
+        }
+        currentGroupIndex = foundG;
+        currentChannelIndex = foundC;
+        lostPlaying = null;
+        if (playingUrl != null) {
+            List<String> urls = found.getSourceUrls();
+            int idx = urls == null ? -1 : urls.indexOf(playingUrl);
+            if (idx >= 0) found.setSourceIndex(idx);
+        }
+        if (found != playing && found.getCurrentEpgInfo() == null && playing.getCurrentEpgInfo() != null) {
+            found.setCurrentEpgInfo(playing.getCurrentEpgInfo());
         }
     }
 
@@ -857,17 +1100,69 @@ public class ChannelManager {
                 if (ch == null) continue;
                 List<String> urls = ch.getSourceUrls();
                 if (urls == null || urls.size() <= urlsLimit) continue;
-                ch.setSourceUrls(new ArrayList<>(urls.subList(0, urlsLimit)));
+                // 裁剪前记下当前线路：重排时只有正在播放的频道（播放提示）索引非 0，
+                // 一律复位 0 会让它的索引指向播放器并未在播的线路（稳定线路记录/自动换源错位）
+                String cur = ch.getCurrentSourceUrl();
+                List<String> kept = new ArrayList<>(urls.subList(0, urlsLimit));
+                ch.setSourceUrls(kept);
                 List<Double> speeds = ch.getSpeeds();
                 if (speeds != null && speeds.size() > urlsLimit) {
                     ch.setSpeeds(new ArrayList<>(speeds.subList(0, urlsLimit)));
                 }
-                ch.setSourceIndex(0);
+                int keepIdx = cur == null ? -1 : kept.indexOf(cur);
+                ch.setSourceIndex(keepIdx >= 0 ? keepIdx : 0);
                 trimmed++;
             }
         }
         if (trimmed > 0) {
             Timber.d("测速后按上限 %d 裁剪了 %d 个频道的线路", urlsLimit, trimmed);
+        }
+    }
+
+    /**
+     * 按测速缓存结果重排 rawGroups 中每个频道的线路：
+     * 测速可用的在前（按综合评分或速度，与测速排序模式一致），未测过的居中，测速失败的最后。
+     * 稳定排序，同档保持原顺序。用户关闭"测速后排序线路"时不做处理（与测速引擎一致）。
+     */
+    private synchronized void reorderRawByCachedResults() {
+        if (!Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true)) return;
+        List<ChannelGroup> groups = rawGroups;
+        if (groups == null) return;
+        final boolean byScore = Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE)
+                == HawkConfig.SORT_MODE_QUALITY_SCORE;
+        for (ChannelGroup group : new ArrayList<>(groups)) {
+            if (group == null) continue;
+            for (LiveChannel ch : group.snapshotChannels()) {
+                if (ch == null) continue;
+                List<String> urls = ch.getSourceUrls();
+                if (urls == null || urls.size() < 2) continue;
+                final int n = urls.size();
+                final int[] tier = new int[n];      // 0 可用 / 1 未测(含无法测速) / 2 测速失败
+                final double[] key = new double[n]; // 可用线路的排序值（越大越靠前）
+                for (int i = 0; i < n; i++) {
+                    SpeedTestResult r = speedTestEngine.getCachedResult(urls.get(i));
+                    if (r == null || SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) {
+                        tier[i] = 1;
+                    } else if (r.isAvailable()) {
+                        tier[i] = 0;
+                        double v = byScore ? r.getQualityScore() : r.getSpeed();
+                        key[i] = Double.isNaN(v) ? 0d : v;
+                    } else {
+                        tier[i] = 2;
+                    }
+                }
+                List<Integer> order = new ArrayList<>(n);
+                for (int i = 0; i < n; i++) order.add(i);
+                java.util.Collections.sort(order, (a, b) -> {
+                    if (tier[a] != tier[b]) return Integer.compare(tier[a], tier[b]);
+                    if (tier[a] == 0) return Double.compare(key[b], key[a]);
+                    return 0;
+                });
+                // 把排序结果转成名次分数交给 LiveChannel（稳定排序，speeds 同步跟随）
+                List<Integer> scores = new ArrayList<>(java.util.Collections.nCopies(n, 0));
+                for (int rank = 0; rank < n; rank++) scores.set(order.get(rank), n - rank);
+                ch.sortSourcesByScores(scores);
+            }
         }
     }
 
@@ -892,11 +1187,17 @@ public class ChannelManager {
     public void persistAfterSpeedTest() {
         ioExecutor.execute(() -> {
             try {
+                // 裁剪前按测速缓存（以 URL 为键）重排当前 rawGroups 的线路：若测速期间
+                // rawGroups 被源刷新整体替换，测速引擎排序的是已被丢弃的旧对象，
+                // 新对象仍是拉取顺序，直接截断会丢掉测出的最佳线路。对未被替换的情况幂等。
+                reorderRawByCachedResults();
                 // 测速已覆盖全部线路，此处按“单频道最多线路”只保留最佳的若干条
-                // （测速引擎已把可用线路按质量排在前面），控制长期内存与数据库体积
+                // （可用线路已按质量排在前面），控制长期内存与数据库体积
                 applyUrlsLimitToRaw();
                 // 重建展示列表以反映测速后的线路排序与过滤
                 rebuildDisplayGroups();
+                // 重建完成后通知界面重同步（列表与播放线路索引），见 speedTestPersistedListener
+                notifySpeedTestPersisted();
                 // 持久化频道数据（含排序后的线路顺序与速度）
                 saveToDatabase(rawGroups);
                 // 生成并持久化"最佳线路"本地播放列表
@@ -906,6 +1207,30 @@ public class ChannelManager {
             } catch (Throwable e) {
                 // 生成/序列化大列表在低内存设备上可能 OOM（Error），需兜住
                 Timber.e(e, "测速后持久化本地播放列表失败");
+            }
+        });
+    }
+
+    /** 设置测速后持久化（重建展示列表）完成的主线程回调；传 null 清除 */
+    public void setOnSpeedTestPersistedListener(Runnable listener) {
+        speedTestPersistedListener = listener;
+    }
+
+    /** 仅当当前回调仍是 listener 时清除（避免新界面注册后被旧界面 onDestroy 清掉） */
+    public void clearOnSpeedTestPersistedListener(Runnable listener) {
+        if (speedTestPersistedListener == listener) speedTestPersistedListener = null;
+    }
+
+    private void notifySpeedTestPersisted() {
+        final Runnable l = speedTestPersistedListener;
+        if (l == null) return;
+        mainHandler.post(() -> {
+            // 投递期间界面可能已销毁并注销
+            if (speedTestPersistedListener != l) return;
+            try {
+                l.run();
+            } catch (Throwable t) {
+                Timber.w(t, "测速后持久化完成回调异常");
             }
         });
     }
@@ -1237,21 +1562,39 @@ public class ChannelManager {
         }
     }
 
+    /**
+     * 记录上次播放频道。
+     *
+     * <p>换台在主线程触发，而 Hawk 写入含序列化与磁盘 IO，因此放到专用后台线程；
+     * 连续快速换台时合并为一次，只写最终停留的频道。
+     *
+     * <p>数据库按"频道名 + 分组"更新播放时间：网络拉取的频道对象 id 恒为 0
+     * （写库后 Room 不会回填自增 id），原先按 id 更新永远命中不了任何行。
+     */
     private void saveLastChannel(LiveChannel channel) {
         if (channel == null) return;
-        try {
-            if (channel.getChannelName() != null) {
-                Hawk.put(HawkConfig.LIVE_LAST_CHANNEL, channel.getChannelName());
-            }
-            if (channel.getGroupName() != null) {
-                Hawk.put(HawkConfig.LIVE_LAST_GROUP, channel.getGroupName());
-            }
-        } catch (Exception e) {
-            Timber.w(e, "保存上次频道失败");
-        }
-        ioExecutor.execute(() -> {
+        // 内存中同步记录，后续整表写库时不会把播放时间覆盖回 0
+        channel.setLastPlayTime(System.currentTimeMillis());
+        // 已有待执行任务时只替换目标频道，无需再提交
+        if (pendingLastChannel.getAndSet(channel) != null) return;
+        prefsExecutor.execute(() -> {
+            LiveChannel latest = pendingLastChannel.getAndSet(null);
+            if (latest == null) return;
+            String name = latest.getChannelName();
+            String group = latest.getGroupName();
             try {
-                database.channelDao().updateLastPlayTime(channel.getId(), System.currentTimeMillis());
+                if (name != null) {
+                    Hawk.put(HawkConfig.LIVE_LAST_CHANNEL, name);
+                }
+                if (group != null) {
+                    Hawk.put(HawkConfig.LIVE_LAST_GROUP, group);
+                }
+            } catch (Exception e) {
+                Timber.w(e, "保存上次频道失败");
+            }
+            if (name == null || group == null) return;
+            try {
+                database.channelDao().updateLastPlayTimeByName(name, group, latest.getLastPlayTime());
             } catch (Exception e) {
                 Timber.w(e, "更新最后播放时间失败");
             }

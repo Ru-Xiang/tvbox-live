@@ -9,7 +9,7 @@
     <external-files-path
         name="apk_download"
         path="Download/" />
-    <!-- 兜底：内部 filesDir 下万一存在下载文件也能授权 -->
+    <!-- 兜底：外部存储不可用时 UpdateManager 保存到 filesDir/Download/，与此处一致 -->
     <files-path
         name="apk_internal"
         path="Download/" />

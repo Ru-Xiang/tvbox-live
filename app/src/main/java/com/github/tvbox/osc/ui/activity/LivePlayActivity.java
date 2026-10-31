@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.widget.FrameLayout;
@@ -21,6 +22,7 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
+import androidx.recyclerview.widget.SimpleItemAnimator;
 
 import com.bumptech.glide.Glide;
 import com.github.tvbox.osc.R;
@@ -47,6 +49,7 @@ import com.google.android.exoplayer2.source.DefaultMediaSourceFactory;
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
 import com.google.android.exoplayer2.ui.StyledPlayerView;
 import com.google.android.exoplayer2.upstream.DefaultHttpDataSource;
+import com.google.android.exoplayer2.video.VideoSize;
 import com.orhanobut.hawk.Hawk;
 
 import org.greenrobot.eventbus.EventBus;
@@ -126,8 +129,23 @@ public class LivePlayActivity extends AppCompatActivity {
      * 供右下角常驻网速显示；未播放时回落为测速缓存值。
      */
     private com.google.android.exoplayer2.upstream.DefaultBandwidthMeter bandwidthMeter;
-    /** 右下角网速的轮询任务：播放中每 2 秒刷新一次实时吞吐 */
-    private final Runnable cornerSpeedTask = this::updateCornerSpeed;
+    /**
+     * 右下角网速的轮询任务：播放中每 2 秒刷新一次实时吞吐。
+     * 必须自我重新投递：原先是 this::updateCornerSpeed 的方法引用，只会执行一次，
+     * 网速停在起播后 2 秒的那个值（或一直隐藏）。由 stopCornerSpeedTicker / onPause 终止循环。
+     */
+    private final Runnable cornerSpeedTask = new Runnable() {
+        @Override
+        public void run() {
+            if (!isAlive() || handler == null) return;
+            updateCornerSpeed();
+            handler.removeCallbacks(this);
+            // 不在前台或播放器已释放时不再续投：STATE_READY 可能在 onPause 之后才到达
+            // （设置页盖住时换线/重连完成），否则会在后台每 2 秒空转读 Hawk、刷 View
+            if (!resumed || exoPlayer == null) return;
+            handler.postDelayed(this, 2000);
+        }
+    };
 
     // ============ 适配器 ============
     private GroupListAdapter groupAdapter;
@@ -152,6 +170,9 @@ public class LivePlayActivity extends AppCompatActivity {
     private Runnable hideChannelInfoRunnable;
     /** 频道列表侧边栏中当前浏览的分组索引（与正在播放的分组可能不同） */
     private int browsingGroupIndex = 0;
+    /** 当前视频的显示尺寸（已按像素宽高比换算），供"原始"缩放模式使用 */
+    private int videoWidth = 0;
+    private int videoHeight = 0;
 
     // ============ 加载优先级控制（播放列表 > 测速 > EPG） ============
     /** 因测速（或测速决策）被推迟加载 EPG 的频道 */
@@ -179,6 +200,94 @@ public class LivePlayActivity extends AppCompatActivity {
     /** 是否在 onStop 中主动释放过播放器（用于 onStart 判断需不需要重新起播） */
     private boolean playerReleasedOnStop = false;
 
+    /**
+     * Activity 是否处于 started（可见）状态：onStart 置 true、onStop 置 false。
+     * 异步加载频道 / 换源回调可能在 onStop 之后才到达，此时不能创建播放器，
+     * 否则直播声音在设置页或桌面后台继续播放，并长期占用硬件解码器与缓冲内存。
+     * 不用 Lifecycle.isAtLeast(STARTED)：ON_START 在 onStart() 返回后才分发，
+     * 会挡住 onStart 自身的重新起播。
+     */
+    private boolean started = false;
+    /** onResume 置 true、onPause 置 false：右下角网速轮询只在前台续投 */
+    private boolean resumed = false;
+
+    /** 起播后稳定播放这么久才视为"本轮换源成功"，重置换源计数 */
+    private static final long STABLE_PLAY_RESET_MS = 15_000L;
+    /**
+     * 测速后持久化（重排、按上限裁剪、重建展示列表）完成后的主线程回调。
+     * 由 ChannelManager 单例持有，onDestroy 时注销；只在主线程执行。
+     */
+    private final Runnable speedTestPersistedListener = new Runnable() {
+        @Override
+        public void run() {
+            if (!isAlive() || channelManager == null) return;
+            refreshChannelListKeepingBrowse();
+            resyncPlayingChannel(false);
+        }
+    };
+
+    /**
+     * 稳定播放后重置换源计数与"全部失败"提醒状态。
+     * 不在每次 READY 立即重置：READY 后马上又出错的线路会让换源无限循环、永不提醒；
+     * 只有稳定播放一段时间后再断流，才按新一轮失败从头计数（单源频道也能重试一次）。
+     */
+    private final Runnable stablePlayResetRunnable = new Runnable() {
+        @Override
+        public void run() {
+            sourceTryCount = 0;
+            allSourcesTimeoutPrompted = false;
+            reconnectSameSourceOnce = true;
+            // 优先取播放器实际加载的 URL：测速后重排/裁剪可能让频道索引暂时不指向在播线路
+            String playing = currentPlayUrl;
+            if (playing == null) {
+                LiveChannel ch = channelManager != null ? channelManager.getCurrentChannel() : null;
+                playing = ch != null ? ch.getCurrentSourceUrl() : null;
+            }
+            lastStableSourceUrl = playing;
+        }
+    };
+
+    /**
+     * 稳定播放后的首次失败先原线路重连一次再换源：多为瞬时断流，原线路通常还能用；
+     * 单源频道原先在播放中断后完全不会重试，直接弹"全部失败"。
+     */
+    private boolean reconnectSameSourceOnce = false;
+
+    // ============ 断网恢复 ============
+    /** 最近一次稳定播放的线路 URL：断网恢复后优先从这条线路重连，而不是停在被轮换走的线路上 */
+    private String lastStableSourceUrl;
+    /** 是否因断网导致播放失败、正在等待网络恢复后自动重连 */
+    private boolean waitingForNetwork = false;
+    /** "全部线路失败"弹窗，网络恢复自动重连时需要关闭它 */
+    private AlertDialog allSourcesDialog;
+    private android.net.ConnectivityManager.NetworkCallback networkCallback;
+    /** 网络恢复后的重连任务：延迟执行以等待 DNS/路由就绪，并对网络抖动的多次回调去抖 */
+    private final Runnable networkResumeRunnable = this::resumeAfterNetworkBack;
+    private static final long NETWORK_RESUME_DELAY_MS = 2_000L;
+    /**
+     * 网络回调注册失败时的兜底轮询：否则断网后既不换源也不弹窗，只能永远黑屏。
+     * 仅在 waitingForNetwork 且 Activity 可见时续投，onStop 中移除。
+     */
+    private static final long NETWORK_POLL_INTERVAL_MS = 8_000L;
+    private final Runnable networkPollRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!isAlive() || !started || handler == null) return;
+            if (!waitingForNetwork || networkCallback != null) return;
+            if (isNetworkConnected()) {
+                resumeAfterNetworkBack();
+            } else {
+                handler.removeCallbacks(this);
+                handler.postDelayed(this, NETWORK_POLL_INTERVAL_MS);
+            }
+        }
+    };
+
+    /** 频道列表适配器当前展示所基于的分组列表引用（用于发现后台已整体替换列表） */
+    private List<ChannelGroup> shownGroups;
+    /** 播放器当前实际在播的线路 URL（存储形式，未去 $ 后缀）；线路管理据此判断"删的是不是正在播的线路" */
+    private String currentPlayUrl;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -187,11 +296,19 @@ public class LivePlayActivity extends AppCompatActivity {
         handler = new Handler(Looper.getMainLooper());
         channelManager = ChannelManager.getInstance(this);
         speedTestEngine = SpeedTestEngine.getInstance();
+        // 已经打开了界面：撤掉开机自启的兜底通知
+        try {
+            android.app.NotificationManager nm = (android.app.NotificationManager)
+                    getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null) nm.cancel(com.github.tvbox.osc.receiver.BootReceiver.BOOT_NOTIFICATION_ID);
+        } catch (Exception ignore) {}
         epgService = EpgService.getInstance();
 
         initViews();
         initAdapters();
         EventBus.getDefault().register(this);
+        // 测速完成事件早于测速后的线路裁剪/列表重建：重建完成后再同步一次列表与在播线路索引
+        channelManager.setOnSpeedTestPersistedListener(speedTestPersistedListener);
 
         loadChannelData();
     }
@@ -199,6 +316,9 @@ public class LivePlayActivity extends AppCompatActivity {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
+        // 从设置页返回时缩放模式可能已改变（原先只在 onCreate 应用一次）
+        applyScaleMode();
         if (exoPlayer != null && exoPlayer.getPlaybackState() != Player.STATE_IDLE) {
             exoPlayer.setPlayWhenReady(true);
         }
@@ -208,6 +328,7 @@ public class LivePlayActivity extends AppCompatActivity {
     @Override
     protected void onPause() {
         super.onPause();
+        resumed = false;
         if (exoPlayer != null) {
             exoPlayer.setPlayWhenReady(false);
         }
@@ -217,7 +338,9 @@ public class LivePlayActivity extends AppCompatActivity {
     @Override
     protected void onStart() {
         super.onStart();
-        // 若曾在 onStop 中释放过播放器，回到前台时重新起播当前频道
+        // 必须在下面的重新起播之前置位：playChannel 会检查该标记
+        started = true;
+        // 若曾在 onStop 中释放过播放器（或后台期间到达的起播请求被推迟），回到前台时重新起播当前频道
         if (exoPlayer == null && playerReleasedOnStop) {
             playerReleasedOnStop = false;
             LiveChannel channel = channelManager.getCurrentChannel();
@@ -225,6 +348,11 @@ public class LivePlayActivity extends AppCompatActivity {
                 playChannel(channel);
             }
         }
+        // 放在重新起播之后注册：注册时系统会对当前可用网络立即回调一次 onAvailable，
+        // 此时 playChannel 已重置失败状态，不会误触发重连
+        registerNetworkCallback();
+        // 注册失败（部分 ROM 抛异常）且仍在等网：没有回调可依赖，改用轮询兜底
+        scheduleNetworkPollIfNeeded();
     }
 
     /**
@@ -238,6 +366,15 @@ public class LivePlayActivity extends AppCompatActivity {
     @Override
     protected void onStop() {
         super.onStop();
+        // 先于 isFinishing 判断清除：之后到达的异步起播/换源回调一律不得创建播放器
+        started = false;
+        unregisterNetworkCallback();
+        if (handler != null) {
+            handler.removeCallbacks(networkResumeRunnable);
+            handler.removeCallbacks(networkPollRunnable);
+            handler.removeCallbacks(stablePlayResetRunnable);
+        }
+        stopCornerSpeedTicker();
         if (isFinishing()) return; // 正在退出，交给 onDestroy 统一释放
         if (exoPlayer != null) {
             playerReleasedOnStop = true;
@@ -249,11 +386,133 @@ public class LivePlayActivity extends AppCompatActivity {
         }
     }
 
+    // ============ 断网恢复 ============
+
+    /**
+     * 监听网络恢复：断网期间所有线路都会失败，网络回来后若不处理，播放器会一直停在黑屏。
+     * 用 registerNetworkCallback(NetworkRequest)（API 21 可用；registerDefaultNetworkCallback 需 API 24）。
+     * 部分电视 ROM 会在注册时抛异常，整体 try/catch，失败只是失去自动重连能力。
+     */
+    private void registerNetworkCallback() {
+        if (networkCallback != null) return;
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    getApplicationContext().getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return;
+            android.net.ConnectivityManager.NetworkCallback cb =
+                    new android.net.ConnectivityManager.NetworkCallback() {
+                        @Override
+                        public void onAvailable(@NonNull android.net.Network network) {
+                            // 回调在 binder 线程，切回主线程处理；延迟去抖，等待网络真正可用
+                            Handler h = handler;
+                            if (h == null) return;
+                            h.post(() -> {
+                                if (!isAlive() || !started) return;
+                                if (!waitingForNetwork && !allSourcesTimeoutPrompted) return;
+                                h.removeCallbacks(networkResumeRunnable);
+                                h.postDelayed(networkResumeRunnable, NETWORK_RESUME_DELAY_MS);
+                            });
+                        }
+                    };
+            android.net.NetworkRequest request = new android.net.NetworkRequest.Builder()
+                    .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build();
+            cm.registerNetworkCallback(request, cb);
+            networkCallback = cb;
+        } catch (Throwable t) {
+            Timber.w(t, "注册网络状态监听失败");
+            networkCallback = null;
+        }
+    }
+
+    private void unregisterNetworkCallback() {
+        android.net.ConnectivityManager.NetworkCallback cb = networkCallback;
+        networkCallback = null;
+        if (cb == null) return;
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    getApplicationContext().getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+            if (cm != null) cm.unregisterNetworkCallback(cb);
+        } catch (Throwable t) {
+            Timber.w(t, "注销网络状态监听失败");
+        }
+    }
+
+    /** 当前是否有已连接的网络；取不到状态时按"在线"处理，保持原有换源行为 */
+    @SuppressWarnings("deprecation")
+    private boolean isNetworkConnected() {
+        try {
+            android.net.ConnectivityManager cm = (android.net.ConnectivityManager)
+                    getApplicationContext().getSystemService(android.content.Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            // getActiveNetworkInfo 在 API 29 起标记为过时，但 API 21~33 均可用，且是 21 上唯一简单可靠的判断方式
+            android.net.NetworkInfo ni = cm.getActiveNetworkInfo();
+            if (ni != null && ni.isConnected()) return true;
+            // 个别盒子 ROM 的有线网络不会成为"默认网络"：再看一遍所有网络，
+            // 避免误判离线而把自动换源整体关掉（getAllNetworks / getNetworkInfo(Network) 均为 API 21）
+            android.net.Network[] all = cm.getAllNetworks();
+            if (all != null) {
+                for (android.net.Network n : all) {
+                    android.net.NetworkInfo info = cm.getNetworkInfo(n);
+                    if (info != null && info.isConnected()) return true;
+                }
+            }
+            return false;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** 没有可用的网络回调时启动兜底轮询（已有回调则什么都不做） */
+    private void scheduleNetworkPollIfNeeded() {
+        if (handler == null || !started || !waitingForNetwork || networkCallback != null) return;
+        handler.removeCallbacks(networkPollRunnable);
+        handler.postDelayed(networkPollRunnable, NETWORK_POLL_INTERVAL_MS);
+    }
+
+    /** 网络恢复后重连当前频道：优先回到断网前稳定播放的那条线路 */
+    private void resumeAfterNetworkBack() {
+        if (!isAlive() || !started) return;
+        if (!waitingForNetwork && !allSourcesTimeoutPrompted) return;
+        if (!isNetworkConnected()) return; // 又断了，等下一次 onAvailable
+        LiveChannel ch = channelManager != null ? channelManager.getCurrentChannel() : null;
+        if (ch == null) return;
+        Timber.i("网络已恢复，自动重连频道: %s", ch.getChannelName());
+        waitingForNetwork = false;
+        dismissAllSourcesDialog();
+        List<String> urls = ch.getSourceUrls();
+        int idx = (lastStableSourceUrl != null && urls != null) ? urls.indexOf(lastStableSourceUrl) : -1;
+        if (idx >= 0) {
+            ch.setSourceIndex(idx);
+        }
+        ToastUtil.show(this, "网络已恢复，正在重新连接");
+        // playChannel 会重置换源计数与"全部失败"提醒状态
+        playChannel(ch);
+    }
+
+    private void dismissAllSourcesDialog() {
+        AlertDialog d = allSourcesDialog;
+        allSourcesDialog = null;
+        if (d == null) return;
+        try {
+            if (d.isShowing()) d.dismiss();
+        } catch (Throwable ignore) {
+        }
+    }
+
     @Override
     protected void onDestroy() {
         super.onDestroy();
         try { EventBus.getDefault().unregister(this); } catch (Exception ignore) {}
+        try {
+            if (channelManager != null) {
+                channelManager.clearOnSpeedTestPersistedListener(speedTestPersistedListener);
+            }
+        } catch (Exception ignore) {}
         try { handler.removeCallbacksAndMessages(null); } catch (Exception ignore) {}
+        // 兜底：正常情况下 onStop 已注销
+        unregisterNetworkCallback();
+        dismissAllSourcesDialog();
         // RecyclerView.post 用的是 View 自带 Handler，不受上面的 handler 影响，
         // 通过 ViewTreeObserver 所在的 Handler 统一清空该 View 的待执行任务
         try {
@@ -299,11 +558,13 @@ public class LivePlayActivity extends AppCompatActivity {
 
         if (groupListView != null) {
             groupListView.setLayoutManager(new LinearLayoutManager(this));
+            disableChangeAnimation(groupListView);
             groupListView.setLayoutAnimation(android.view.animation.AnimationUtils
                     .loadLayoutAnimation(this, R.anim.layout_anim_fall_down));
         }
         if (channelListView != null) {
             channelListView.setLayoutManager(new LinearLayoutManager(this));
+            disableChangeAnimation(channelListView);
             channelListView.setLayoutAnimation(android.view.animation.AnimationUtils
                     .loadLayoutAnimation(this, R.anim.layout_anim_fall_down));
         }
@@ -316,30 +577,61 @@ public class LivePlayActivity extends AppCompatActivity {
         applyScaleMode();
     }
 
+    /**
+     * 关闭条目刷新的交叉淡入动画：notifyItemChanged（高亮切换）时默认动画会用新 ViewHolder
+     * 替换旧视图，正在聚焦的条目因此丢失焦点，遥控器操作时表现为焦点乱跳。
+     */
+    private void disableChangeAnimation(RecyclerView rv) {
+        if (rv != null && rv.getItemAnimator() instanceof SimpleItemAnimator) {
+            ((SimpleItemAnimator) rv.getItemAnimator()).setSupportsChangeAnimations(false);
+        }
+    }
+
     private void initAdapters() {
         groupAdapter = new GroupListAdapter();
         channelAdapter = new ChannelListAdapter();
 
         groupAdapter.setOnGroupActionListener((position, group) -> {
+            // 焦点回到当前浏览的分组（如从频道列表按左键返回）时不重复刷新，
+            // 否则频道列表整表重建、滚动位置被重置
+            if (position == browsingGroupIndex && channelAdapter.getItemCount() > 0) return;
             browsingGroupIndex = position;
             // 用抗并发快照：后台线程可能正在结构性修改该分组的频道列表，
             // 直接 new ArrayList<>(getChannels()) 会抛 ConcurrentModificationException，
             // 而本回调由焦点变化触发，不在任何 try/catch 保护内
-            channelAdapter.setChannels(group != null ? group.snapshotChannels() : null);
+            channelAdapter.setChannels(group != null ? group.snapshotChannels() : null,
+                    channelNumberOffset(position));
             // 若浏览的是当前播放分组，高亮正在播放的频道
-            channelAdapter.setPlayingIndex(
-                    position == channelManager.getCurrentGroupIndex()
-                            ? channelManager.getCurrentChannelIndex() : -1);
+            channelAdapter.setPlayingIndex(playingIndexInGroup(position));
         });
 
         channelAdapter.setOnChannelActionListener(new ChannelListAdapter.OnChannelActionListener() {
             @Override
             public void onChannelClick(int position, LiveChannel channel) {
-                LiveChannel selected = channelManager.selectChannel(browsingGroupIndex, position);
-                if (selected != null) {
-                    playChannel(selected);
-                    channelAdapter.setPlayingIndex(position);
+                // 按用户点中的频道对象定位，而不是按 (浏览分组, 下标)：
+                // 测速前重载 / 后台刷新可能已整体替换 ChannelManager 的列表，而界面仍显示旧列表，
+                // 按旧下标去新列表里取会播放另一个频道（并被记成"上次播放"）。
+                LiveChannel target = null;
+                // 先按对象 / key（分组+频道名）在当前列表中找到同一频道：同名频道会出现在多个分组
+                // （如央视与高清分组都有 CCTV-1、线路不同），只按频道名会播成别的分组的那个
+                LiveChannel exact = findChannelInCurrentList(channel);
+                if (exact != null && channelManager.syncCurrentTo(exact)) {
+                    target = channelManager.getCurrentChannel();
+                } else if (channel != null && channelManager.syncCurrentTo(channel)) {
+                    // 兜底：key 也找不到（分组被改名等）时退回 ChannelManager 的按名匹配
+                    // 取当前列表中的那份对象（可能是按频道名匹配到的新副本）
+                    target = channelManager.getCurrentChannel();
                 }
+                if (target == null) {
+                    // 点中的频道已不在当前列表：刷新界面让用户重新选择，不按下标猜
+                    Timber.w("点击的频道已不在当前列表: %s",
+                            channel != null ? channel.getChannelName() : "null");
+                    ToastUtil.show(LivePlayActivity.this, "频道列表已更新，请重新选择");
+                    refreshChannelListInPlace();
+                    return;
+                }
+                // playChannel 内部会同步"正在播放"高亮
+                playChannel(target);
                 hideChannelList();
             }
 
@@ -411,7 +703,11 @@ public class LivePlayActivity extends AppCompatActivity {
                 LivePlayActivity a = ref.get();
                 if (a == null) return;
                 a.showLoading(false);
-                a.refreshGroupAdapter();
+                // 后台静默刷新可能在用户浏览频道列表时到达：列表打开时原地刷新，
+                // 保留浏览分组与焦点所在频道，避免跳回播放分组、按 OK 播错台
+                a.refreshChannelListKeepingBrowse();
+                // 刷新后当前频道可能换成了新对象：对齐线路索引并重拉信息栏节目单
+                a.resyncPlayingChannel(true);
                 ToastUtil.show(a, "已更新 " + newCount + " 个频道");
             });
         }
@@ -497,6 +793,7 @@ public class LivePlayActivity extends AppCompatActivity {
         // 只取一次引用：getChannelGroups() 返回的是 ChannelManager 的 volatile 字段，
         // 后台线程会整体替换它，分别读取会导致校验与取值落在不同快照上
         List<ChannelGroup> groups = channelManager.getChannelGroups();
+        shownGroups = groups;
         if (groups == null) groups = new ArrayList<>();
         groupAdapter.setGroups(groups);
 
@@ -512,9 +809,9 @@ public class LivePlayActivity extends AppCompatActivity {
         browsingGroupIndex = Math.max(0, Math.min(playingGroup, groups.size() - 1));
         groupAdapter.setSelectedIndex(browsingGroupIndex);
         ChannelGroup g = groups.get(browsingGroupIndex);
-        channelAdapter.setChannels(g != null ? g.snapshotChannels() : null);
-        channelAdapter.setPlayingIndex(
-                browsingGroupIndex == playingGroup ? channelManager.getCurrentChannelIndex() : -1);
+        channelAdapter.setChannels(g != null ? g.snapshotChannels() : null,
+                channelNumberOffset(groups, browsingGroupIndex));
+        channelAdapter.setPlayingIndex(playingIndexInGroup(browsingGroupIndex));
     }
 
     /**
@@ -540,6 +837,7 @@ public class LivePlayActivity extends AppCompatActivity {
         }
 
         List<ChannelGroup> groups = channelManager.getChannelGroups();
+        shownGroups = groups;
         if (groups == null) groups = new ArrayList<>();
         groupAdapter.setGroups(groups);
 
@@ -550,16 +848,187 @@ public class LivePlayActivity extends AppCompatActivity {
             return;
         }
 
-        int playingGroup = channelManager.getCurrentGroupIndex();
         // 关键差异：这里保留用户当前浏览的分组，而不是强制跳回播放分组
         browsingGroupIndex = Math.max(0, Math.min(browsingGroupIndex, groups.size() - 1));
         groupAdapter.setSelectedIndex(browsingGroupIndex);
         ChannelGroup g = groups.get(browsingGroupIndex);
-        channelAdapter.setChannels(g != null ? g.snapshotChannels() : null);
-        channelAdapter.setPlayingIndex(
-                browsingGroupIndex == playingGroup ? channelManager.getCurrentChannelIndex() : -1);
+        channelAdapter.setChannels(g != null ? g.snapshotChannels() : null,
+                channelNumberOffset(groups, browsingGroupIndex));
+        channelAdapter.setPlayingIndex(playingIndexInGroup(browsingGroupIndex));
 
         restoreChannelFocus(keepChannelPos);
+    }
+
+    /**
+     * 频道数据被后台更新（静默刷新 / 测速完成 / 测速前重载）后的列表刷新入口：
+     * 列表面板打开时原地刷新并保持浏览位置；未打开时按原逻辑刷新（下次打开本来也会重新定位）。
+     */
+    private void refreshChannelListKeepingBrowse() {
+        if (isChannelListVisible) {
+            refreshChannelListInPlace();
+        } else {
+            refreshGroupAdapter();
+        }
+    }
+
+    /** 列表打开期间若 ChannelManager 已整体替换了分组列表（如测速前重载），原地刷新界面 */
+    private void refreshChannelListIfReplaced() {
+        if (!isChannelListVisible || channelManager == null) return;
+        if (channelManager.getChannelGroups() == shownGroups) return;
+        Timber.d("频道列表已在后台替换，原地刷新界面");
+        refreshChannelListInPlace();
+    }
+
+    /**
+     * 面板可见时的原地刷新：保留用户正在浏览的分组（按分组名在新列表中重新定位）与
+     * 焦点所在的频道（按频道 key / 名称重新定位），不强制跳回播放分组。
+     *
+     * <p>不能直接用 {@link #refreshGroupAdapter()}：它把浏览分组重置为播放分组并整表替换，
+     * 而 RecyclerView 焦点仍停在原下标，换成了别的分组的频道，用户按 OK 会播错台。
+     * 也不能用 {@link #refreshGroupAdapterKeepingFocus(int)}：焦点在分组栏（pos&lt;0）时它会退回
+     * refreshGroupAdapter，同样重置分组。
+     */
+    private void refreshChannelListInPlace() {
+        if (groupAdapter == null || channelAdapter == null) return;
+        if (!isChannelListVisible) {
+            refreshGroupAdapter();
+            return;
+        }
+        try {
+            // 1) 记录刷新前的浏览位置
+            final boolean focusInChannels = isFocusIn(channelListView);
+            final boolean focusInGroups = !focusInChannels && isFocusIn(groupListView);
+            int focusedPos = focusInChannels ? focusedChannelPosition() : -1;
+            LiveChannel focused = channelAdapter.getItem(focusedPos);
+            String focusedKey = focused != null ? focused.getKey() : null;
+            String focusedName = focused != null ? focused.getChannelName() : null;
+            String browsingName = groupNameAt(shownGroups, browsingGroupIndex);
+
+            // 2) 换数据，但保留浏览分组
+            List<ChannelGroup> groups = channelManager.getChannelGroups();
+            shownGroups = groups;
+            if (groups == null) groups = new ArrayList<>();
+            groupAdapter.setGroups(groups);
+            if (groups.isEmpty()) {
+                browsingGroupIndex = 0;
+                channelAdapter.setChannels(null);
+                channelAdapter.setPlayingIndex(-1);
+                return;
+            }
+            int target = indexOfGroupByName(groups, browsingName);
+            if (target < 0) target = browsingGroupIndex; // 分组已不存在：按原下标就近（下面会钳位）
+            browsingGroupIndex = Math.max(0, Math.min(target, groups.size() - 1));
+            groupAdapter.setSelectedIndex(browsingGroupIndex);
+            ChannelGroup g = groups.get(browsingGroupIndex);
+            List<LiveChannel> chs = g != null ? g.snapshotChannels() : null;
+            channelAdapter.setChannels(chs, channelNumberOffset(groups, browsingGroupIndex));
+            channelAdapter.setPlayingIndex(playingIndexInGroup(browsingGroupIndex));
+
+            // 3) 还原焦点。整表刷新后 RecyclerView 会把焦点恢复到"原下标"，
+            //    那里可能已是别的频道，所以这里主动把焦点移到同一频道的新位置
+            if (focusInChannels) {
+                int count = chs != null ? chs.size() : 0;
+                if (count > 0) {
+                    int newPos = indexOfChannel(chs, focusedKey, focusedName);
+                    if (newPos < 0) newPos = focusedPos;
+                    final int p = Math.max(0, Math.min(newPos, count - 1));
+                    // post：setChannels 在列表繁忙时会把替换推迟一帧，焦点移动必须排在其后
+                    channelListView.post(() -> {
+                        if (!isAlive() || !isChannelListVisible) return;
+                        focusChannelItem(p);
+                    });
+                    restoreChannelFocus(p);
+                }
+            } else if (focusInGroups && groupListView != null) {
+                final int gp = browsingGroupIndex;
+                groupListView.post(() -> {
+                    if (!isAlive() || !isChannelListVisible) return;
+                    focusGroupItem(gp);
+                });
+            }
+        } catch (Throwable t) {
+            // 刷新失败不应影响播放；退回原有整表刷新
+            Timber.w(t, "原地刷新频道列表失败");
+            refreshGroupAdapter();
+        }
+    }
+
+    /** 当前焦点所在频道条目的 adapter 位置；焦点不在频道列表时返回 -1 */
+    private int focusedChannelPosition() {
+        if (channelListView == null) return -1;
+        try {
+            View f = getCurrentFocus();
+            if (f == null) return -1;
+            // 焦点可能落在条目的子 View 上，先找到所属条目
+            View item = channelListView.findContainingItemView(f);
+            return item != null ? channelListView.getChildAdapterPosition(item) : -1;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private static String groupNameAt(List<ChannelGroup> groups, int index) {
+        try {
+            if (groups == null || index < 0 || index >= groups.size()) return null;
+            ChannelGroup g = groups.get(index);
+            return g != null ? g.getGroupName() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static int indexOfGroupByName(List<ChannelGroup> groups, String name) {
+        if (groups == null || name == null) return -1;
+        for (int i = 0; i < groups.size(); i++) {
+            ChannelGroup g = groups.get(i);
+            if (g != null && name.equals(g.getGroupName())) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * 在 ChannelManager 当前列表中查找与 {@code clicked} 对应的频道对象：
+     * 先按对象引用，再按 getKey()（分组+频道名）；都找不到返回 null，由调用方决定是否按名兜底。
+     */
+    private LiveChannel findChannelInCurrentList(LiveChannel clicked) {
+        if (clicked == null || channelManager == null) return null;
+        List<ChannelGroup> groups = channelManager.getChannelGroups();
+        if (groups == null) return null;
+        String key = clicked.getKey();
+        LiveChannel byKey = null;
+        try {
+            for (int g = 0; g < groups.size(); g++) {
+                ChannelGroup group = groups.get(g);
+                if (group == null) continue;
+                List<LiveChannel> chs = group.snapshotChannels();
+                for (int c = 0; c < chs.size(); c++) {
+                    LiveChannel ch = chs.get(c);
+                    if (ch == clicked) return ch;
+                    if (byKey == null && key != null && key.equals(ch.getKey())) byKey = ch;
+                }
+            }
+        } catch (Exception e) {
+            Timber.w(e, "按 key 查找点击的频道异常");
+        }
+        return byKey;
+    }
+
+    /** 在频道快照中按 key（优先）或频道名查找位置 */
+    private static int indexOfChannel(List<LiveChannel> chs, String key, String name) {
+        if (chs == null || (key == null && name == null)) return -1;
+        if (key != null) {
+            for (int i = 0; i < chs.size(); i++) {
+                LiveChannel c = chs.get(i);
+                if (c != null && key.equals(c.getKey())) return i;
+            }
+        }
+        if (name != null) {
+            for (int i = 0; i < chs.size(); i++) {
+                LiveChannel c = chs.get(i);
+                if (c != null && name.equals(c.getChannelName())) return i;
+            }
+        }
+        return -1;
     }
 
     /**
@@ -586,6 +1055,26 @@ public class LivePlayActivity extends AppCompatActivity {
         }
     }
 
+    /** 指定分组首个频道的全局序号（与数字键换台 switchToChannelByNum 的编号一致，从 1 开始） */
+    private int channelNumberOffset(int groupIndex) {
+        return channelNumberOffset(channelManager.getChannelGroups(), groupIndex);
+    }
+
+    private static int channelNumberOffset(List<ChannelGroup> groups, int groupIndex) {
+        int offset = 1;
+        if (groups == null) return offset;
+        try {
+            for (int g = 0; g < groupIndex && g < groups.size(); g++) {
+                ChannelGroup group = groups.get(g);
+                // 与 switchToChannelByNum 一致：空分组不占编号
+                if (group != null) offset += group.getChannelCount();
+            }
+        } catch (Exception ignore) {
+            // 后台线程替换列表导致的越界：编号仅用于展示，失败不影响操作
+        }
+        return offset;
+    }
+
     // ============ 播放控制 ============
 
     private void playChannel(LiveChannel channel) {
@@ -599,11 +1088,17 @@ public class LivePlayActivity extends AppCompatActivity {
         // 同步频道列表的"正在播放"高亮，避免菜单播放后标记停留在旧频道
         try {
             if (channelAdapter != null) {
-                channelAdapter.setPlayingIndex(
-                        browsingGroupIndex == channelManager.getCurrentGroupIndex()
-                                ? channelManager.getCurrentChannelIndex() : -1);
+                channelAdapter.setPlayingIndex(playingIndexInGroup(browsingGroupIndex));
             }
         } catch (Exception ignore) {
+        }
+
+        // 已进入后台（onStop 之后）：异步加载完成 / 重载 / 换源回调才到达。
+        // 只记录当前频道，不创建播放器，交给 onStart 回到前台时起播
+        if (!started) {
+            Timber.d("界面不可见，推迟起播: %s", channel.getChannelName());
+            playerReleasedOnStop = true;
+            return;
         }
 
         String url = channel.getCurrentSourceUrl();
@@ -622,6 +1117,11 @@ public class LivePlayActivity extends AppCompatActivity {
         // 用户主动切换频道：重置本频道的换源尝试计数和提醒状态
         sourceTryCount = 0;
         allSourcesTimeoutPrompted = false;
+        reconnectSameSourceOnce = false;
+        waitingForNetwork = false;
+        if (handler != null) handler.removeCallbacks(networkResumeRunnable);
+        // 换台后旧频道的"全部失败"弹窗已无意义（且其"重试本频道"会切回旧频道）
+        dismissAllSourcesDialog();
         showChannelInfo(channel);
         initPlayer(url);
         loadEpgForChannel(channel);
@@ -638,6 +1138,20 @@ public class LivePlayActivity extends AppCompatActivity {
         // 与 ProtocolFilter 保持同一套白名单：http(s)/rtsp(s)/rtmp(s)/file/content 可播，
         // rtp/udp/igmp/p2p 等视为无效线路直接跳过，避免换源时白等超时
         return com.github.tvbox.osc.util.ProtocolFilter.isSupported(u);
+    }
+
+    /**
+     * 去掉 TVBox 常见的 "url$标签"（如 ...m3u8$高清 / $线路1）后缀。
+     * 测速（SpeedTestEngine.cleanUrl）测的是去掉后缀的地址，播放器却拿原串去请求，
+     * 路径变成 ".m3u8$%E9%AB%98..." 导致 404、HLS 也识别不出，测得最快的线路反而播不了。
+     * 规则与 SpeedTestEngine.cleanUrl 保持一致：截掉第一个 '$' 之后的内容。
+     */
+    private static String stripSourceLabel(String url) {
+        if (url == null) return null;
+        String u = url.trim();
+        int idx = u.indexOf('$');
+        if (idx > 0) u = u.substring(0, idx).trim();
+        return u;
     }
 
     /**
@@ -759,13 +1273,39 @@ public class LivePlayActivity extends AppCompatActivity {
      * 所有 ExoPlayer 调用做异常保护，失败后异步（post 到主线程）触发换源，
      * 避免 ExoPlayer 在 onPlayerError 中同步递归调用 setMediaItem 引发状态混乱与崩溃。
      */
+    /**
+     * 频道对象被刷新替换、或线路被测速重排后，让当前频道的索引重新指向播放器实际加载的 URL，
+     * 并更新播放提示；reloadEpg 为 true 时按新对象重拉信息栏节目单
+     * （EPG 回调按对象身份判断"是否仍是当前频道"，换了对象后旧回调不会再更新信息栏）。
+     */
+    private void resyncPlayingChannel(boolean reloadEpg) {
+        LiveChannel ch = channelManager.getCurrentChannel();
+        if (ch == null) return;
+        String url = currentPlayUrl;
+        if (url != null && ch.syncSourceIndexTo(url)) {
+            LiveChannel.setPlayingHint(ch, url);
+        }
+        if (reloadEpg) loadEpgForChannel(ch);
+    }
+
     private void initPlayer(String url) {
         if (playerView == null || !isAlive()) return;
+        // 新一次起播：上一条线路的"稳定播放"计时作废
+        if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
+        if (!started) {
+            // 后台时（换源回调等直接走到这里）不创建/启动播放器，回到前台由 onStart 重新起播
+            cancelPlayTimeout();
+            playerReleasedOnStop = true;
+            return;
+        }
         if (!isPlayableUrl(url)) {
             Timber.w("initPlayer: URL 无效, 触发换源: %s", url);
             postSourceFailure(false);
             return;
         }
+        currentPlayUrl = url;
+        // 告知 LiveChannel 当前实际播放的线路：测速排序/置顶重排时据此保持索引指向这条线路
+        LiveChannel.setPlayingHint(channelManager.getCurrentChannel(), url);
         if (exoPlayer == null) {
             try {
                 // 自定义 HTTP 数据源：允许跨协议重定向（http<->https）、放宽超时、
@@ -818,8 +1358,29 @@ public class LivePlayActivity extends AppCompatActivity {
                         if (state == Player.STATE_READY) {
                             // 成功起播，取消超时换源定时器
                             cancelPlayTimeout();
+                            waitingForNetwork = false;
+                            // 稳定播放一段时间后重置换源计数（见 stablePlayResetRunnable）
+                            if (handler != null) {
+                                handler.removeCallbacks(stablePlayResetRunnable);
+                                handler.postDelayed(stablePlayResetRunnable, STABLE_PLAY_RESET_MS);
+                            }
                             // 起播后开始轮询右下角实时网速
                             startCornerSpeedTicker();
+                        } else if (handler != null) {
+                            // 缓冲/空闲/结束：未达到稳定播放，不重置计数
+                            handler.removeCallbacks(stablePlayResetRunnable);
+                        }
+                    }
+
+                    @Override
+                    public void onVideoSizeChanged(@NonNull VideoSize videoSize) {
+                        // 部分流不带像素宽高比（为 0），按方形像素处理，避免算出 0 宽度
+                        float par = videoSize.pixelWidthHeightRatio > 0
+                                ? videoSize.pixelWidthHeightRatio : 1f;
+                        videoWidth = (int) (videoSize.width * par);
+                        videoHeight = videoSize.height;
+                        if (Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0) == SCALE_ORIGINAL) {
+                            applyScaleMode();
                         }
                     }
 
@@ -827,6 +1388,7 @@ public class LivePlayActivity extends AppCompatActivity {
                     public void onPlayerError(@NonNull PlaybackException error) {
                         Timber.w("播放出错: %s", error.getMessage());
                         cancelPlayTimeout();
+                        if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
                         // 异步换源，避免同步递归调用 setMediaItem 引发 IllegalStateException
                         postSourceFailure(false);
                     }
@@ -843,7 +1405,8 @@ public class LivePlayActivity extends AppCompatActivity {
             try { exoPlayer.stop(); } catch (Exception ignore) {}
             try { exoPlayer.clearMediaItems(); } catch (Exception ignore) {}
 
-            Uri uri = Uri.parse(url);
+            // 去掉 TVBox 风格的 "$标签" 后缀再交给播放器（仅影响本次播放，不改存储的 URL）
+            Uri uri = Uri.parse(stripSourceLabel(url));
             // 直播流设置目标偏移：播放点离直播边缘更远，可容忍更大的网络波动而不卡顿
             MediaItem item = new MediaItem.Builder()
                     .setUri(uri)
@@ -873,6 +1436,11 @@ public class LivePlayActivity extends AppCompatActivity {
         if (!isAlive() || handler == null) return;
         handler.post(() -> {
             if (!isAlive()) return;
+            if (!started) {
+                // onStop 之前已排队的失败回调：不在后台换源/重建播放器，回到前台从当前线路重新起播
+                playerReleasedOnStop = true;
+                return;
+            }
             handleSourceFailure(byTimeout);
         });
     }
@@ -908,11 +1476,36 @@ public class LivePlayActivity extends AppCompatActivity {
     private void handleSourceFailure(boolean byTimeout) {
         LiveChannel channel = channelManager.getCurrentChannel();
         if (channel == null) return;
+        // 线路可能已被测速重排/刷新替换：先把索引对齐到播放器实际在播的 URL，换源才不会重复或跳过线路
+        if (currentPlayUrl != null) channel.syncSourceIndexTo(currentPlayUrl);
 
         int total = channel.getSourceCount();
         if (total <= 0) {
             showAllSourcesTimeoutOnce(channel);
             return;
+        }
+
+        // 断网导致的失败不是线路问题：不计入换源次数、不轮换线路（否则会把置顶/最优线路换走，
+        // 最后弹出"全部线路失败"并停在黑屏），等网络恢复回调自动重连
+        if (!isNetworkConnected()) {
+            if (!waitingForNetwork) {
+                waitingForNetwork = true;
+                Timber.w("网络已断开，暂停换源，等待网络恢复: %s", channel.getChannelName());
+                ToastUtil.show(this, "网络已断开，恢复后将自动重连");
+            }
+            scheduleNetworkPollIfNeeded();
+            return;
+        }
+
+        if (reconnectSameSourceOnce) {
+            reconnectSameSourceOnce = false;
+            String cur = channel.getCurrentSourceUrl();
+            if (isPlayableUrl(cur)) {
+                Timber.w("稳定播放后中断，原线路重连: %s", channel.getChannelName());
+                ToastUtil.show(this, "播放中断，正在重连");
+                initPlayer(cur);
+                return;
+            }
         }
 
         sourceTryCount++;
@@ -963,7 +1556,9 @@ public class LivePlayActivity extends AppCompatActivity {
         if (!isAlive()) return;
         String name = channel != null ? channel.getChannelName() : "当前频道";
         try {
-            new AlertDialog.Builder(this)
+            dismissAllSourcesDialog();
+            // 保存引用：网络恢复自动重连或换台时需要关掉它
+            allSourcesDialog = new AlertDialog.Builder(this)
                     .setTitle("线路均无法播放")
                     .setMessage("频道「" + name + "」的全部 "
                             + (channel != null ? channel.getSourceCount() : 0)
@@ -983,23 +1578,93 @@ public class LivePlayActivity extends AppCompatActivity {
         }
     }
 
+    // 缩放模式（与设置页下拉框顺序一致：自适应 / 填充 / 16:9 / 4:3 / 原始）
+    private static final int SCALE_FILL = 1;
+    private static final int SCALE_16_9 = 2;
+    private static final int SCALE_4_3 = 3;
+    private static final int SCALE_ORIGINAL = 4;
+
+    /**
+     * 应用缩放模式：
+     * 自适应=等比完整显示；填充=拉伸铺满；16:9 / 4:3=在居中的固定比例区域内拉伸；
+     * 原始=按视频像素尺寸显示（超出屏幕时等比缩小）。
+     * 旧实现 16:9 / 4:3 与自适应完全相同，"原始"用 FIXED_WIDTH 实际是按宽铺满，均不符合预期。
+     */
     private void applyScaleMode() {
-        if (playerView == null) return;
-        int scale = Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0);
-        switch (scale) {
-            case 1: // 填充
-                playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FILL);
-                break;
-            case 4: // 原始
-                playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIXED_WIDTH);
-                break;
-            default: // 自适应 / 16:9 / 4:3 均使用 fit
-                playerView.setResizeMode(AspectRatioFrameLayout.RESIZE_MODE_FIT);
-                break;
+        if (playerView == null || playerContainer == null) return;
+        try {
+            int scale = Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0);
+            switch (scale) {
+                case SCALE_FILL:
+                    setPlayerViewSize(-1, -1, AspectRatioFrameLayout.RESIZE_MODE_FILL);
+                    break;
+                case SCALE_16_9:
+                    setPlayerViewAspect(16f / 9f);
+                    break;
+                case SCALE_4_3:
+                    setPlayerViewAspect(4f / 3f);
+                    break;
+                case SCALE_ORIGINAL:
+                    if (videoWidth > 0 && videoHeight > 0) {
+                        final int vw = videoWidth;
+                        final int vh = videoHeight;
+                        playerContainer.post(() -> {
+                            if (!isAlive() || playerContainer == null) return;
+                            int cw = playerContainer.getWidth();
+                            int ch = playerContainer.getHeight();
+                            if (cw <= 0 || ch <= 0) return;
+                            float shrink = Math.min(1f, Math.min((float) cw / vw, (float) ch / vh));
+                            setPlayerViewSize(Math.round(vw * shrink), Math.round(vh * shrink),
+                                    AspectRatioFrameLayout.RESIZE_MODE_FILL);
+                        });
+                    } else {
+                        // 尚未拿到视频尺寸：先按自适应显示，onVideoSizeChanged 后再调整
+                        setPlayerViewSize(-1, -1, AspectRatioFrameLayout.RESIZE_MODE_FIT);
+                    }
+                    break;
+                default:
+                    setPlayerViewSize(-1, -1, AspectRatioFrameLayout.RESIZE_MODE_FIT);
+                    break;
+            }
+        } catch (Exception e) {
+            // 缩放属展示层设置，任何异常都不得影响播放
+            Timber.w(e, "应用缩放模式失败");
         }
     }
 
+    /** 在播放区域内居中放置指定宽高比的画面框，画面拉伸填满该框 */
+    private void setPlayerViewAspect(final float ratio) {
+        // 需要容器实际尺寸，首次进入时尚未完成布局，post 到布局之后计算
+        playerContainer.post(() -> {
+            if (!isAlive() || playerContainer == null) return;
+            int cw = playerContainer.getWidth();
+            int ch = playerContainer.getHeight();
+            if (cw <= 0 || ch <= 0) return;
+            int w = cw;
+            int h = Math.round(cw / ratio);
+            if (h > ch) {
+                h = ch;
+                w = Math.round(ch * ratio);
+            }
+            setPlayerViewSize(w, h, AspectRatioFrameLayout.RESIZE_MODE_FILL);
+        });
+    }
+
+    /** 设置画面尺寸（-1 表示铺满容器）与 ExoPlayer 缩放方式 */
+    private void setPlayerViewSize(int width, int height, int resizeMode) {
+        if (playerView == null) return;
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                width > 0 ? width : FrameLayout.LayoutParams.MATCH_PARENT,
+                height > 0 ? height : FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER);
+        playerView.setLayoutParams(lp);
+        playerView.setResizeMode(resizeMode);
+    }
+
     private void releasePlayer() {
+        currentPlayUrl = null;
+        LiveChannel.setPlayingHint(null, null);
+        if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
         if (exoPlayer != null) {
             try {
                 exoPlayer.stop();
@@ -1040,8 +1705,15 @@ public class LivePlayActivity extends AppCompatActivity {
                 return true;
             }
             if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && isFocusIn(groupListView)) {
-                focusChannelItem(browsingGroupIndex == channelManager.getCurrentGroupIndex()
-                        ? Math.max(0, channelManager.getCurrentChannelIndex()) : 0);
+                focusChannelItem(playingIndexInBrowsingGroup());
+                return true;
+            }
+            // 列表条目上显示了全局频道号，数字键应能直接换台：
+            // 先收起列表（数字气泡不被面板遮挡，换台后也不会留下过期的高亮/焦点），
+            // 后续数字键走下面的常规路径
+            if (keyCode >= KeyEvent.KEYCODE_0 && keyCode <= KeyEvent.KEYCODE_9) {
+                hideChannelList();
+                handleNumInput(keyCode - KeyEvent.KEYCODE_0);
                 return true;
             }
             return super.onKeyDown(keyCode, event);
@@ -1111,6 +1783,16 @@ public class LivePlayActivity extends AppCompatActivity {
 
     @Override
     public boolean onKeyLongPress(int keyCode, KeyEvent event) {
+        // 与 onKeyDown 一致：按键回调里的异常会直接闪退，统一兜底
+        try {
+            return handleKeyLongPress(keyCode, event);
+        } catch (Exception e) {
+            Timber.w(e, "长按处理异常 keyCode=%d", keyCode);
+            return super.onKeyLongPress(keyCode, event);
+        }
+    }
+
+    private boolean handleKeyLongPress(int keyCode, KeyEvent event) {
         if (isChannelListVisible) {
             return super.onKeyLongPress(keyCode, event);
         }
@@ -1131,6 +1813,15 @@ public class LivePlayActivity extends AppCompatActivity {
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent event) {
+        try {
+            return handleKeyUp(keyCode, event);
+        } catch (Exception e) {
+            Timber.w(e, "按键处理异常 keyCode=%d", keyCode);
+            return super.onKeyUp(keyCode, event);
+        }
+    }
+
+    private boolean handleKeyUp(int keyCode, KeyEvent event) {
         if (isChannelListVisible) {
             return super.onKeyUp(keyCode, event);
         }
@@ -1554,6 +2245,8 @@ public class LivePlayActivity extends AppCompatActivity {
     private void showChannelList() {
         if (channelListPanel == null || !dataLoaded) return;
         refreshGroupAdapter();
+        // 分组列表滚动到当前浏览的分组（分组较多时它可能不在可见范围）
+        if (groupListView != null) groupListView.scrollToPosition(browsingGroupIndex);
         channelListPanel.setVisibility(View.VISIBLE);
         channelListPanel.startAnimation(android.view.animation.AnimationUtils
                 .loadAnimation(this, R.anim.panel_slide_in_left));
@@ -1564,16 +2257,32 @@ public class LivePlayActivity extends AppCompatActivity {
         isChannelListVisible = true;
         // 列表盖住左下角，网速标签需要让位
         updateCornerSpeed();
-        // 聚焦到频道列表，方便遥控器操作
+        // 聚焦到正在播放的频道：不在可见范围时 findViewHolderForAdapterPosition 返回 null，
+        // 旧实现会退化为聚焦列表本身（落到第一项）。focusChannelItem 会先滚动过去再聚焦。
+        // post 一帧：refreshGroupAdapter 可能因 RecyclerView 繁忙把数据替换推迟到下一帧
         channelListView.post(() -> {
-            RecyclerView.ViewHolder vh = channelListView.findViewHolderForAdapterPosition(
-                    Math.max(0, channelManager.getCurrentChannelIndex()));
-            if (vh != null) {
-                vh.itemView.requestFocus();
-            } else {
-                channelListView.requestFocus();
-            }
+            if (!isAlive() || !isChannelListVisible) return;
+            focusChannelItem(playingIndexInBrowsingGroup());
         });
+    }
+
+    /**
+     * 指定分组中"正在播放"频道的下标，不在该分组时返回 -1。
+     * 正在播放的频道被刷新移除而处于钉住状态时，旧下标已被别的频道占据，同样返回 -1，
+     * 避免把无关频道标成正在播放。
+     */
+    private int playingIndexInGroup(int groupIndex) {
+        if (channelManager == null || channelManager.isCurrentPinned()) return -1;
+        return groupIndex == channelManager.getCurrentGroupIndex()
+                ? channelManager.getCurrentChannelIndex() : -1;
+    }
+
+    /** 正在播放的频道在当前浏览分组中的位置；不在该分组则返回 0（首个频道） */
+    private int playingIndexInBrowsingGroup() {
+        // 钉住的频道已不在列表中：焦点落到首项，而不是占据旧位置的无关频道
+        if (channelManager.isCurrentPinned()) return 0;
+        return browsingGroupIndex == channelManager.getCurrentGroupIndex()
+                ? Math.max(0, channelManager.getCurrentChannelIndex()) : 0;
     }
 
     private void hideChannelList() {
@@ -1610,6 +2319,23 @@ public class LivePlayActivity extends AppCompatActivity {
         ToastUtil.showLong(this, message);
     }
 
+    /**
+     * 安全弹出对话框：Activity 已在关闭/销毁时 show() 会抛 BadTokenException，
+     * 异步回调（拉源、测速、换源失败）里弹窗尤其容易撞上。
+     *
+     * @return 是否成功显示
+     */
+    private boolean showDialogSafely(AlertDialog dialog) {
+        if (dialog == null || !isAlive()) return false;
+        try {
+            dialog.show();
+            return true;
+        } catch (Exception e) {
+            Timber.w(e, "显示对话框失败");
+            return false;
+        }
+    }
+
     /** Activity 是否仍处于可安全操作 UI 的存活状态 */
     private boolean isAlive() {
         return !isFinishing() && !isDestroyed();
@@ -1618,11 +2344,11 @@ public class LivePlayActivity extends AppCompatActivity {
     private void showExitDialog() {
         if (!isAlive()) return;
         // 仅保留"确定"一个选项；不需要退出时按返回键即可关闭本弹窗
-        new AlertDialog.Builder(this)
+        showDialogSafely(new AlertDialog.Builder(this)
                 .setTitle("退出直播")
                 .setMessage("确定要退出吗？")
                 .setPositiveButton("确定", (dialog, which) -> finish())
-                .show();
+                .create());
     }
 
     private void openSettings() {
@@ -1650,11 +2376,15 @@ public class LivePlayActivity extends AppCompatActivity {
             return;
         }
 
+        // "▶" 只标在真正正在播放的那条线路上：长按的可能是列表里任意一个非播放频道
+        final boolean isPlayingChannel = isPlayingChannel(channel);
+        final String playingUrl = currentPlayUrl;
         int playingIdx = channel.getSourceIndex();
         final int count = urls.size();
         CharSequence[] items = new CharSequence[count];
         for (int i = 0; i < count; i++) {
-            boolean isPlaying = i == playingIdx;
+            boolean isPlaying = isPlayingChannel
+                    && (playingUrl != null ? playingUrl.equals(urls.get(i)) : i == playingIdx);
             items[i] = (isPlaying ? "▶ " : "   ") + "线路 " + (i + 1) + "  " + shortUrl(urls.get(i));
         }
 
@@ -1662,8 +2392,10 @@ public class LivePlayActivity extends AppCompatActivity {
             new AlertDialog.Builder(this)
                     .setTitle(channel.getChannelName() + " · 线路管理（共 " + count + " 条）")
                     .setItems(items, (dialog, which) -> {
-                        if (which >= 0 && which < channel.getSourceCount()) {
-                            showSingleSourceActionDialog(channel, which, keepChannelPos);
+                        // 按弹窗展示时的快照取 URL，而不是之后再按行号去取：
+                        // 弹窗期间测速完成会重排/裁剪 channel.sourceUrls，行号会指向另一条线路
+                        if (which >= 0 && which < urls.size()) {
+                            showSingleSourceActionDialog(channel, urls.get(which), which, keepChannelPos);
                         }
                     })
                     .setNegativeButton("关闭", null)
@@ -1673,23 +2405,44 @@ public class LivePlayActivity extends AppCompatActivity {
         }
     }
 
-    /** 针对某条线路的操作菜单：置顶 / 删除并拉黑 / 切换播放 */
-    private void showSingleSourceActionDialog(final LiveChannel channel, final int sourceIndex,
-                                              final int keepChannelPos) {
-        if (!isAlive() || channel == null) return;
-        List<String> urls = channel.getSourceUrls();
-        if (urls == null || sourceIndex < 0 || sourceIndex >= urls.size()) return;
-        final String url = urls.get(sourceIndex);
+    /** 指定频道是否就是正在播放的频道（按对象或 key 匹配：列表中可能是另一份同 key 的对象） */
+    private boolean isPlayingChannel(LiveChannel channel) {
+        if (channel == null || channelManager == null) return false;
+        LiveChannel cur = channelManager.getCurrentChannel();
+        if (cur == null) return false;
+        if (cur == channel) return true;
+        String k = cur.getKey();
+        return k != null && k.equals(channel.getKey());
+    }
+
+    /**
+     * 针对某条线路的操作菜单：置顶 / 删除并拉黑 / 切换播放。
+     *
+     * @param url          用户点中的线路 URL（展示时的快照）；所有操作都按它在点击时重新定位
+     * @param displayIndex 展示时的行号，仅用于标题
+     */
+    private void showSingleSourceActionDialog(final LiveChannel channel, final String url,
+                                              final int displayIndex, final int keepChannelPos) {
+        if (!isAlive() || channel == null || url == null) return;
 
         String[] actions = {"播放此线路", "置顶此线路", "删除并加入黑名单"};
         try {
             new AlertDialog.Builder(this)
-                    .setTitle("线路 " + (sourceIndex + 1))
+                    // 标题带上 URL，便于确认操作的是哪条线路
+                    .setTitle("线路 " + (displayIndex + 1) + "  " + shortUrl(url))
                     .setItems(actions, (dialog, which) -> {
                         try {
+                            // 点击时重新定位：两次弹窗之间线路列表可能已被测速重排
+                            List<String> curUrls = channel.getSourceUrls();
+                            int idx = curUrls != null ? curUrls.indexOf(url) : -1;
+                            if (idx < 0) {
+                                ToastUtil.show(this, "线路列表已更新，请重新选择");
+                                refreshGroupAdapterKeepingFocus(keepChannelPos);
+                                return;
+                            }
                             switch (which) {
                                 case 0: // 播放此线路
-                                    channel.setSourceIndex(sourceIndex);
+                                    channel.setSourceIndex(idx);
                                     playChannel(channel);
                                     break;
                                 case 1: // 置顶
@@ -1701,17 +2454,32 @@ public class LivePlayActivity extends AppCompatActivity {
                                         ToastUtil.show(this, "该线路已在首位");
                                     }
                                     break;
-                                case 2: // 删除并拉黑
-                                    boolean playingRemoved = sourceIndex == channel.getSourceIndex();
+                                case 2: { // 删除并拉黑
+                                    // 只有"被删的正是播放器此刻在播的线路"才需要换线：
+                                    // 不能只比较 sourceIndex——长按的可能是非播放频道（其 sourceIndex 通常也是 0），
+                                    // 测速排序也会把 sourceIndex 归零而不切换播放
+                                    LiveChannel cur = channelManager.getCurrentChannel();
+                                    boolean playingChannel = isPlayingChannel(channel);
+                                    String playing = currentPlayUrl;
+                                    if (playing == null && playingChannel && cur != null) {
+                                        playing = cur.getCurrentSourceUrl();
+                                    }
+                                    boolean playingRemoved = playingChannel && url.equals(playing);
                                     channelManager.blacklistSource(channel, url);
+                                    if (playingChannel && cur != null && cur != channel) {
+                                        // 正在播放的是同 key 的另一份对象：同步移除，避免重连回被拉黑的线路
+                                        channelManager.blacklistSource(cur, url);
+                                    }
                                     ToastUtil.show(this, "已删除该线路并加入黑名单");
                                     if (channel.getSourceCount() == 0) {
                                         ToastUtil.show(this, "该频道已无可用线路");
                                     } else if (playingRemoved) {
-                                        // 正在播放的线路被删除，切到当前索引指向的线路
-                                        playChannel(channel);
+                                        // 正在播放的线路被删除，切到当前索引指向的线路；
+                                        // 播放正在播的那份对象，避免"当前频道"被挪到浏览中的副本
+                                        playChannel(cur != null ? cur : channel);
                                     }
                                     break;
+                                }
                                 default:
                                     break;
                             }
@@ -1774,8 +2542,8 @@ public class LivePlayActivity extends AppCompatActivity {
                 .create();
         // EPG 优先级最低：等用户完成测速决策（开始测速或关闭弹窗）后再加载节目单
         setOnDismissFlushEpg(dialog);
-        dialog.show();
-        return true;
+        // 弹窗失败时返回 false，调用方会立即放行 EPG，避免节目单被永久推迟
+        return showDialogSafely(dialog);
     }
 
     /** @return 是否实际弹出了对话框 */
@@ -1793,8 +2561,7 @@ public class LivePlayActivity extends AppCompatActivity {
                         Hawk.put(HawkConfig.SPEED_TEST_MODE, HawkConfig.SPEED_MODE_MANUAL))
                 .create();
         setOnDismissFlushEpg(dialog);
-        dialog.show();
-        return true;
+        return showDialogSafely(dialog);
     }
 
     /**
@@ -1870,6 +2637,9 @@ public class LivePlayActivity extends AppCompatActivity {
                 tvSpeedTestInfo.setText(msg);
             }
         }
+        // 测速前重载会整体替换频道列表但不通知界面：列表打开时原地刷新，
+        // 避免用户在旧列表上点选、按旧下标播到别的频道
+        refreshChannelListIfReplaced();
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN)
@@ -1886,6 +2656,8 @@ public class LivePlayActivity extends AppCompatActivity {
                     percent, event.current, event.total,
                     event.channelName != null ? event.channelName : ""));
         }
+        // 仅比较引用，开销可忽略；兜住准备阶段事件之后才完成的列表替换
+        refreshChannelListIfReplaced();
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN)
@@ -1909,8 +2681,12 @@ public class LivePlayActivity extends AppCompatActivity {
             }
             ToastUtil.show(this, String.format("测速完成: %d/%d 个源可用",
                     available, total));
-            // 刷新列表以反映最新速度排序
-            refreshGroupAdapter();
+            // 刷新列表以反映最新速度排序；列表打开时原地刷新，保留浏览分组与焦点
+            refreshChannelListKeepingBrowse();
+            resyncPlayingChannel(false);
+        } else {
+            // 取消的测速也可能已完成重载：列表打开时同步到新列表
+            refreshChannelListIfReplaced();
         }
         // 测速结束后，补拉此前让路给测速的节目单（EPG 优先级最低，最后加载）
         flushDeferredEpg();
@@ -1925,6 +2701,7 @@ public class LivePlayActivity extends AppCompatActivity {
         if (handler != null) handler.removeCallbacks(epgFlushRetry);
         if (speedTestBar != null) speedTestBar.setVisibility(View.GONE);
         ToastUtil.show(this, "测速失败: " + event.errorMsg);
+        refreshChannelListIfReplaced();
         flushDeferredEpg();
     }
 }

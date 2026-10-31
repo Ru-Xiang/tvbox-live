@@ -84,6 +84,7 @@ public class EpgDialog {
         try {
             // inflate 与视图绑定同样纳入异常兜底（InflateException / OOM 等）
             View view = LayoutInflater.from(activity).inflate(R.layout.dialog_epg, null);
+            fitListHeightToScreen(view);
             bindViews(view);
             bindHeader(channel);
             bindDateBar();
@@ -137,6 +138,28 @@ public class EpgDialog {
 
     // ============ 私有方法 ============
 
+    /**
+     * 按屏幕实际高度限制节目列表高度。
+     * 布局里固定 480dp，加上头部、日期栏、底部提示和 AlertDialog 按钮栏后超过 540dp
+     * （1080p@xhdpi / 720p@tvdpi 的常见电视屏高），对话框会裁掉底部内容，
+     * 但 RecyclerView 仍按 480dp 测量，认为被裁掉的行"可见"而不滚动，焦点落到屏幕外。
+     * 预留 300dp 给列表以外的部分，并保证至少 160dp 可用。
+     */
+    private void fitListHeightToScreen(View root) {
+        try {
+            View list = root.findViewById(R.id.fl_epg_list);
+            if (list == null || list.getLayoutParams() == null) return;
+            android.util.DisplayMetrics dm = activity.getResources().getDisplayMetrics();
+            float d = dm.density;
+            int maxH = (int) (480 * d);
+            int minH = (int) (160 * d);
+            int h = Math.max(minH, Math.min(maxH, dm.heightPixels - (int) (300 * d)));
+            list.getLayoutParams().height = h;
+        } catch (Throwable t) {
+            Timber.w(t, "调整 EPG 列表高度失败");
+        }
+    }
+
     private void bindViews(View root) {
         ivLogo = root.findViewById(R.id.iv_epg_logo);
         tvChannel = root.findViewById(R.id.tv_epg_channel);
@@ -179,6 +202,11 @@ public class EpgDialog {
         if (rvList != null) {
             rvList.setLayoutManager(new LinearLayoutManager(activity));
             rvList.setAdapter(adapter);
+            // 与频道列表一致：关闭条目刷新的交叉淡入动画，避免刷新时聚焦条目被替换而丢焦点
+            if (rvList.getItemAnimator() instanceof androidx.recyclerview.widget.SimpleItemAnimator) {
+                ((androidx.recyclerview.widget.SimpleItemAnimator) rvList.getItemAnimator())
+                        .setSupportsChangeAnimations(false);
+            }
         }
     }
 
@@ -255,19 +283,31 @@ public class EpgDialog {
                     adapter.setData(programs, currentIdx, currentProgress);
                     updateEmpty(false, null);
 
-                    // 滚动到当前节目
-                    if (currentIdx >= 0 && rvList != null) {
-                        rvList.post(() -> {
+                    // 滚动到当前节目（非今日/无当前节目时回到顶部），并把焦点放到该条目：
+                    // 否则焦点停在"关闭"按钮上，上下键无法直接浏览节目
+                    if (rvList != null) {
+                        // 取局部引用：dismiss() 会把 rvList 字段置空，post 的任务可能在其后执行
+                        final RecyclerView list = rvList;
+                        final int focusIdx = Math.max(0, currentIdx);
+                        list.post(() -> {
                             try {
-                                RecyclerView.LayoutManager lm = rvList.getLayoutManager();
+                                if (!isAlive() || dialog == null) return;
+                                RecyclerView.LayoutManager lm = list.getLayoutManager();
                                 if (lm instanceof LinearLayoutManager) {
                                     ((LinearLayoutManager) lm).scrollToPositionWithOffset(
-                                            Math.max(0, adapter.getCurrentIndex() - 1), 0);
+                                            Math.max(0, focusIdx - 1), 0);
                                 }
+                                // 滚动后需等下一帧布局完成，目标条目才有 ViewHolder 可聚焦
+                                list.post(() -> {
+                                    try {
+                                        if (!isAlive() || dialog == null) return;
+                                        RecyclerView.ViewHolder vh =
+                                                list.findViewHolderForAdapterPosition(focusIdx);
+                                        if (vh != null) vh.itemView.requestFocus();
+                                    } catch (Exception ignore) {}
+                                });
                             } catch (Exception ignore) {}
                         });
-                    } else if (rvList != null) {
-                        rvList.scrollToPosition(0);
                     }
                 });
             }

@@ -116,8 +116,11 @@
             android:textSize="14sp" />
     </LinearLayout>
 
-    <!-- 节目列表 / 状态：置于玻璃面板内，层次更分明 -->
+    <!-- 节目列表 / 状态：置于玻璃面板内，层次更分明。
+         480dp 只是上限：EpgDialog 会按实际屏幕高度缩小，避免 540dp 高的电视屏上列表被裁切、
+         焦点落到看不见的行上 -->
     <FrameLayout
+        android:id="@+id/fl_epg_list"
         android:layout_width="match_parent"
         android:layout_height="480dp"
         android:layout_marginStart="16dp"

@@ -112,10 +112,10 @@ public class GroupListAdapter extends RecyclerView.Adapter<GroupListAdapter.Grou
         final GroupViewHolder holder = new GroupViewHolder(view);
 
         // 监听器只设置一次，避免每次绑定都新建 lambda（分组数虽少，但焦点切换会频繁重绑）
-        view.setOnClickListener(v -> selectAndNotify(holder.getAdapterPosition()));
+        view.setOnClickListener(v -> selectAndNotify(holder.getBindingAdapterPosition()));
         view.setOnFocusChangeListener((v, hasFocus) -> {
             ChannelListAdapter.animateFocus(v, hasFocus);
-            if (hasFocus) selectAndNotify(holder.getAdapterPosition());
+            if (hasFocus) selectAndNotify(holder.getBindingAdapterPosition());
         });
         return holder;
     }
@@ -128,6 +128,8 @@ public class GroupListAdapter extends RecyclerView.Adapter<GroupListAdapter.Grou
         holder.tvName.setText(group.getGroupName() != null ? group.getGroupName() : "");
         holder.tvCount.setText(String.valueOf(group.getChannelCount()));
         holder.itemView.setSelected(position == selectedIndex);
+        // 复用的视图可能残留聚焦放大状态，先复位
+        ChannelListAdapter.resetFocusScale(holder.itemView);
     }
 
     private void selectAndNotify(int position) {

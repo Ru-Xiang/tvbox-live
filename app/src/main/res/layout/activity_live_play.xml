@@ -214,7 +214,7 @@
                 android:gravity="center"
                 android:paddingTop="10dp"
                 android:paddingBottom="10dp"
-                android:text="OK 播放 · 长按 收藏/拉黑 · 返回 关闭"
+                android:text="@string/channel_list_hint"
                 android:textColor="@color/text_tertiary"
                 android:textSize="11sp" />
         </LinearLayout>

@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import timber.log.Timber;
 
@@ -45,12 +46,21 @@ public class SpeedTestWorker extends Worker {
                 return Result.success();
             }
 
+            // 已有测速在进行（用户手动 / 前台服务发起）：本次定时测速直接跳过。
+            // 引擎"重新测速"会顶替正在进行的一轮，若 Worker 照常启动，会把用户的测速取消掉
+            if (SpeedTestEngine.getInstance().isRunning()) {
+                Timber.i("已有测速在进行，跳过本次定时测速");
+                return Result.success();
+            }
+
             // 获取频道管理器
             ChannelManager channelManager = ChannelManager.getInstance(getApplicationContext());
 
             // 同步执行：先重新拉取全量源（自定义源 + 远程订阅源），再对全部线路测速
             CountDownLatch latch = new CountDownLatch(1);
             AtomicBoolean success = new AtomicBoolean(false);
+            // 记下本 Worker 发起的测速回调：超时取消时只取消自己这一轮
+            final AtomicReference<SpeedTestEngine.SpeedTestCallback> myCallback = new AtomicReference<>();
 
             // reloadForSpeedTest 会联网重新拉取并合并/过滤，回调返回待测的全量频道
             channelManager.reloadForSpeedTest(channels -> {
@@ -59,7 +69,14 @@ public class SpeedTestWorker extends Worker {
                     latch.countDown();
                     return;
                 }
-                SpeedTestEngine.getInstance().testChannels(new ArrayList<>(channels),
+                // 拉源可能耗时数十秒，期间用户可能已手动开始测速：同样不去顶替它
+                if (SpeedTestEngine.getInstance().isRunning()) {
+                    Timber.i("拉源期间已有其它测速开始，跳过本次定时测速");
+                    success.set(true);
+                    latch.countDown();
+                    return;
+                }
+                SpeedTestEngine.SpeedTestCallback callback =
                         new SpeedTestEngine.SpeedTestCallback() {
                             @Override
                             public void onItemComplete(SpeedTestResult result, int current, int total) {
@@ -100,7 +117,9 @@ public class SpeedTestWorker extends Worker {
                                 Timber.w("定时测速被取消: %d/%d", completed, total);
                                 latch.countDown();
                             }
-                        });
+                        };
+                myCallback.set(callback);
+                SpeedTestEngine.getInstance().testChannels(new ArrayList<>(channels), callback);
             });
 
             // 等待完成，最多30分钟
@@ -108,7 +127,8 @@ public class SpeedTestWorker extends Worker {
 
             if (!finished) {
                 Timber.w("定时测速超时");
-                SpeedTestEngine.getInstance().cancel();
+                // 只取消本 Worker 发起的一轮：若期间用户手动发起了新测速，不能把它一并取消
+                SpeedTestEngine.getInstance().cancel(myCallback.get());
                 return Result.retry();
             }
 

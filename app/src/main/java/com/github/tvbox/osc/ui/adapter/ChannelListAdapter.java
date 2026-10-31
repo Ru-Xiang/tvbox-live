@@ -14,6 +14,7 @@ import com.bumptech.glide.Glide;
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.bean.LiveChannel;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -35,6 +36,8 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
 
     private final List<LiveChannel> channels = new ArrayList<>();
     private int playingIndex = -1;
+    /** 首个频道的全局序号（与数字键换台编号一致，从 1 开始） */
+    private int firstNumber = 1;
     private OnChannelActionListener listener;
     private RecyclerView attachedView;
 
@@ -58,15 +61,24 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
     }
 
     public void setChannels(List<LiveChannel> data) {
+        setChannels(data, 1);
+    }
+
+    /**
+     * @param firstNumber 列表首项的全局频道序号，用于在条目上显示可直接用数字键输入的编号
+     */
+    public void setChannels(List<LiveChannel> data, int firstNumber) {
+        final int first = Math.max(1, firstNumber);
         // 分组列表 item 获得焦点会同步触发本方法刷新频道列表；若此时 RecyclerView
         // 正处于布局/滚动计算中，直接 notifyDataSetChanged 会抛
         // "Cannot call this method while RecyclerView is computing a layout or scrolling"
         // 或 "Inconsistency detected"。因此在计算布局时改为 post 到下一帧执行。
         if (isBusy()) {
             final List<LiveChannel> snapshot = data == null ? null : new ArrayList<>(data);
-            attachedView.post(() -> applyChannels(snapshot));
+            // 序号与数据必须一起推迟替换，否则下一帧绑定前会出现"新序号配旧数据"
+            attachedView.post(() -> applyChannels(snapshot, first));
         } else {
-            applyChannels(data);
+            applyChannels(data, first);
         }
     }
 
@@ -77,7 +89,8 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
                 || attachedView.getScrollState() != RecyclerView.SCROLL_STATE_IDLE);
     }
 
-    private void applyChannels(List<LiveChannel> data) {
+    private void applyChannels(List<LiveChannel> data, int first) {
+        this.firstNumber = first;
         channels.clear();
         if (data != null) channels.addAll(data);
         // 数据整体替换后，旧的播放高亮位置可能越界，重置以免 setPlayingIndex 误刷新
@@ -130,14 +143,14 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
         // 列表快速滑动时产生大量临时对象，加重低内存设备的 GC 压力。
         view.setOnFocusChangeListener((v, hasFocus) -> animateFocus(v, hasFocus));
         view.setOnClickListener(v -> {
-            int pos = holder.getAdapterPosition();
+            int pos = holder.getBindingAdapterPosition();
             LiveChannel c = getItem(pos);
             if (listener != null && c != null) {
                 listener.onChannelClick(pos, c);
             }
         });
         view.setOnLongClickListener(v -> {
-            int pos = holder.getAdapterPosition();
+            int pos = holder.getBindingAdapterPosition();
             LiveChannel c = getItem(pos);
             if (listener != null && c != null) {
                 listener.onChannelLongClick(pos, c);
@@ -155,7 +168,11 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
         if (channel == null) return;
 
         holder.tvName.setText(channel.getChannelName() != null ? channel.getChannelName() : "");
-        holder.tvSub.setText(channel.getSourceCount() + " 个源");
+        // 显示全局频道号（与数字键换台一致），方便直接按数字键切过来
+        holder.tvSub.setText((firstNumber + position) + " · " + channel.getSourceCount() + " 个源");
+
+        // 复用的视图可能残留上一次聚焦时的放大/抬升状态，先复位
+        resetFocusScale(holder.itemView);
 
         // 当前播放高亮
         holder.itemView.setSelected(position == playingIndex);
@@ -179,19 +196,83 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
                     holder.ivLogo.getContext(), channel.getChannelName(), channel.getLogoUrl());
             if (logoSource != null) {
                 // 限制解码尺寸并用 RGB_565，显著降低台标位图内存占用（低内存电视更稳）
-                Glide.with(holder.ivLogo.getContext())
-                        .load(logoSource)
-                        .override(LOGO_SIZE_PX, LOGO_SIZE_PX)
-                        .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
-                        .diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.ALL)
-                        .placeholder(R.drawable.ic_launcher)
-                        .error(R.drawable.ic_launcher)
-                        .into(holder.ivLogo);
+                com.bumptech.glide.RequestBuilder<android.graphics.drawable.Drawable> req =
+                        Glide.with(holder.ivLogo.getContext())
+                                .load(logoSource)
+                                .override(LOGO_SIZE_PX, LOGO_SIZE_PX)
+                                .format(com.bumptech.glide.load.DecodeFormat.PREFER_RGB_565)
+                                .diskCacheStrategy(com.bumptech.glide.load.engine.DiskCacheStrategy.ALL)
+                                .placeholder(R.drawable.ic_launcher)
+                                .error(R.drawable.ic_launcher);
+                if (logoSource instanceof File) {
+                    // 本地台标按频道名固定路径保存，"清除测速缓存"后重新下载仍是同一路径；
+                    // Glide 默认按路径做缓存 key，会一直显示旧图，需带上文件版本签名
+                    req = req.signature(logoSignature((File) logoSource));
+                }
+                req.into(holder.ivLogo);
             } else {
+                // 必须先取消该 ImageView 上未完成的 Glide 请求：复用的条目可能还挂着上一个
+                // 频道的远程台标请求，加载完成后会把别的频道的台标盖到本行上
+                clearLogoRequest(holder.ivLogo);
                 holder.ivLogo.setImageResource(R.drawable.ic_launcher);
             }
         } catch (Exception ignore) {
+            // 这里多半是 Glide.with 在 Activity 销毁后抛出，clear 同样可能抛，单独兜住
+            clearLogoRequest(holder.ivLogo);
             holder.ivLogo.setImageResource(R.drawable.ic_launcher);
+        }
+    }
+
+    @Override
+    public void onViewRecycled(@NonNull ChannelViewHolder holder) {
+        super.onViewRecycled(holder);
+        // 回收时就释放台标请求与位图引用，低内存盒子上更早归还内存
+        clearLogoRequest(holder.ivLogo);
+    }
+
+    /** 取消 ImageView 上挂着的 Glide 请求；Activity 已销毁时 Glide.with 会抛异常，忽略即可 */
+    private static void clearLogoRequest(ImageView iv) {
+        if (iv == null) return;
+        try {
+            Glide.with(iv.getContext()).clear(iv);
+        } catch (Exception ignore) {
+        }
+    }
+
+    /**
+     * 本地台标文件的缓存签名。
+     *
+     * <p>LogoCache 每次（重新）登记本地文件都会放入新的 File 实例（清缓存时整体清空内存标记），
+     * 因此按"File 实例是否变化"记忆签名：同一实例只在首次绑定时读一次 lastModified，
+     * 之后滑动绑定不再碰磁盘；清缓存并重新下载后实例变化，签名随之更新，Glide 不再命中旧图。
+     */
+    private static com.bumptech.glide.load.Key logoSignature(File file) {
+        String path = file.getPath();
+        LogoSig sig = LOGO_SIGS.get(path);
+        if (sig != null && sig.file == file) return sig.key;
+        long version = 0L;
+        try {
+            version = file.lastModified();
+        } catch (Exception ignore) {
+        }
+        if (LOGO_SIGS.size() >= MAX_LOGO_SIGS) LOGO_SIGS.clear();
+        sig = new LogoSig(file, new com.bumptech.glide.signature.ObjectKey(path + "#" + version));
+        LOGO_SIGS.put(path, sig);
+        return sig.key;
+    }
+
+    /** 台标签名记忆上限，与 LogoCache 的内存标记上限一致 */
+    private static final int MAX_LOGO_SIGS = 2000;
+    private static final java.util.concurrent.ConcurrentHashMap<String, LogoSig> LOGO_SIGS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static final class LogoSig {
+        final File file;
+        final com.bumptech.glide.signature.ObjectKey key;
+
+        LogoSig(File file, com.bumptech.glide.signature.ObjectKey key) {
+            this.file = file;
+            this.key = key;
         }
     }
 
@@ -205,6 +286,17 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
                     .setDuration(220)
                     .setInterpolator(new android.view.animation.DecelerateInterpolator(1.5f))
                     .start();
+        } catch (Exception ignore) {}
+    }
+
+    /** 未聚焦的复用视图复位缩放/抬升，避免出现"没聚焦却放大"的条目 */
+    static void resetFocusScale(View v) {
+        if (v == null || v.hasFocus()) return;
+        try {
+            v.animate().cancel();
+            v.setScaleX(1f);
+            v.setScaleY(1f);
+            v.setTranslationZ(0f);
         } catch (Exception ignore) {}
     }
 

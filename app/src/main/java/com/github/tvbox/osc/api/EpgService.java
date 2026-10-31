@@ -25,8 +25,10 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import okhttp3.Call;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -49,6 +51,31 @@ public class EpgService {
 
     private final OkHttpClient client;
     private final ExecutorService executor;
+
+    /** 并发请求数：换台时当前频道的请求不必排在已过时的请求之后 */
+    private static final int EPG_CONCURRENCY = 3;
+    /** 播放界面信息栏（当前频道今日节目） */
+    private static final String SLOT_PLAYING = "playing";
+    /** 指定日期查询（节目单弹窗翻日期） */
+    private static final String SLOT_QUERY = "query";
+    /** 每个请求入口（slot）最近一次提交的请求；新请求到来时取消同入口的旧请求 */
+    private final ConcurrentHashMap<String, EpgRequest> latestBySlot = new ConcurrentHashMap<>();
+    /** XMLTV 构建锁：线程池并发时，整份 XMLTV 只下载、解析一次，其余请求等待后直接查询 */
+    private final Object xmltvLock = new Object();
+    /** 上次使用的 EPG 地址；地址变更（如网页配置修改）时清空内存缓存，避免继续展示旧源的节目单 */
+    private volatile String lastEpgBase;
+    /**
+     * 频道节目缓存代数：每次 clearCache() 自增。请求提交时记下代数，写缓存前比对，
+     * 代数变了说明期间缓存被清空过（EPG 地址变更 / 低内存回收），旧请求的结果不能再写回，
+     * 否则地址变更后仍会命中旧源的节目单。
+     */
+    private final java.util.concurrent.atomic.AtomicInteger cacheGen =
+            new java.util.concurrent.atomic.AtomicInteger();
+    /** XMLTV 失败短时记忆窗口：窗口内同一 key 不再重复联网，避免排队请求挨个重下整份文件 */
+    private static final long XMLTV_FAIL_BACKOFF_MS = 15 * 1000L;
+    /** 上次 XMLTV 联网失败的时间与 key（仅在 xmltvLock 内读写） */
+    private long lastXmltvFailAt;
+    private String lastXmltvFailKey;
 
     /** 单频道节目缓存最大条数（LRU，防止长期运行后无限增长） */
     private static final int MAX_CHANNEL_CACHE = 24;
@@ -142,7 +169,8 @@ public class EpgService {
         client = com.github.tvbox.osc.util.HttpClients.newBuilder(8, 10);
         // 设为守护线程 + 低优先级：本服务是永久单例、executor 从不 shutdown，
         // 非守护线程会阻止进程正常退出；EPG 解析也不应与播放/UI 抢 CPU。
-        executor = Executors.newSingleThreadExecutor(r -> {
+        // 固定 3 线程：快速换台时新请求不必排在已过时的旧请求之后（旧请求会被取消）
+        executor = Executors.newFixedThreadPool(EPG_CONCURRENCY, r -> {
             Thread t = new Thread(r, "EpgService");
             t.setDaemon(true);
             t.setPriority(Thread.MIN_PRIORITY);
@@ -163,7 +191,7 @@ public class EpgService {
      * 异步加载某频道今日节目单
      */
     public void loadEpg(String channelName, EpgCallback callback) {
-        loadEpg(channelName, todayDate(), callback);
+        load(channelName, todayDate(), SLOT_PLAYING, callback);
     }
 
     /**
@@ -172,12 +200,36 @@ public class EpgService {
      * @param date 日期，格式 yyyy-MM-dd
      */
     public void loadEpg(String channelName, String date, EpgCallback callback) {
+        load(channelName, date, SLOT_QUERY, callback);
+    }
+
+    /**
+     * 同一 slot 内"后发优先"：快速连续换台/翻日期时，新请求会取消同 slot 的旧请求——
+     * 排队中的直接丢弃，执行中的中止其 HTTP 请求；被取消的请求不回调错误。
+     * XMLTV 整份下载/解析不随单个请求取消（结果供所有频道共用）。
+     */
+    private void load(String channelName, String date, String slot, EpgCallback callback) {
         boolean enabled = Hawk.get(HawkConfig.IPTV_ENABLE_EPG, true);
         if (!enabled || TextUtils.isEmpty(channelName)) {
             if (callback != null) callback.onEpgError("EPG 未启用");
             return;
         }
         if (TextUtils.isEmpty(date)) date = todayDate();
+
+        String base = Hawk.get(HawkConfig.IPTV_EPG_URL, HawkConfig.DEFAULT_IPTV_EPG_URL);
+        if (base != null && !base.equals(lastEpgBase)) {
+            // 频道节目缓存不区分 EPG 源，地址变化后必须清空（XMLTV 缓存 key 本身含 URL）
+            if (lastEpgBase != null) {
+                Timber.i("EPG 地址已变更，清空内存缓存");
+                clearCache();
+            }
+            lastEpgBase = base;
+        }
+        // 在主线程固定本次请求使用的 EPG 地址与缓存代数：工作线程不再自行读取 Hawk，
+        // 同一请求不会混用新旧源；结果写缓存前据此判断是否已过时
+        final String reqRawBase = base;
+        final String reqBase = TextUtils.isEmpty(base) ? HawkConfig.DEFAULT_IPTV_EPG_URL : base.trim();
+        final int reqGen = cacheGen.get();
 
         final String queryDate = date;
         final String cacheKey = channelName + "@" + queryDate;
@@ -188,22 +240,61 @@ public class EpgService {
             return;
         }
 
-        executor.execute(() -> {
+        final EpgRequest req = new EpgRequest();
+        req.future = executor.submit(() -> {
+            if (req.cancelled) return;
             try {
-                List<EpgProgram> programs = fetchEpg(channelName, queryDate);
+                List<EpgProgram> programs = fetchEpg(channelName, queryDate, reqBase, req);
+                if (req.cancelled && programs.isEmpty()) return;
                 if (programs.isEmpty()) {
                     if (callback != null) callback.onEpgError("暂无节目单");
                     return;
                 }
-                cache.put(cacheKey, programs);
+                // 仅当期间缓存未被清空、且 EPG 地址仍是提交时的地址才写回，
+                // 防止旧源的结果在 clearCache() 之后又被写进按 频道@日期 索引的缓存
+                String curBase = lastEpgBase;
+                if (reqGen == cacheGen.get()
+                        && (reqRawBase == null ? curBase == null : reqRawBase.equals(curBase))) {
+                    cache.put(cacheKey, programs);
+                } else {
+                    Timber.d("EPG 源已变更或缓存已清空，丢弃旧结果缓存: %s", cacheKey);
+                }
                 if (callback != null) callback.onEpgLoaded(programs, findCurrentForDate(programs, queryDate));
             } catch (Throwable e) {
+                // 被新请求取消导致的 "Canceled" 异常属正常流程，不提示错误
+                if (req.cancelled) return;
                 Timber.w(e, "加载 EPG 失败: %s @ %s", channelName, queryDate);
                 if (callback != null) {
                     try { callback.onEpgError("EPG 获取失败"); } catch (Exception ignore) {}
                 }
             }
         });
+        EpgRequest previous = latestBySlot.put(slot, req);
+        if (previous != null && previous != req) previous.cancel();
+    }
+
+    /**
+     * 单次 EPG 请求的取消句柄：排队中的直接不执行；执行中的中止其 OkHttp Call
+     * （同步 execute 不响应线程中断，必须调用 Call.cancel 才能立即返回）。
+     */
+    private static class EpgRequest {
+        volatile Future<?> future;
+        volatile Call call;
+        volatile boolean cancelled;
+
+        /** 先登记再检查，避免取消发生在登记前而漏掉 */
+        void attach(Call c) {
+            call = c;
+            if (cancelled) c.cancel();
+        }
+
+        void cancel() {
+            cancelled = true;
+            Future<?> f = future;
+            if (f != null) f.cancel(false);
+            Call c = call;
+            if (c != null) c.cancel();
+        }
     }
 
     /** 今天日期字符串 yyyy-MM-dd */
@@ -235,6 +326,8 @@ public class EpgService {
     }
 
     public void clearCache() {
+        // 先自增代数再清空：进行中的旧请求完成后发现代数不符，不再写回
+        cacheGen.incrementAndGet();
         cache.clear();
         xmltvCache = null;
         xmltvCacheKey = null;
@@ -260,21 +353,21 @@ public class EpgService {
 
     // ============ 私有 ============
 
-    private List<EpgProgram> fetchEpg(String channelName, String date) throws Exception {
-        String base = Hawk.get(HawkConfig.IPTV_EPG_URL, HawkConfig.DEFAULT_IPTV_EPG_URL);
+    private List<EpgProgram> fetchEpg(String channelName, String date, String base, EpgRequest req) throws Exception {
+        // base 由 load() 在提交时确定（已去空白、空则用默认地址）
         if (TextUtils.isEmpty(base)) base = HawkConfig.DEFAULT_IPTV_EPG_URL;
         base = base.trim();
 
         // XMLTV 源：地址通常以 .xml / .xml.gz 结尾，直接解析整份 XMLTV
         String lower = base.toLowerCase();
         if (lower.endsWith(".xml") || lower.endsWith(".xml.gz") || lower.endsWith(".gz")) {
-            return fetchXmltv(base, channelName, date);
+            return fetchXmltv(base, channelName, date, req);
         }
 
         // 否则按 diyp JSON 接口请求
         String diypBase = base.replaceAll("/+$", "");
         String url = diypBase + "/?ch=" + encode(channelName) + "&date=" + date;
-        String body = httpGet(url);
+        String body = httpGet(url, req);
         List<EpgProgram> diyp = parseDiyp(body);
         if (!diyp.isEmpty()) return diyp;
 
@@ -286,8 +379,8 @@ public class EpgService {
     }
 
     /** 拉取并解析 XMLTV 源（仅保留当前源频道，配合 6 小时磁盘缓存） */
-    private List<EpgProgram> fetchXmltv(String url, String channelName, String date) throws Exception {
-        XmltvData data = getOrBuildXmltv(url);
+    private List<EpgProgram> fetchXmltv(String url, String channelName, String date, EpgRequest req) throws Exception {
+        XmltvData data = getOrBuildXmltv(url, req);
         return queryFromXmltv(data, channelName, date);
     }
 
@@ -299,7 +392,14 @@ public class EpgService {
      *   <li><b>网络</b>：下载 + 流式解析（按当前频道过滤）+ 写入磁盘缓存</li>
      * </ol>
      */
-    private XmltvData getOrBuildXmltv(String url) throws Exception {
+    private XmltvData getOrBuildXmltv(String url, EpgRequest req) throws Exception {
+        // 线程池并发时串行化构建：同一份 XMLTV 只下载/解析一次，后到的请求直接命中内存缓存
+        synchronized (xmltvLock) {
+            return getOrBuildXmltvLocked(url, req);
+        }
+    }
+
+    private XmltvData getOrBuildXmltvLocked(String url, EpgRequest req) throws Exception {
         // 当前源频道的归一化 key 白名单：只有这些频道的节目会进入内存
         Set<String> wantedKeys = currentChannelKeys();
         String key = url + "|" + wantedKeys.size() + "|" + keysFingerprint(wantedKeys);
@@ -324,6 +424,16 @@ public class EpgService {
         }
 
         // 3) 联网下载并解析
+        // 等锁期间已被新请求取消的，不再联网下载整份 XMLTV（load() 的 catch 对已取消请求静默返回）。
+        // 不对下载 Call 做 req.attach：下载结果供所有频道共用，一旦开始就不随换台中止。
+        if (req != null && req.cancelled) {
+            throw new java.util.concurrent.CancellationException("EPG 请求已取消");
+        }
+        // 刚失败过（如超时/HTTP 错误）则短时间内直接失败，避免排队的请求依次重下同一份文件
+        if (key.equals(lastXmltvFailKey)
+                && System.currentTimeMillis() - lastXmltvFailAt < XMLTV_FAIL_BACKOFF_MS) {
+            throw new Exception("XMLTV 刚下载失败，稍后重试");
+        }
         okhttp3.Request request = new okhttp3.Request.Builder()
                 .url(url)
                 .header("User-Agent", "okhttp/4.12.0")
@@ -333,6 +443,7 @@ public class EpgService {
             if (!response.isSuccessful() || response.body() == null) {
                 throw new Exception("HTTP " + response.code());
             }
+            lastXmltvFailKey = null;
             InputStream in = response.body().byteStream();
             String enc = response.header("Content-Encoding", "");
             if (url.toLowerCase(Locale.ROOT).endsWith(".gz") || (enc != null && enc.contains("gzip"))) {
@@ -349,6 +460,11 @@ public class EpgService {
             Timber.i("EPG 已下载解析: %d 条节目（仅当前源 %d 个频道）",
                     data.programmeCount, wantedKeys.size());
             return data;
+        } catch (Exception e) {
+            // 记录失败（在 xmltvLock 内），供随后等锁的请求快速失败
+            lastXmltvFailKey = key;
+            lastXmltvFailAt = System.currentTimeMillis();
+            throw e;
         }
     }
 
@@ -634,12 +750,15 @@ public class EpgService {
         }
     }
 
-    private String httpGet(String url) throws Exception {
+    private String httpGet(String url, EpgRequest req) throws Exception {
         okhttp3.Request request = new okhttp3.Request.Builder()
                 .url(url)
                 .header("User-Agent", "okhttp/4.12.0")
                 .build();
-        try (Response response = client.newCall(request).execute()) {
+        Call call = client.newCall(request);
+        // 登记 Call，便于同 slot 的新请求到来时立即中止
+        if (req != null) req.attach(call);
+        try (Response response = call.execute()) {
             if (!response.isSuccessful() || response.body() == null) {
                 throw new Exception("HTTP " + response.code());
             }

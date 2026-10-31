@@ -590,7 +590,7 @@
                 <TextView
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="播放器类型"
+                    android:text="播放器类型（当前仅支持 ExoPlayer）"
                     android:textColor="@color/text_secondary"
                     android:textSize="14sp" />
 
@@ -659,6 +659,14 @@
                 android:layout_marginStart="12dp"
                 android:layout_weight="1"
                 android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tv_info_duration_value"
+                android:layout_width="70dp"
+                android:layout_height="wrap_content"
+                android:gravity="end"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp" />
         </LinearLayout>
 
         <CheckBox
