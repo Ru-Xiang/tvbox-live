@@ -127,6 +127,19 @@ public class HawkConfig {
      */
     public static final String SPEED_FILTER_UNAVAILABLE = "speed_filter_unavailable";
 
+    /**
+     * 测速完成后是否移除黑屏线路：测速发现没有视频轨（只有声音），或播放时持续全黑/始终出不了画面。
+     * 广播/电台类频道不受影响；每个频道至少保留一条线路，置顶线路不删。默认开启。
+     */
+    public static final String SPEED_FILTER_BLACK = "speed_filter_black";
+
+    /**
+     * 最低分辨率（按画面高度，16:9 等效）：已知分辨率低于它的线路在测速完成后移除。
+     * 0 = 不限。分辨率未知的线路不受影响；频道里没有达标线路时一条都不删。默认 1080。
+     */
+    public static final String SPEED_MIN_RESOLUTION = "speed_min_resolution";
+    public static final int DEFAULT_SPEED_MIN_RESOLUTION = 1080;
+
     /** 测速失败超时重试次数（对齐 ISEP：仅对超时失败自动重试） */
     public static final String SPEED_TEST_RETRY = "speed_test_retry";
 

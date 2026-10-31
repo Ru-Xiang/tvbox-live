@@ -29,6 +29,7 @@ import com.github.tvbox.osc.service.SpeedTestEngine;
 import com.github.tvbox.osc.ui.dialog.ScanConfigDialog;
 import com.github.tvbox.osc.util.ActivityCallbacks;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.LineQuality;
 import com.orhanobut.hawk.Hawk;
 
 import org.greenrobot.eventbus.EventBus;
@@ -81,6 +82,10 @@ public class LiveSettingsActivity extends AppCompatActivity {
     private TextView tvConcurrencyValue;
     private CheckBox cbSortBySpeed;
     private CheckBox cbFilterUnavailable;
+    private View llFilterBlack;
+    private CheckBox cbFilterBlack;
+    private View llMinResolution;
+    private Spinner spMinResolution;
     private SeekBar sbMinSpeed;
     private TextView tvMinSpeedValue;
     private Button btnStartSpeedTest;
@@ -184,6 +189,10 @@ public class LiveSettingsActivity extends AppCompatActivity {
         tvConcurrencyValue = findViewById(R.id.tv_concurrency_value);
         cbSortBySpeed = findViewById(R.id.cb_sort_by_speed);
         cbFilterUnavailable = findViewById(R.id.cb_filter_unavailable);
+        llFilterBlack = findViewById(R.id.ll_filter_black);
+        cbFilterBlack = findViewById(R.id.cb_filter_black);
+        llMinResolution = findViewById(R.id.ll_min_resolution);
+        spMinResolution = findViewById(R.id.sp_min_resolution);
         sbMinSpeed = findViewById(R.id.sb_min_speed);
         tvMinSpeedValue = findViewById(R.id.tv_min_speed_value);
         btnStartSpeedTest = findViewById(R.id.btn_start_speed_test);
@@ -226,7 +235,28 @@ public class LiveSettingsActivity extends AppCompatActivity {
         setupSpinners();
     }
 
+    /** 最低分辨率选项：画面高度，0 = 不限（与 MIN_RESOLUTION_LABELS 一一对应） */
+    private static final int[] MIN_RESOLUTION_VALUES = {0, 480, 720, 1080};
+    private static final String[] MIN_RESOLUTION_LABELS = {"不限", "480P", "720P", "1080P"};
+
+    /** 已存的最低分辨率对应的选项下标：非标准值取不高于它的最大一档 */
+    private static int minResolutionIndex(int height) {
+        int idx = 0;
+        for (int i = 0; i < MIN_RESOLUTION_VALUES.length; i++) {
+            if (MIN_RESOLUTION_VALUES[i] <= height) idx = i;
+        }
+        return idx;
+    }
+
     private void setupSpinners() {
+
+        // 最低分辨率
+        if (spMinResolution != null) {
+            ArrayAdapter<String> resAdapter = new ArrayAdapter<>(this,
+                    android.R.layout.simple_spinner_item, MIN_RESOLUTION_LABELS);
+            resAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+            spMinResolution.setAdapter(resAdapter);
+        }
 
         // IP 版本选择
         if (spIpVersion != null) {
@@ -320,6 +350,8 @@ public class LiveSettingsActivity extends AppCompatActivity {
 
         if (cbSortBySpeed != null) cbSortBySpeed.setChecked(Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true));
         if (cbFilterUnavailable != null) cbFilterUnavailable.setChecked(Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true));
+        if (cbFilterBlack != null) cbFilterBlack.setChecked(LineQuality.filterBlackEnabled());
+        if (spMinResolution != null) spMinResolution.setSelection(minResolutionIndex(LineQuality.minHeight()));
 
         int timeout = Hawk.get(HawkConfig.SPEED_TEST_TIMEOUT, HawkConfig.DEFAULT_SPEED_TEST_TIMEOUT);
         if (sbSpeedTestTimeout != null) {
@@ -649,6 +681,8 @@ public class LiveSettingsActivity extends AppCompatActivity {
                 parentOf(sbConcurrency),
                 cbSortBySpeed,
                 cbFilterUnavailable,
+                llFilterBlack,
+                llMinResolution,
                 parentOf(sbMinSpeed),
                 btnStartSpeedTest,
         };
@@ -974,6 +1008,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
         if (sbConcurrency != null) putIfChanged(HawkConfig.SPEED_TEST_CONCURRENCY, Math.max(1, sbConcurrency.getProgress()));
         if (cbSortBySpeed != null) putIfChanged(HawkConfig.SPEED_SORT_SOURCES, cbSortBySpeed.isChecked());
         if (cbFilterUnavailable != null) putIfChanged(HawkConfig.SPEED_FILTER_UNAVAILABLE, cbFilterUnavailable.isChecked());
+        if (cbFilterBlack != null) putIfChanged(HawkConfig.SPEED_FILTER_BLACK, cbFilterBlack.isChecked());
+        // 同样过滤 INVALID_POSITION(-1)；选项未改动时不覆盖网页端存入的非标准值
+        if (spMinResolution != null) {
+            int pos = spMinResolution.getSelectedItemPosition();
+            if (pos >= 0 && pos < MIN_RESOLUTION_VALUES.length
+                    && pos != minResolutionIndex(LineQuality.minHeight())) {
+                putIfChanged(HawkConfig.SPEED_MIN_RESOLUTION, MIN_RESOLUTION_VALUES[pos]);
+            }
+        }
         if (sbMinSpeed != null) putIfChanged(HawkConfig.SPEED_MIN_THRESHOLD, sbMinSpeed.getProgress());
 
         // 播放器设置

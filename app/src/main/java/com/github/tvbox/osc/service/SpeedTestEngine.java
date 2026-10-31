@@ -5,6 +5,8 @@ import com.github.tvbox.osc.api.ChannelManager;
 import com.github.tvbox.osc.bean.LiveChannel;
 import com.github.tvbox.osc.bean.SpeedTestResult;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.LineQuality;
+import com.github.tvbox.osc.util.MediaProbe;
 import com.github.tvbox.osc.util.ProtocolFilter;
 import com.github.tvbox.osc.util.StreamQualityScorer;
 import com.github.tvbox.osc.util.StreamUrl;
@@ -23,6 +25,7 @@ import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -298,6 +301,7 @@ public class SpeedTestEngine {
                 r.setQualityScore(o.optInt(compact ? "q" : "qualityScore", 0));
                 r.setFailureType(optStr(o, compact ? "f" : "failureType"));
                 r.setHls(o.optBoolean("h", false));
+                r.setVideoState(o.optInt("v", SpeedTestResult.VIDEO_UNKNOWN));
                 resultCache.put(url, r);
             }
             Timber.d("从持久化恢复测速缓存: %d 条", resultCache.size());
@@ -369,6 +373,7 @@ public class SpeedTestEngine {
                 if (r.getQualityScore() != 0) o.put("q", r.getQualityScore());
                 if (r.getFailureType() != null) o.put("f", r.getFailureType());
                 if (r.isHls()) o.put("h", true);
+                if (r.getVideoState() != SpeedTestResult.VIDEO_UNKNOWN) o.put("v", r.getVideoState());
                 arr.put(o);
             }
             String out = arr.toString();
@@ -798,9 +803,13 @@ public class SpeedTestEngine {
                     // 更新频道的最佳速度/评分/分辨率，并按配置模式排序
                     // （各频道测完时已各自更新过一次；剔除不可用线路后需按剩余线路重算）
                     boolean filterUnavailable = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
+                    // 黑屏 / 低分辨率线路过滤与"移除不可用线路"开关相互独立，规则见 LineQuality
+                    boolean filterQuality = LineQuality.filterBlackEnabled() || LineQuality.minHeight() > 0;
                     for (LiveChannel channel : channels) {
-                        if (filterUnavailable && !downRound) {
-                            try { removeUnavailableSources(channel, startTime, channelManager); } catch (Exception ignore) {}
+                        if ((filterUnavailable || filterQuality) && !downRound) {
+                            try {
+                                removeUnavailableSources(channel, startTime, channelManager, filterUnavailable, filterQuality);
+                            } catch (Exception ignore) {}
                         }
                         applyChannelResults(channel, startTime, sortSources, sortMode);
                         channel.setLastSpeedTestTime(System.currentTimeMillis());
@@ -1128,6 +1137,48 @@ public class SpeedTestEngine {
         long icyBrKbps;
     }
 
+    /** 媒体样本最多保留的字节数：TS 一般在头 1~2 个 GOP 内就有 PAT/PMT 与 SPS */
+    private static final int SAMPLE_CAPTURE_MAX = 512 * 1024;
+
+    /**
+     * 测速时顺带保留的媒体样本（HLS 首个分片 / 直链开头），测完交给 MediaProbe 探测画面后即释放。
+     * 每个测速任务至多一份，按需扩容，不改变读取与计速流程。
+     */
+    private static final class Capture {
+        byte[] buf;
+        int len;
+
+        void append(byte[] src, int off, int n) {
+            if (n <= 0 || len >= SAMPLE_CAPTURE_MAX) return;
+            n = Math.min(n, SAMPLE_CAPTURE_MAX - len);
+            if (buf == null) {
+                buf = new byte[Math.min(SAMPLE_CAPTURE_MAX, Math.max(64 * 1024, n))];
+            } else if (len + n > buf.length) {
+                buf = Arrays.copyOf(buf, Math.min(SAMPLE_CAPTURE_MAX, Math.max(buf.length * 2, len + n)));
+            }
+            System.arraycopy(src, off, buf, len, n);
+            len += n;
+        }
+    }
+
+    /** 探测样本里的视频轨与分辨率写入结果（清单已声明分辨率时不覆盖），然后释放样本 */
+    private static void applyMediaProbe(SpeedTestResult result, Capture cap) {
+        if (cap == null) return;
+        try {
+            if (cap.buf == null || cap.len <= 0) return;
+            MediaProbe.Result p = MediaProbe.probe(cap.buf, cap.len);
+            if (p.hasSize() && result.getResolution() == null) {
+                result.setResolution(p.width + "x" + p.height);
+            }
+            result.setVideoState(p.videoState);
+        } catch (Throwable t) {
+            Timber.w(t, "媒体样本探测失败");
+        } finally {
+            cap.buf = null;
+            cap.len = 0;
+        }
+    }
+
     /**
      * 执行单个 URL 的测速。
      *
@@ -1185,10 +1236,11 @@ public class SpeedTestEngine {
                     result.setErrorMsg("未测到有效数据");
                 }
             }
-            Timber.d("测速完成: %s - %.1f KB/s (阈值 %.0f), 延迟 %d ms, %s%s",
+            Timber.d("测速完成: %s - %.1f KB/s (阈值 %.0f), 延迟 %d ms, %s%s%s",
                     channelName, result.getSpeed(), effMin, result.getLatency(),
                     result.getResolution() != null ? result.getResolution() : "?",
-                    result.isHls() ? " HLS" : "");
+                    result.isHls() ? " HLS" : "",
+                    result.isVideoMissing() ? " 无视频轨" : "");
         } catch (Exception e) {
             result.setAvailable(false);
             result.setStatus(3);
@@ -1298,13 +1350,17 @@ public class SpeedTestEngine {
                 if (headLen > 0 && looksLikeErrorPage(contentType, head, headLen)) {
                     throw new Exception("返回的不是音视频流（错误页/文本）");
                 }
-                // 直链：用当前已建立的流继续测速（含已读的 head 字节及其耗时）
-                StreamStat st = measureStream(in, headLen, bodyStart, probe);
+                // 直链：用当前已建立的流继续测速（含已读的 head 字节及其耗时）；
+                // 同时保留开头的样本，测完后探测有无视频轨与分辨率
+                Capture cap = new Capture();
+                cap.append(head, 0, headLen);
+                StreamStat st = measureStream(in, headLen, bodyStart, probe, cap);
                 if (st.eof && st.bytes < MIN_BYTES) {
                     // 直播流不会这么快结束；短 body 只能是错误页/占位文件
                     throw new Exception("流提前结束（仅 " + (st.bytes / 1024) + " KB），不是有效的直播流");
                 }
                 result.setSpeed(st.speed);
+                applyMediaProbe(result, cap);
                 // 窗口结束时仍在出数据、且没有声明长度 → 直播流（速度≈码率）；
                 // 读完了或声明了长度 → 有限文件（速度≈带宽），沿用用户阈值
                 info.liveDirect = !st.eof && st.elapsedMs >= MIN_MEASURE_MS && conn.getContentLength() <= 0;
@@ -1363,12 +1419,14 @@ public class SpeedTestEngine {
         boolean timedOut = false;
         int lastHttp = 0;
         Exception lastErr = null;
+        // 只保留第一个拿到数据的分片作样本，用于探测有无视频轨与分辨率
+        Capture cap = new Capture();
         for (String seg : sampled) {
             if (remainingMs(probe.deadline) <= 0) {
                 timedOut = true;
                 break;
             }
-            SegmentStat r = downloadSegment(seg, probe);
+            SegmentStat r = downloadSegment(seg, probe, cap.len == 0 ? cap : null);
             if (r.bytes > 0) {
                 bodyBytes += r.bytes;
                 bodyMs += r.bodyMs;
@@ -1387,6 +1445,7 @@ public class SpeedTestEngine {
             long ms = bodyMs >= MIN_SEGMENT_BODY_MS ? bodyMs : totalMs;
             if (ms <= 0) ms = 1;
             result.setSpeed((bodyBytes / 1024.0) / (ms / 1000.0));
+            applyMediaProbe(result, cap);
             return;
         }
         // 采样分片全部失败：把原因抛出去交给 classifyFailure，超时才能触发重试
@@ -1401,8 +1460,9 @@ public class SpeedTestEngine {
      *
      * @param prefixLen 已经预读的字节数（计入总量）
      * @param start     计时起点（响应头到达时刻，早于预读，预读耗时也计入）
+     * @param cap       媒体样本（可为 null）：读到的数据顺带保留开头一段
      */
-    private StreamStat measureStream(InputStream in, int prefixLen, long start, Probe probe) throws Exception {
+    private StreamStat measureStream(InputStream in, int prefixLen, long start, Probe probe, Capture cap) throws Exception {
         StreamStat st = new StreamStat();
         byte[] buffer = new byte[16 * 1024];
         long totalBytes = Math.max(0, prefixLen);
@@ -1426,6 +1486,7 @@ public class SpeedTestEngine {
                 break;
             }
             totalBytes += n;
+            if (cap != null) cap.append(buffer, 0, n);
 
             long now = System.currentTimeMillis();
             long dt = now - lastTime;
@@ -1460,8 +1521,8 @@ public class SpeedTestEngine {
         return st;
     }
 
-    /** 下载单个分片（在剩余预算内尽量读完） */
-    private SegmentStat downloadSegment(String segUrl, Probe probe) {
+    /** 下载单个分片（在剩余预算内尽量读完）；cap 不为 null 时顺带保留分片开头作媒体样本 */
+    private SegmentStat downloadSegment(String segUrl, Probe probe, Capture cap) {
         SegmentStat st = new SegmentStat();
         Response resp = null;
         InputStream in = null;
@@ -1480,6 +1541,7 @@ public class SpeedTestEngine {
                 int n = in.read(buffer);
                 if (n == -1) break;
                 st.bytes += n;
+                if (cap != null) cap.append(buffer, 0, n);
             }
         } catch (Exception e) {
             // 已读到的部分照常计入；没读到数据时由 measureHls 按超时/其它原因上报
@@ -1893,10 +1955,13 @@ public class SpeedTestEngine {
         double bestSpeed = 0;
         int bestScore = 0;
         String bestResolution = null;
+        boolean audio = LineQuality.isAudioChannel(channel);
         for (String url : channel.getSourceUrls()) {
             SpeedTestResult r = resultCache.get(url);
             // 只看本轮测出的结果：本轮没测到的线路，旧评分可能早已失效
             if (r == null || r.getTestTime() < roundStart) continue;
+            // 黑屏线路与不可用同等对待，不参与最佳指标
+            if (!audio && LineQuality.isBlackLine(url, r)) continue;
             if (r.getSpeed() > bestSpeed) bestSpeed = r.getSpeed();
             if (r.getQualityScore() > bestScore) {
                 bestScore = r.getQualityScore();
@@ -1923,12 +1988,22 @@ public class SpeedTestEngine {
      * 线路管理界面查看；该频道在展示列表与本地节目列表中仍会被隐藏
      * （见 ChannelManager#hasPlayableSource / #pickBestSource），
      * 因此不会出现"点进去只能黑屏"的频道。
+     *
+     * <p>画质过滤（filterQuality）：本轮测得可用、但为黑屏线路（{@link LineQuality#isBlackLine}，
+     * 含播放时的黑屏标记）或低分辨率（{@link LineQuality#isLowResolution}）的线路也一并移除。
+     * 广播/电台频道不做画质过滤；不可测速的线路不判定；置顶线路不删；
+     * 频道里须至少留下一条本轮实测可用且画质合格的线路，否则一条都不按画质删。
      */
-    private void removeUnavailableSources(LiveChannel channel, long roundStart, ChannelManager channelManager) {
+    private void removeUnavailableSources(LiveChannel channel, long roundStart, ChannelManager channelManager,
+                                          boolean filterUnavailable, boolean filterQuality) {
         if (channel == null || channel.getSourceUrls() == null || channel.getSourceUrls().isEmpty()) return;
         List<String> urls = new ArrayList<>(channel.getSourceUrls());
         List<String> toRemove = new ArrayList<>();
+        List<String> unavailable = new ArrayList<>();
+        List<String> lowQuality = new ArrayList<>();
+        boolean checkQuality = filterQuality && !LineQuality.isAudioChannel(channel);
         int tested = 0;
+        int good = 0;
         for (String url : urls) {
             SpeedTestResult r = resultCache.get(url);
             // 只认本轮的结果：旧失败可能是几天前的网络波动，线路早已恢复
@@ -1936,26 +2011,61 @@ public class SpeedTestEngine {
             // UNTESTABLE（RTSP/RTMP 等流式协议）只是无法测速，线路本身可能可播，不能删
             if (UNTESTABLE.equals(r.getFailureType())) continue;
             tested++;
-            if (!r.isAvailable()) toRemove.add(url);
+            if (!r.isAvailable()) {
+                unavailable.add(url);
+            } else if (checkQuality && (LineQuality.isBlackLine(url, r) || LineQuality.isLowResolution(url, r))) {
+                lowQuality.add(url);
+            } else {
+                // 本轮实测可用、且画质合格（或不做画质判断）的线路才算"正常线路"
+                good++;
+            }
         }
-        if (toRemove.isEmpty()) return;
-        // "全部失败"按本轮实际测到的线路算（置顶线路的失败也计入；置顶线路在下面删除时再跳过）：本轮测到的全挂了，多半是网络临时波动，一条都不删
-        if (toRemove.size() >= tested) {
-            Timber.w("频道 %s 本轮测到的线路全部不可用，保留原有线路避免误删", channel.getChannelName());
+        if (filterUnavailable) toRemove.addAll(unavailable);
+        if (toRemove.isEmpty() && lowQuality.isEmpty()) return;
+        int removed = 0;
+        if (!toRemove.isEmpty()) {
+            // "全部失败"按本轮实际测到的线路算（置顶线路的失败也计入；置顶线路在下面删除时再跳过）：本轮测到的全挂了，多半是网络临时波动，一条都不删
+            if (toRemove.size() >= tested) {
+                Timber.w("频道 %s 本轮测到的线路全部不可用，保留原有线路避免误删", channel.getChannelName());
+                return;
+            }
+            for (String url : toRemove) {
+                // 用户置顶的线路不删：用户确认能播，测速可能因缺请求头/阈值误判；删掉后置顶偏好随之静默失效
+                if (isPinnedQuietly(channelManager, channel, url)) continue;
+                if (channel.removeSource(url)) removed++;
+            }
+            if (removed > 0) Timber.d("频道 %s 移除 %d 条不可用线路", channel.getChannelName(), removed);
+        }
+        if (lowQuality.isEmpty()) return;
+        // 画质过滤后频道里至少要留一条本轮实测可用且画质合格的线路（未测 / 旧结果 / 不可测速的线路不算，无法确认能播），
+        // 否则全部保留：宁可播低清或可能黑屏的线路，也不能让频道只剩未经确认的线路
+        if (good == 0) {
+            Timber.d("频道 %s 有 %d 条黑屏/低分辨率线路，但没有其它可用线路，全部保留",
+                    channel.getChannelName(), lowQuality.size());
             return;
         }
-        int removed = 0;
-        for (String url : toRemove) {
-            // 用户置顶的线路不删：用户确认能播，测速可能因缺请求头/阈值误判；删掉后置顶偏好随之静默失效
-            if (channelManager != null) {
-                try {
-                    if (channelManager.isSourcePinned(channel, url)) continue;
-                } catch (Throwable ignore) {
-                }
+        int removedBlack = 0, removedLow = 0;
+        for (String url : lowQuality) {
+            if (isPinnedQuietly(channelManager, channel, url)) continue;
+            boolean isBlack = LineQuality.isBlackLine(url, resultCache.get(url));
+            if (channel.removeSource(url)) {
+                if (isBlack) removedBlack++;
+                else removedLow++;
             }
-            if (channel.removeSource(url)) removed++;
         }
-        if (removed > 0) Timber.d("频道 %s 移除 %d 条不可用线路", channel.getChannelName(), removed);
+        if (removedBlack + removedLow > 0) {
+            Timber.d("频道 %s 移除 %d 条黑屏线路、%d 条低分辨率线路（低于 %dP）",
+                    channel.getChannelName(), removedBlack, removedLow, LineQuality.minHeight());
+        }
+    }
+
+    private static boolean isPinnedQuietly(ChannelManager channelManager, LiveChannel channel, String url) {
+        if (channelManager == null) return false;
+        try {
+            return channelManager.isSourcePinned(channel, url);
+        } catch (Throwable ignore) {
+            return false;
+        }
     }
 
     /**
@@ -1987,14 +2097,20 @@ public class SpeedTestEngine {
      * 按综合评分对频道的线路重排。
      * 只用本轮结果：本轮可用的按评分在前；本轮未测（含旧结果）与不可测速的记 0 保持相对顺序；
      * 本轮测得不可用的记 -1 排到最后。旧的 90 分不会压过本轮刚测的 70 分。
+     * 黑屏线路（本轮测得无视频轨，或播放时被标记黑屏）同样记 -1；低分辨率交给评分器的分辨率分项。
      */
     private void sortChannelByScores(LiveChannel channel, long roundStart) {
         if (channel.getSourceUrls() == null) return;
+        boolean audio = LineQuality.isAudioChannel(channel);
         List<Integer> scores = new ArrayList<>();
         for (String url : channel.getSourceUrls()) {
             SpeedTestResult r = resultCache.get(url);
+            boolean fresh = r != null && r.getTestTime() >= roundStart;
             int score;
-            if (r == null || r.getTestTime() < roundStart || UNTESTABLE.equals(r.getFailureType())) {
+            // 旧结果的"无视频轨"可能已过时，只认本轮的；播放时的黑屏标记自带有效期，任何时候都认
+            if (!audio && LineQuality.isBlackLine(url, fresh ? r : null)) {
+                score = -1;
+            } else if (!fresh || UNTESTABLE.equals(r.getFailureType())) {
                 score = 0;
             } else if (r.isAvailable()) {
                 score = Math.max(0, r.getQualityScore());

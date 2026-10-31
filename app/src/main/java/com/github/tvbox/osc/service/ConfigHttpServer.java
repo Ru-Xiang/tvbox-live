@@ -157,6 +157,13 @@ public class ConfigHttpServer extends NanoHTTPD {
         // 按速度排序 / 过滤不可用线路（与 TV 端统一）
         Hawk.put(HawkConfig.SPEED_SORT_SOURCES, p.containsKey("sort_by_speed"));
         Hawk.put(HawkConfig.SPEED_FILTER_UNAVAILABLE, p.containsKey("filter_unavailable"));
+        // 黑屏线路过滤 / 最低分辨率（与 TV 端统一；分辨率只接受下拉框的几档，0 = 不限）
+        Hawk.put(HawkConfig.SPEED_FILTER_BLACK, p.containsKey("filter_black"));
+        if (p.containsKey("min_resolution")) {
+            int res = parseInt(p.get("min_resolution"), HawkConfig.DEFAULT_SPEED_MIN_RESOLUTION, 0, 1080);
+            if (res != 0 && res != 480 && res != 720 && res != 1080) res = HawkConfig.DEFAULT_SPEED_MIN_RESOLUTION;
+            Hawk.put(HawkConfig.SPEED_MIN_RESOLUTION, res);
+        }
 
         // 播放器设置（与 TV 端统一）
         // 目前只实现了 ExoPlayer，与 TV 端设置页一致固定为 2，忽略网页提交的其它值
@@ -224,6 +231,10 @@ public class ConfigHttpServer extends NanoHTTPD {
         int minSpeed = Hawk.get(HawkConfig.SPEED_MIN_THRESHOLD, HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD);
         boolean sortBySpeed = Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true);
         boolean filterUnavailable = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
+        boolean filterBlack = com.github.tvbox.osc.util.LineQuality.filterBlackEnabled();
+        // 回显取不高于已存值的最大一档，避免下拉框无选中项时浏览器默认选「不限」再被提交
+        int storedRes = com.github.tvbox.osc.util.LineQuality.minHeight();
+        int minResolution = storedRes >= 1080 ? 1080 : storedRes >= 720 ? 720 : storedRes >= 480 ? 480 : 0;
         int scaleMode = Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0);
         boolean showChannelInfo = Hawk.get(HawkConfig.LIVE_SHOW_CHANNEL_INFO, true);
         boolean showSpeedInfo = Hawk.get(HawkConfig.LIVE_SHOW_SPEED_INFO, true);
@@ -286,6 +297,11 @@ public class ConfigHttpServer extends NanoHTTPD {
                 + field("最低速度（KB/s，0=不限制）", numberInput("min_speed", minSpeed, "50", 0, MAX_SPEED_MIN_THRESHOLD))
                 + checkbox("sort_by_speed", "按速度/质量对线路排序", sortBySpeed)
                 + checkbox("filter_unavailable", "测速后移除不可用线路", filterUnavailable)
+                + checkbox("filter_black", "过滤黑屏线路（删除只有声音没有画面、或播放时持续黑屏的线路，广播电台除外）", filterBlack)
+                + field("最低分辨率（删除低于该分辨率的线路；分辨率未知的不删，每个频道至少保留一条）",
+                        select("min_resolution", new String[][]{
+                                {"0", "不限"}, {"480", "480P"}, {"720", "720P"}, {"1080", "1080P"}},
+                                String.valueOf(minResolution)))
 
                 + section("播放器")
                 + field("播放器内核（当前仅支持 ExoPlayer）", select("player_type", new String[][]{

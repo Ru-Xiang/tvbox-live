@@ -439,6 +439,65 @@
             android:textColor="@color/text_secondary"
             android:textSize="16sp" />
 
+        <!-- 过滤黑屏线路（复选框与说明包在同一容器里，测速关闭时整块置灰） -->
+        <LinearLayout
+            android:id="@+id/ll_filter_black"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <CheckBox
+                android:id="@+id/cb_filter_black"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:focusable="true"
+                android:text="过滤黑屏线路"
+                android:textColor="@color/text_secondary"
+                android:textSize="16sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="测速后删除只有声音没有画面、或播放时持续黑屏的线路（广播电台除外）"
+                android:textColor="@color/text_quaternary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- 最低分辨率 -->
+        <LinearLayout
+            android:id="@+id/ll_min_resolution"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="最低分辨率"
+                android:textColor="@color/text_secondary"
+                android:textSize="16sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="测速后删除低于该分辨率的线路（分辨率未知的不删，每个频道至少保留一条）"
+                android:textColor="@color/text_quaternary"
+                android:textSize="12sp" />
+
+            <Spinner
+                android:id="@+id/sp_min_resolution"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:layout_marginTop="6dp"
+                android:background="@drawable/glass_input"
+                android:focusable="true"
+                android:focusableInTouchMode="false" />
+        </LinearLayout>
+
         <!-- 最低速度 -->
         <LinearLayout
             android:layout_width="match_parent"

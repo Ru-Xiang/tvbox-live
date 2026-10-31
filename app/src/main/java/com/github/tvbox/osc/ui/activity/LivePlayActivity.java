@@ -4,12 +4,19 @@ import com.github.tvbox.osc.util.ToastUtil;
 
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.PixelCopy;
+import android.view.Surface;
+import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -19,6 +26,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -41,12 +49,16 @@ import com.github.tvbox.osc.ui.dialog.EpgDialog;
 import com.github.tvbox.osc.ui.dialog.ScanConfigDialog;
 import com.github.tvbox.osc.util.ActivityCallbacks;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.LineQuality;
 import com.github.tvbox.osc.util.RunLog;
 import com.github.tvbox.osc.util.StreamUrl;
+import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.Format;
 import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.PlaybackException;
 import com.google.android.exoplayer2.Player;
+import com.google.android.exoplayer2.Tracks;
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory;
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
 import com.google.android.exoplayer2.ui.StyledPlayerView;
@@ -312,6 +324,44 @@ public class LivePlayActivity extends AppCompatActivity {
     /** 解除 positioningList 的延时任务（持有引用以便重新打开/关闭列表时取消上一次的） */
     private final Runnable clearPositioning = () -> positioningList = false;
 
+    // ============ 黑屏检测（播放时） ============
+    /** 起播（READY）后这么久仍没有视频轨 / 没渲染出首帧，判为黑屏 */
+    private static final long BLACK_NO_FRAME_MS = 8_000L;
+    /** 首帧后多久开始截取画面采样，之后每隔多久采一次 */
+    private static final long BLACK_FIRST_SAMPLE_MS = 4_000L;
+    private static final long BLACK_SAMPLE_INTERVAL_MS = 3_000L;
+    /** 连续几次采样全黑才判为黑屏（约 4s + 5×3s ≈ 19s 的窗口，避免影视频道暗场误判后被测速删线路） */
+    private static final int BLACK_SAMPLES_NEEDED = 6;
+    /** 采样里每个像素的亮度都低于该值才算全黑（0~255） */
+    private static final int BLACK_LUMA_MAX = 24;
+    /** 采样图尺寸：64x36 足以覆盖台标等小块亮区，逐像素判断的开销仍可忽略 */
+    private static final int SAMPLE_W = 64;
+    private static final int SAMPLE_H = 36;
+    /**
+     * 本机截取画面是否可信：曾采到过非全黑画面才置 true。部分盒子的视频走硬件叠加层，
+     * 截到的永远是全黑，不先确认就会把所有线路都误判成黑屏
+     */
+    private static final String KEY_FRAME_SAMPLE_OK = "live_frame_sample_ok";
+    /** 已为哪一代起播安排过检测（READY 会在每次缓冲结束后重复到达，只安排一次） */
+    private int blackCheckGen = -1;
+    /** 本次起播是否已渲染出首帧 */
+    private boolean firstFrameRendered;
+    /** 本次起播的视频轨状态：0 未知，1 有可播放的视频轨，2 没有 */
+    private int videoTrackState;
+    /** 连续全黑的采样次数 */
+    private int blackSampleCount;
+    /** 本次起播的黑屏检测已有结论（或已放弃），不再继续 */
+    private boolean blackCheckDone;
+    /** 有截图请求在途：此时不能回收采样位图 */
+    private boolean frameCopyPending;
+    /** 复用的采样位图与像素缓冲 */
+    private Bitmap frameSample;
+    private int[] framePixels;
+    /** 本次起播已记录的最高画面高度（16:9 等效），只在变高时写入，避免 ABR 低档位覆盖 */
+    private int recordedHeight;
+    private final Runnable noFrameCheck = this::checkNoFrame;
+    private final Runnable frameSampleTask = this::sampleFrame;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -398,6 +448,7 @@ public class LivePlayActivity extends AppCompatActivity {
             handler.removeCallbacks(networkPollRunnable);
             handler.removeCallbacks(stablePlayResetRunnable);
         }
+        resetBlackCheck();
         stopCornerSpeedTicker();
         if (isFinishing()) return; // 正在退出，交给 onDestroy 统一释放
         if (exoPlayer != null) {
@@ -555,6 +606,12 @@ public class LivePlayActivity extends AppCompatActivity {
             epgDialog = null;
         }
         releasePlayer();
+        // 截图请求在途时不回收：系统可能仍在往里写，交给 GC
+        if (frameSample != null && !frameCopyPending) {
+            try { frameSample.recycle(); } catch (Exception ignore) {}
+        }
+        frameSample = null;
+        framePixels = null;
     }
 
     // ============ 初始化 ============
@@ -1418,6 +1475,8 @@ public class LivePlayActivity extends AppCompatActivity {
         if (playerView == null || !isAlive()) return;
         // 新一次起播：上一条线路的"稳定播放"计时作废
         if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
+        // 上一次起播的黑屏检测作废
+        resetBlackCheck();
         if (!started) {
             // 后台时（换源回调等直接走到这里）不创建/启动播放器，回到前台由 onStart 重新起播
             cancelPlayTimeout();
@@ -1479,6 +1538,7 @@ public class LivePlayActivity extends AppCompatActivity {
                             }
                             // 起播后开始轮询右下角实时网速
                             startCornerSpeedTicker();
+                            onReadyForBlackCheck();
                         } else if (handler != null) {
                             // 缓冲/空闲/结束：未达到稳定播放，不重置计数
                             handler.removeCallbacks(stablePlayResetRunnable);
@@ -1494,6 +1554,39 @@ public class LivePlayActivity extends AppCompatActivity {
                         videoHeight = videoSize.height;
                         if (Hawk.get(HawkConfig.LIVE_PLAYER_SCALE, 0) == SCALE_ORIGINAL) {
                             applyScaleMode();
+                        }
+                        // 首帧之前的尺寸回调可能是上一条线路排队中的旧事件，不记
+                        if (firstFrameRendered) noteResolution(videoWidth, videoHeight);
+                    }
+
+                    @Override
+                    public void onRenderedFirstFrame() {
+                        firstFrameRendered = true;
+                        if (exoPlayer != null) {
+                            VideoSize vs = exoPlayer.getVideoSize();
+                            float par = vs.pixelWidthHeightRatio > 0 ? vs.pixelWidthHeightRatio : 1f;
+                            noteResolution((int) (vs.width * par), vs.height);
+                        }
+                        // READY 已先到达：现在才有画面可采样
+                        if (blackCheckGen == playGen) scheduleFrameSample(BLACK_FIRST_SAMPLE_MS);
+                    }
+
+                    @Override
+                    public void onTracksChanged(@NonNull Tracks tracks) {
+                        // 停止/切换时会先回调一次空轨道，不代表没有视频
+                        if (tracks.isEmpty()) return;
+                        // 允许超出解码能力：ExoPlayer 默认仍会尝试播放，播不出来由首帧检测兜底
+                        videoTrackState = tracks.isTypeSupported(C.TRACK_TYPE_VIDEO, true) ? 1 : 2;
+                        // 自适应码流（HLS 多档位）起播常在低档位，按清单里的最高档位记录线路分辨率
+                        for (Tracks.Group g : tracks.getGroups()) {
+                            if (g.getType() != C.TRACK_TYPE_VIDEO) continue;
+                            for (int i = 0; i < g.length; i++) {
+                                if (!g.isTrackSupported(i, true)) continue;
+                                Format f = g.getTrackFormat(i);
+                                if (f.width <= 0 || f.height <= 0) continue;
+                                float par = f.pixelWidthHeightRatio > 0 ? f.pixelWidthHeightRatio : 1f;
+                                noteResolution((int) (f.width * par), f.height);
+                            }
                         }
                     }
 
@@ -1703,6 +1796,11 @@ public class LivePlayActivity extends AppCompatActivity {
      * 若一圈下来都没有合法源则返回 false。
      */
     private boolean advanceToNextPlayableSource(LiveChannel channel) {
+        return advanceToNextPlayableSource(channel, false);
+    }
+
+    /** @param skipBlack 同时跳过播放时被标记为黑屏的线路 */
+    private boolean advanceToNextPlayableSource(LiveChannel channel, boolean skipBlack) {
         if (channel == null || channel.getSourceCount() <= 0) return false;
         int total = channel.getSourceCount();
         for (int i = 0; i < total; i++) {
@@ -1711,7 +1809,7 @@ public class LivePlayActivity extends AppCompatActivity {
                 channel.setSourceIndex(0);
             }
             String u = channel.getCurrentSourceUrl();
-            if (isPlayableUrl(u)) return true;
+            if (isPlayableUrl(u) && (!skipBlack || !LineQuality.isMarkedBlack(u))) return true;
         }
         return false;
     }
@@ -1751,6 +1849,226 @@ public class LivePlayActivity extends AppCompatActivity {
         } catch (Throwable t) {
             Timber.w(t, "显示线路超时弹窗失败");
         }
+    }
+
+    // ============ 黑屏检测与分辨率记录 ============
+
+    /** 记录本次起播观察到的画面尺寸（只记最高的一次），供测速结束时按分辨率剔除线路 */
+    private void noteResolution(int width, int height) {
+        if (width <= 0 || height <= 0 || currentPlayUrl == null) return;
+        int eq = LineQuality.equivalentHeight(width, height);
+        if (eq <= recordedHeight) return;
+        recordedHeight = eq;
+        LineQuality.recordResolution(currentPlayUrl, width, height);
+    }
+
+    /** 取消本次起播的黑屏检测并清空状态（换源 / 起播 / 释放播放器 / 进入后台时调用） */
+    private void resetBlackCheck() {
+        if (handler != null) {
+            handler.removeCallbacks(noFrameCheck);
+            handler.removeCallbacks(frameSampleTask);
+        }
+        blackCheckGen = -1;
+        firstFrameRendered = false;
+        videoTrackState = 0;
+        blackSampleCount = 0;
+        blackCheckDone = false;
+        recordedHeight = 0;
+    }
+
+    /** 当前起播是否需要做黑屏检测：关闭了过滤、广播类频道、后台时不做 */
+    private boolean blackCheckAllowed() {
+        if (blackCheckDone || !started || !isAlive() || exoPlayer == null
+                || handler == null || currentPlayUrl == null) return false;
+        if (!LineQuality.filterBlackEnabled()) return false;
+        return !LineQuality.isAudioChannel(channelManager.getCurrentChannel());
+    }
+
+    /** STATE_READY：每代起播只安排一次检测 */
+    private void onReadyForBlackCheck() {
+        if (blackCheckGen == playGen) return;
+        blackCheckGen = playGen;
+        if (!blackCheckAllowed()) return;
+        handler.removeCallbacks(noFrameCheck);
+        handler.postDelayed(noFrameCheck, BLACK_NO_FRAME_MS);
+        // 首帧通常在 READY 之前就已渲染
+        if (firstFrameRendered) scheduleFrameSample(BLACK_FIRST_SAMPLE_MS);
+    }
+
+    /** READY 后一段时间：没有视频轨或始终没出首帧，判为黑屏 */
+    private void checkNoFrame() {
+        if (!blackCheckAllowed()) return;
+        if (exoPlayer.getPlaybackState() != Player.STATE_READY) {
+            // 正在缓冲：卡顿不算黑屏，恢复播放后再判断
+            handler.postDelayed(noFrameCheck, BLACK_SAMPLE_INTERVAL_MS);
+            return;
+        }
+        if (videoTrackState == 2) {
+            onBlackDetected("无视频轨");
+        } else if (!firstFrameRendered) {
+            onBlackDetected("无画面");
+        } else if (!frameSamplingUsable()) {
+            // 已出首帧且有视频轨：本机截图无法确认画面，旧标记只可能来自首帧检测，据此清除
+            LineQuality.clearBlack(currentPlayUrl);
+        }
+    }
+
+    private void scheduleFrameSample(long delayMs) {
+        if (!blackCheckAllowed()) return;
+        handler.removeCallbacks(frameSampleTask);
+        handler.postDelayed(frameSampleTask, delayMs);
+    }
+
+    /** 本机能否靠截图确认画面（能则由 onFrameSampled 负责清除黑屏标记） */
+    private boolean frameSamplingUsable() {
+        if (!Hawk.get(KEY_FRAME_SAMPLE_OK, false)) return false;
+        View v = playerView != null ? playerView.getVideoSurfaceView() : null;
+        return v instanceof TextureView || (v instanceof SurfaceView && Build.VERSION.SDK_INT >= 24);
+    }
+
+    /** 截一张缩略图判断画面是否全黑：SurfaceView 用 PixelCopy（API 24+），TextureView 直接取位图 */
+    private void sampleFrame() {
+        if (!blackCheckAllowed() || playerView == null) return;
+        // 上一代起播的截图请求还没返回，或正在缓冲：稍后再采
+        if (frameCopyPending || exoPlayer.getPlaybackState() != Player.STATE_READY) {
+            scheduleFrameSample(BLACK_SAMPLE_INTERVAL_MS);
+            return;
+        }
+        View v = playerView.getVideoSurfaceView();
+        try {
+            if (frameSample == null) {
+                frameSample = Bitmap.createBitmap(SAMPLE_W, SAMPLE_H, Bitmap.Config.ARGB_8888);
+                framePixels = new int[SAMPLE_W * SAMPLE_H];
+            }
+            if (v instanceof TextureView) {
+                TextureView tv = (TextureView) v;
+                if (!tv.isAvailable()) {
+                    scheduleFrameSample(BLACK_SAMPLE_INTERVAL_MS);
+                    return;
+                }
+                tv.getBitmap(frameSample);
+                onFrameSampled(isSampleBlack());
+            } else if (v instanceof SurfaceView && Build.VERSION.SDK_INT >= 24) {
+                requestPixelCopy((SurfaceView) v);
+            }
+            // 其他情况（API 24 以下的 SurfaceView）无法截图，只靠首帧检测
+        } catch (Throwable t) {
+            // Surface 已失效等（IllegalArgumentException）：本次起播放弃截图判断
+            frameCopyPending = false;
+            Timber.w(t, "画面采样失败");
+        }
+    }
+
+    @RequiresApi(24)
+    private void requestPixelCopy(SurfaceView sv) {
+        Surface surface = sv.getHolder().getSurface();
+        if (surface == null || !surface.isValid()) {
+            scheduleFrameSample(BLACK_SAMPLE_INTERVAL_MS);
+            return;
+        }
+        final int gen = playGen;
+        final Bitmap target = frameSample;
+        frameCopyPending = true;
+        PixelCopy.request(sv, target, result -> {
+            frameCopyPending = false;
+            // 期间已换源 / 释放：结果作废
+            if (gen != playGen || frameSample != target || !isAlive()) {
+                if (frameSample != target && !target.isRecycled()) target.recycle();
+                return;
+            }
+            // 截图失败（如 Surface 尚无内容）视为未知，本次起播不再采样
+            if (result != PixelCopy.SUCCESS) return;
+            onFrameSampled(isSampleBlack());
+        }, handler);
+    }
+
+    /** 采样图中每个像素的亮度都很低即视为全黑 */
+    private boolean isSampleBlack() {
+        frameSample.getPixels(framePixels, 0, SAMPLE_W, 0, 0, SAMPLE_W, SAMPLE_H);
+        for (int c : framePixels) {
+            int luma = (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000;
+            if (luma >= BLACK_LUMA_MAX) return false;
+        }
+        return true;
+    }
+
+    private void onFrameSampled(boolean black) {
+        if (!blackCheckAllowed()) return;
+        if (!black) {
+            // 有正常画面：清除这条线路的旧黑屏标记，本次起播不再采样
+            blackCheckDone = true;
+            LineQuality.clearBlack(currentPlayUrl);
+            if (!Hawk.get(KEY_FRAME_SAMPLE_OK, false)) Hawk.put(KEY_FRAME_SAMPLE_OK, true);
+            return;
+        }
+        blackSampleCount++;
+        if (blackSampleCount < BLACK_SAMPLES_NEEDED) {
+            scheduleFrameSample(BLACK_SAMPLE_INTERVAL_MS);
+            return;
+        }
+        if (!Hawk.get(KEY_FRAME_SAMPLE_OK, false)) {
+            // 本机还没截到过正常画面，截图结果不可信（可能是硬件叠加层），不据此判黑屏
+            blackCheckDone = true;
+            RunLog.i("画面采样全黑，但本机截图未经确认，不判黑屏: " + logUrl(currentPlayUrl));
+            return;
+        }
+        onBlackDetected("画面全黑");
+    }
+
+    /** 确认黑屏：标记线路（测速结束时据此剔除），有其他线路则换过去，否则继续播放（可能只有声音） */
+    private void onBlackDetected(String reason) {
+        blackCheckDone = true;
+        if (handler != null) {
+            handler.removeCallbacks(noFrameCheck);
+            handler.removeCallbacks(frameSampleTask);
+        }
+        String url = currentPlayUrl;
+        LineQuality.markBlack(url);
+        LiveChannel channel = channelManager.getCurrentChannel();
+        RunLog.i("黑屏(" + reason + "): " + (channel != null ? channel.getChannelName() : "")
+                + " " + logUrl(url));
+        postBlackFailover();
+    }
+
+    /**
+     * 黑屏换源：与播放失败共用 sourceTryCount 上限，但不等网络、不弹"全部失败"，
+     * 也不先原线路重连；只换到未被标记黑屏的线路，没有就继续播当前线路，不会来回循环。
+     */
+    private void postBlackFailover() {
+        if (!isAlive() || handler == null) return;
+        final int gen = playGen;
+        handler.post(() -> {
+            if (!isAlive() || !started || gen != playGen) return;
+            LiveChannel channel = channelManager.getCurrentChannel();
+            if (channel == null || currentPlayUrl == null) return;
+            channel.syncSourceIndexTo(currentPlayUrl);
+            int total = channel.getSourceCount();
+            boolean hasOther = false;
+            List<String> urls = channel.getSourceUrls();
+            if (urls != null) {
+                for (String u : urls) {
+                    if (u != null && !u.equals(currentPlayUrl) && isPlayableUrl(u)
+                            && !LineQuality.isMarkedBlack(u)) {
+                        hasOther = true;
+                        break;
+                    }
+                }
+            }
+            if (!hasOther || sourceTryCount + 1 >= total || !isNetworkConnected()) {
+                RunLog.i("黑屏但无其他可换线路，继续播放: " + channel.getChannelName());
+                return;
+            }
+            handler.removeCallbacks(stablePlayResetRunnable);
+            // 黑屏不是断流，原线路重连没有意义
+            reconnectSameSourceOnce = false;
+            sourceTryCount++;
+            if (advanceToNextPlayableSource(channel, true)) {
+                ToastUtil.show(this, "画面黑屏，切换线路 " + (channel.getSourceIndex() + 1) + "/" + total);
+                initPlayer(channel.getCurrentSourceUrl());
+            } else {
+                channel.syncSourceIndexTo(currentPlayUrl);
+            }
+        });
     }
 
     // 缩放模式（与设置页下拉框顺序一致：自适应 / 填充 / 16:9 / 4:3 / 原始）
@@ -1837,6 +2155,7 @@ public class LivePlayActivity extends AppCompatActivity {
     }
 
     private void releasePlayer() {
+        resetBlackCheck();
         currentPlayUrl = null;
         LiveChannel.setPlayingHint(null, null);
         if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);

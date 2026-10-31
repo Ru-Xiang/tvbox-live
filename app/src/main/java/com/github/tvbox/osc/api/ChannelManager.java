@@ -8,6 +8,7 @@ import com.github.tvbox.osc.bean.SpeedTestResult;
 import com.github.tvbox.osc.cache.LiveChannelDatabase;
 import com.github.tvbox.osc.service.SpeedTestEngine;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.LineQuality;
 import com.github.tvbox.osc.util.StreamUrl;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
@@ -1295,6 +1296,7 @@ public class ChannelManager {
      * - 有任意线路未测（无记录 / 被配额截断 / 早于最近一轮的旧结果 / 断网轮次的失败） → 视为可播：
      *   原先只要测过的线路都失败就隐藏，配额外从未测过、可能可用的线路被一并丢掉；
      * - 用户置顶的线路 → 视为可播（用户确认能播，测速可能因缺 UA/Referer 误判）；
+     * - 黑屏线路不算失败：只剩黑屏线路的频道仍然显示（选线时排在最后兜底）；
      * - 只有全部线路都在最近一轮明确测速失败 → 不可播。
      */
     private boolean hasPlayableSource(LiveChannel channel, long roundStart, long abortedAt) {
@@ -1461,7 +1463,7 @@ public class ChannelManager {
 
     /**
      * 按测速缓存结果重排 rawGroups 中每个频道的线路：
-     * 测速可用的在前（按综合评分或速度，与测速排序模式一致），未测过的居中，测速失败的最后。
+     * 测速可用的在前（按综合评分或速度，与测速排序模式一致），未测过的居中，黑屏线路其次，测速失败的最后。
      * 稳定排序，同档保持原顺序。用户关闭"测速后排序线路"时不做处理（与测速引擎一致）。
      */
     private synchronized void reorderRawByCachedResults() {
@@ -1478,19 +1480,25 @@ public class ChannelManager {
                 List<String> urls = ch.getSourceUrls();
                 if (urls == null || urls.size() < 2) continue;
                 final int n = urls.size();
-                final int[] tier = new int[n];      // 0 可用 / 1 未测(含无法测速、旧结果) / 2 测速失败
+                // 0 可用 / 1 未测(含无法测速、旧结果) / 2 黑屏 / 3 测速失败
+                final int[] tier = new int[n];
                 final SpeedTestResult[] res = new SpeedTestResult[n]; // 可用线路的测速结果
+                // 广播/电台类频道本来没有画面，不按黑屏处理
+                final boolean audio = LineQuality.isAudioChannel(ch);
                 for (int i = 0; i < n; i++) {
-                    int st = lineStatus(urls.get(i), roundStart, abortedAt);
+                    String url = urls.get(i);
+                    int st = lineStatus(url, roundStart, abortedAt);
                     if (st == ST_OK) {
                         tier[i] = 0;
-                        res[i] = speedTestEngine.getCachedResult(urls.get(i));
+                        res[i] = speedTestEngine.getCachedResult(url);
                         if (res[i] == null) tier[i] = 1; // 读取间隙被清缓存
                     } else if (st == ST_FAILED) {
-                        tier[i] = 2;
+                        tier[i] = 3;
                     } else {
                         tier[i] = 1;
                     }
+                    // 黑屏线路与失败线路一样排到后面（排在失败线路之前，没有别的线路时仍可兜底）
+                    if (tier[i] < 2 && !audio && LineQuality.isBlackLine(url, res[i])) tier[i] = 2;
                 }
                 List<Integer> order = new ArrayList<>(n);
                 for (int i = 0; i < n; i++) order.add(i);
@@ -1663,7 +1671,8 @@ public class ChannelManager {
 
     /**
      * 列表在测速中途被替换时，按 URL 把本轮结果补用到当前 rawGroups：
-     * 剔除本轮明确失败的线路（与测速引擎同一规则：全部失败时保留；置顶线路不剔除），
+     * 剔除本轮明确失败的线路（与测速引擎同一规则：全部失败时保留；置顶线路不剔除）
+     * 及黑屏 / 低分辨率线路（见 {@link #removeLowQualitySources}），
      * 并写入各线路速度与频道最佳速度/评分/分辨率。
      */
     private void applyRoundResultsByUrl(long roundStart) {
@@ -1703,6 +1712,8 @@ public class ChannelManager {
                             for (String url : toRemove) ch.removeSource(url);
                         }
                     }
+                    // 画质过滤（黑屏 / 低分辨率）有各自的开关，不受"过滤不可用线路"影响
+                    removeLowQualitySources(ch, roundStart);
                     urls = ch.getSourceUrls();
                     List<Double> speeds = new ArrayList<>(urls.size());
                     List<Double> oldSpeeds = ch.getSpeeds();
@@ -1733,6 +1744,50 @@ public class ChannelManager {
                 }
             }
         }
+    }
+
+    /**
+     * 剔除黑屏 / 低分辨率线路（与测速引擎同一规则，调用方持有频道锁）：
+     * 只判断本轮测得可用的线路；本轮测得不可用的不判断、也不算正常线路；未测/不可测速/旧结果不判断；
+     * 置顶线路不合格时计入不合格（不算正常线路），但不删除；
+     * 广播/电台类频道不判断；分辨率未知不算低分辨率；
+     * 频道里须至少留下一条本轮实测可用且画质合格的线路，否则一条都不按画质删。
+     */
+    private void removeLowQualitySources(LiveChannel ch, long roundStart) {
+        if (!LineQuality.filterBlackEnabled() && LineQuality.minHeight() <= 0) return;
+        if (LineQuality.isAudioChannel(ch)) return;
+        List<String> urls = ch.getSourceUrls();
+        if (urls == null || urls.isEmpty()) return;
+        String pinned = pinnedUrl(ch);
+        List<String> lowQuality = new ArrayList<>();
+        int good = 0;
+        for (String url : urls) {
+            if (url == null) continue;
+            // 与引擎同一口径：只判断本轮测得可用的线路
+            if (lineStatus(url, roundStart, 0L) != ST_OK) continue;
+            SpeedTestResult r = speedTestEngine.getCachedResult(url);
+            if (LineQuality.isBlackLine(url, r) || LineQuality.isLowResolution(url, r)) {
+                // 置顶线路也计入不合格（不算正常线路），删除时再跳过
+                lowQuality.add(url);
+            } else {
+                good++;   // 本轮实测可用且画质合格
+            }
+        }
+        if (lowQuality.isEmpty()) return;
+        if (good == 0) {
+            Timber.w("频道 %s 没有本轮实测可用且画质合格的线路，保留黑屏/低分辨率线路", ch.getChannelName());
+            return;
+        }
+        int black = 0, low = 0;
+        for (String url : lowQuality) {
+            if (url.equals(pinned)) continue;   // 置顶线路不删
+            boolean isBlack = LineQuality.isBlackLine(url, speedTestEngine.getCachedResult(url));
+            if (ch.removeSource(url)) {
+                if (isBlack) black++;
+                else low++;
+            }
+        }
+        if (black + low > 0) Timber.d("频道 %s 移除黑屏线路 %d 条、低分辨率线路 %d 条", ch.getChannelName(), black, low);
     }
 
     /**
@@ -1923,7 +1978,8 @@ public class ChannelManager {
      *
      * <p>没有可用线路时依次回退：无法测速的协议线路（RTSP/RTMP）→ 未测线路
      * （无记录、被单轮配额截断、早于本轮的旧结果、断网轮次的失败；取列表中第一条，
-     * 重排后未测线路排在失败线路之前）→ 用户置顶线路。
+     * 重排后未测线路排在失败线路之前）→ 黑屏线路（测速无视频轨或播放时标记黑屏；
+     * 广播/电台类频道不按黑屏处理）→ 用户置顶线路。
      * <b>只有全部线路都在本轮明确失败时返回 null</b>，由调用方把该频道从节目列表中剔除，
      * 避免用户点进去只能黑屏/转圈。原先只要测过的线路都失败就剔除整个频道，
      * 配额外从未测过、可能可用的线路被一并丢掉。
@@ -1936,13 +1992,24 @@ public class ChannelManager {
         SpeedTestResult best = null;
         String untestableUrl = null;    // 无法测速但可能可播的线路（RTSP/RTMP）
         String untestedUrl = null;      // 本轮未测到的线路
+        String blackUrl = null;         // 黑屏线路（能连上但没画面），最后才用
+        // 广播/电台类频道本来没有画面，不按黑屏处理
+        final boolean audio = LineQuality.isAudioChannel(channel);
 
         for (String url : urls) {
             int st = lineStatus(url, roundStart, abortedAt);
             if (st == ST_OK) {
                 SpeedTestResult r = speedTestEngine.getCachedResult(url);
                 if (r == null) {
-                    if (untestedUrl == null) untestedUrl = url;
+                    if (!audio && LineQuality.isBlackLine(url, null)) {
+                        if (blackUrl == null) blackUrl = url;
+                    } else if (untestedUrl == null) {
+                        untestedUrl = url;
+                    }
+                    continue;
+                }
+                if (!audio && LineQuality.isBlackLine(url, r)) {
+                    if (blackUrl == null) blackUrl = url;
                     continue;
                 }
                 // 严格更优才替换：完全相同时保留列表中靠前的一条，与稳定排序一致
@@ -1950,10 +2017,15 @@ public class ChannelManager {
                     best = r;
                     bestUrl = url;
                 }
-            } else if (st == ST_UNTESTABLE) {
-                if (untestableUrl == null) untestableUrl = url;
-            } else if (st == ST_UNTESTED) {
-                if (untestedUrl == null) untestedUrl = url;
+            } else if (st == ST_UNTESTABLE || st == ST_UNTESTED) {
+                if (!audio && LineQuality.isBlackLine(url, null)) {
+                    // 播放时被标记为黑屏
+                    if (blackUrl == null) blackUrl = url;
+                } else if (st == ST_UNTESTABLE) {
+                    if (untestableUrl == null) untestableUrl = url;
+                } else if (untestedUrl == null) {
+                    untestedUrl = url;
+                }
             }
         }
 
@@ -1962,6 +2034,8 @@ public class ChannelManager {
         if (untestableUrl != null) return untestableUrl;
         // 有本轮未测到的线路 → 保留它，避免误删
         if (untestedUrl != null) return untestedUrl;
+        // 只剩黑屏线路 → 仍然保留（可能只是暂时没画面），不因此隐藏频道
+        if (blackUrl != null) return blackUrl;
         // 用户置顶的线路（用户确认能播）→ 保留
         String pinned = pinnedUrl(channel);
         if (pinned != null && urls.contains(pinned)) return pinned;

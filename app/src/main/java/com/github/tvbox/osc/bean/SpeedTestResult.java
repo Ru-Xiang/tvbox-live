@@ -63,6 +63,17 @@ public class SpeedTestResult implements Serializable {
      */
     private boolean hls;
 
+    /** 测速时探测到的视频轨情况：VIDEO_UNKNOWN / VIDEO_PRESENT / VIDEO_MISSING（只有音频） */
+    private int videoState;
+    public static final int VIDEO_UNKNOWN = 0;
+    public static final int VIDEO_PRESENT = 1;
+    public static final int VIDEO_MISSING = 2;
+
+    public int getVideoState() { return videoState; }
+    public void setVideoState(int videoState) { this.videoState = videoState; }
+    /** 测速确认这条线路没有视频轨（只有声音，播放时黑屏） */
+    public boolean isVideoMissing() { return videoState == VIDEO_MISSING; }
+
     public SpeedTestResult() {
         this.testTime = System.currentTimeMillis();
         this.status = 0;
