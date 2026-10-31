@@ -188,6 +188,22 @@ public class BackgroundSpeedTestService extends Service {
         }
     }
 
+    /**
+     * 单个频道测速完成事件：该频道的测速值与线路排序已更新，界面可只刷新这一个频道。
+     * channel 与展示列表共用同一对象（展示分组按引用持有原始频道）。
+     */
+    public static class SpeedTestChannelEvent {
+        public final LiveChannel channel;
+        public final int completedChannels;
+        public final int totalChannels;
+
+        public SpeedTestChannelEvent(LiveChannel channel, int completedChannels, int totalChannels) {
+            this.channel = channel;
+            this.completedChannels = completedChannels;
+            this.totalChannels = totalChannels;
+        }
+    }
+
     /** 测速错误事件 */
     public static class SpeedTestErrorEvent {
         public final String errorMsg;
@@ -557,6 +573,13 @@ public class BackgroundSpeedTestService extends Service {
             }
 
             @Override
+            public void onChannelComplete(LiveChannel channel, int completedChannels, int totalChannels) {
+                // 已取消/已被本服务的新一轮接管：旧一轮的迟到结果不再广播
+                if (activeCallback != this) return;
+                postSpeedTestEvent(new SpeedTestChannelEvent(channel, completedChannels, totalChannels));
+            }
+
+            @Override
             public void onCancelled(int completed, int total) {
                 boolean mine = finishActive(this);
                 if (!mine && activeCallback != null) {
@@ -795,6 +818,12 @@ public class BackgroundSpeedTestService extends Service {
             }
 
             @Override
+            public void onChannelComplete(LiveChannel channel, int completedChannels, int totalChannels) {
+                if (inProcessCallback != this) return;
+                postSpeedTestEvent(new SpeedTestChannelEvent(channel, completedChannels, totalChannels));
+            }
+
+            @Override
             public void onCancelled(int completed, int total) {
                 SpeedTestEngine.SpeedTestCallback latest = inProcessCallback;
                 if (latest != null && latest != this) {
@@ -827,7 +856,8 @@ public class BackgroundSpeedTestService extends Service {
 
     /** 测速事件统一出口：先更新忙闲状态再广播，保证订阅方收到事件时 isBusy() 已是最新值 */
     private static void postSpeedTestEvent(Object event) {
-        if (event instanceof SpeedTestPrepareEvent || event instanceof SpeedTestProgressEvent) {
+        if (event instanceof SpeedTestPrepareEvent || event instanceof SpeedTestProgressEvent
+                || event instanceof SpeedTestChannelEvent) {
             sBusy = true;
         } else if (event instanceof SpeedTestCompleteEvent || event instanceof SpeedTestErrorEvent) {
             sBusy = false;

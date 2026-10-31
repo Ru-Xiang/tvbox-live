@@ -796,6 +796,25 @@ public class ChannelManager {
                     }
                 }
             }
+            // 再按频道 key（分组+名称）匹配：列表被刷新替换后旧对象应落回同一分组的新对象，
+            // 不能直接按名称跨分组匹配到别的分组里的同名频道（与 relocateCurrent 的顺序一致）
+            String key = target.getKey();
+            if (key != null) {
+                for (int g = 0; g < groups.size(); g++) {
+                    ChannelGroup group = groups.get(g);
+                    if (group == null || group.getChannels() == null) continue;
+                    List<LiveChannel> chs = group.getChannels();
+                    for (int c = 0; c < chs.size(); c++) {
+                        LiveChannel ch = chs.get(c);
+                        if (ch != null && key.equals(ch.getKey())) {
+                            currentGroupIndex = g;
+                            currentChannelIndex = c;
+                            saveLastChannel(ch);
+                            return true;
+                        }
+                    }
+                }
+            }
             String name = target.getChannelName();
             if (name != null) {
                 for (int g = 0; g < groups.size(); g++) {

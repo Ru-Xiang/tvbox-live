@@ -130,6 +130,9 @@ public class LiveSettingsActivity extends AppCompatActivity {
     private long speedTestStartLastTime = -1L;
     /** 最近一次收到测速相关事件（或点击测速）的时刻（elapsedRealtime），用于兜底判断准备阶段失败 */
     private long speedTestLastEventAt = 0L;
+    /** 本轮已测完 / 共需测速的频道数（0 表示尚未收到逐频道完成事件） */
+    private int speedTestChannelsDone = 0;
+    private int speedTestChannelsTotal = 0;
     /**
      * 引擎未运行且超过该时长没有任何测速事件，视为本轮已结束（多为准备阶段失败、错误事件在停止期间丢失）。
      * 若实际仍在拉取线路，后续准备/进度事件会重新显示进度条，误收起无副作用。
@@ -1098,6 +1101,8 @@ public class LiveSettingsActivity extends AppCompatActivity {
         // 准备事件可能来自其他页面发起的测速，同样登记本轮起点（准备阶段内上次测速时间不变，重复登记无害）
         markSpeedTestStarted();
         speedTestInTestPhase = false;
+        speedTestChannelsDone = 0;
+        speedTestChannelsTotal = 0;
         if (speedTestBar != null) speedTestBar.setVisibility(View.VISIBLE);
         if (speedTestProgress != null) {
             if (event.total > 0) {
@@ -1133,10 +1138,22 @@ public class LiveSettingsActivity extends AppCompatActivity {
         }
         if (tvSpeedTestInfo != null) {
             int percent = event.total > 0 ? event.current * 100 / event.total : 0;
-            tvSpeedTestInfo.setText(String.format(java.util.Locale.CHINA, "测速 %d%% (%d/%d) %s",
-                    percent, event.current, event.total,
+            String channels = speedTestChannelsTotal > 0
+                    ? String.format(java.util.Locale.CHINA, " · 频道 %d/%d",
+                    speedTestChannelsDone, speedTestChannelsTotal)
+                    : "";
+            tvSpeedTestInfo.setText(String.format(java.util.Locale.CHINA, "测速 %d%% (%d/%d)%s %s",
+                    percent, event.current, event.total, channels,
                     event.channelName != null ? event.channelName : ""));
         }
+    }
+
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onSpeedTestChannel(BackgroundSpeedTestService.SpeedTestChannelEvent event) {
+        if (isFinishing() || isDestroyed() || event == null) return;
+        speedTestLastEventAt = SystemClock.elapsedRealtime();
+        speedTestChannelsDone = Math.max(speedTestChannelsDone, event.completedChannels);
+        speedTestChannelsTotal = event.totalChannels;
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN)

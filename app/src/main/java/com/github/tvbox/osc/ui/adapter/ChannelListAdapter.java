@@ -126,6 +126,27 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
         }
     }
 
+    /**
+     * 某个频道的数据（测速值/线路数）在原地更新后只刷新它所在的条目；不在当前列表中则忽略。
+     * 按对象身份匹配：展示列表按引用持有频道。同样避开布局/滚动期。
+     */
+    public void notifyChannelUpdated(LiveChannel channel) {
+        if (channel == null) return;
+        if (isBusy()) {
+            attachedView.post(() -> notifyChannelUpdated(channel));
+            return;
+        }
+        for (int i = 0; i < channels.size(); i++) {
+            if (channels.get(i) == channel) {
+                try {
+                    notifyItemChanged(i);
+                } catch (Exception ignore) {
+                }
+                return;
+            }
+        }
+    }
+
     public LiveChannel getItem(int position) {
         if (position < 0 || position >= channels.size()) return null;
         return channels.get(position);

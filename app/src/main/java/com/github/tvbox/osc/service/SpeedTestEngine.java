@@ -173,6 +173,12 @@ public class SpeedTestEngine {
         void onProgress(int current, int total, String currentChannel);
         /** 测速被取消 */
         void onCancelled(int completed, int total);
+        /**
+         * 一个频道的线路全部测完：该频道的测速值、最佳指标与线路排序已按本轮结果更新，可立即刷新界面。
+         * 本轮不可用线路的剔除仍在整轮结束后统一进行（需要整轮结果判断是否断网）。
+         * 在测速线程上回调；本轮已取消/已收尾后不再回调。
+         */
+        default void onChannelComplete(LiveChannel channel, int completedChannels, int totalChannels) {}
     }
 
     private SpeedTestEngine() {
@@ -582,20 +588,32 @@ public class SpeedTestEngine {
         // 保证每个频道至少测1 条，不会整段跳过后面的频道。
         int channelCount = channels.size();
         int perChannel = Math.max(1, MAX_TEST_LINES / Math.max(1, channelCount));
+        // 任务按频道顺序排列，线程池先进先出：总是先测排在前面的频道，
+        // 每个频道的线路全部测完即单独更新该频道（见 onChannelTaskDone），不必等整轮结束
         List<SpeedTestTask> tasks = new ArrayList<>();
+        // 同一频道对象在列表里重复出现时共用一个计数，避免提前判定"已测完"
+        java.util.IdentityHashMap<LiveChannel, ChannelTracker> trackers = new java.util.IdentityHashMap<>();
         for (LiveChannel channel : channels) {
             if (channel == null) continue;
             // 取一次线路列表快照，避免 size 与 get 之间列表被替换/修改
             List<String> sourceUrls = channel.getSourceUrls();
             if (sourceUrls == null) continue;
             int size = Math.min(sourceUrls.size(), perChannel);
+            ChannelTracker tracker = trackers.get(channel);
             for (int i = 0; i < size; i++) {
                 String url = sourceUrls.get(i);
                 if (url != null && !url.isEmpty()) {
-                    tasks.add(new SpeedTestTask(channel, url, i));
+                    if (tracker == null) {
+                        tracker = new ChannelTracker();
+                        trackers.put(channel, tracker);
+                    }
+                    tracker.remaining.incrementAndGet();
+                    tasks.add(new SpeedTestTask(channel, url, i, tracker));
                 }
             }
         }
+        final int channelTotal = trackers.size();
+        final AtomicInteger channelsDone = new AtomicInteger(0);
 
         final int totalCount = tasks.size();
         round.total = totalCount;
@@ -631,6 +649,10 @@ public class SpeedTestEngine {
         long perAttemptMs = Math.max(2, timeout) * 1000L + WATCHDOG_GRACE_MS + 2000L;
         final long awaitMs = Math.max(((long) timeout * (MAX_SEGMENT_SAMPLE + 1) + 10) * 1000L,
                 (retryCfg + 1) * perAttemptMs + 5000L);
+
+        // 排序配置整轮只读一次：逐频道更新与整轮收尾使用同一口径
+        final boolean sortSources = Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true);
+        final int sortMode = Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE);
 
         Thread runner = new Thread(() -> {
             long startTime = System.currentTimeMillis();
@@ -711,6 +733,8 @@ public class SpeedTestEngine {
                                     Timber.w(ex, "测速回调异常");
                                 }
                             }
+                            onChannelTaskDone(task, round, startTime, sortSources, sortMode,
+                                    channelsDone, channelTotal);
                         } catch (Throwable t) {
                             // 兜底：包含 OOM / VirtualMachineError 也不让线程池挂掉
                             Timber.e(t, "测速任务未捕获异常: %s", task.url);
@@ -724,6 +748,11 @@ public class SpeedTestEngine {
                                             task.channel != null ? task.channel.getChannelName() : "");
                                 } catch (Exception ignore) {}
                             }
+                            // 异常的线路也算测完：否则该频道永远等不到"全部测完"，要到整轮结束才更新
+                            try {
+                                onChannelTaskDone(task, round, startTime, sortSources, sortMode,
+                                        channelsDone, channelTotal);
+                            } catch (Throwable ignore) {}
                         }
                     });
                     futures.add(future);
@@ -767,21 +796,13 @@ public class SpeedTestEngine {
                 // 既让本线程尽快结束，也避免与新一轮同时改动频道线路
                 if (!round.superseded) {
                     // 更新频道的最佳速度/评分/分辨率，并按配置模式排序
-                    boolean sortSources = Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true);
-                    int sortMode = Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE);
+                    // （各频道测完时已各自更新过一次；剔除不可用线路后需按剩余线路重算）
                     boolean filterUnavailable = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
                     for (LiveChannel channel : channels) {
                         if (filterUnavailable && !downRound) {
                             try { removeUnavailableSources(channel, startTime, channelManager); } catch (Exception ignore) {}
                         }
-                        updateChannelBestMetrics(channel, startTime);
-                        if (sortSources) {
-                            if (sortMode == HawkConfig.SORT_MODE_QUALITY_SCORE) {
-                                sortChannelByScores(channel, startTime);
-                            } else {
-                                channel.sortSourcesBySpeed();
-                            }
-                        }
+                        applyChannelResults(channel, startTime, sortSources, sortMode);
                         channel.setLastSpeedTestTime(System.currentTimeMillis());
                     }
                 }
@@ -1985,6 +2006,49 @@ public class SpeedTestEngine {
         channel.sortSourcesByScores(scores);
     }
 
+    /** 按本轮结果更新频道的最佳指标，并按配置模式重排线路（逐频道更新与整轮收尾共用） */
+    private void applyChannelResults(LiveChannel channel, long roundStart, boolean sortSources, int sortMode) {
+        if (channel == null) return;
+        updateChannelBestMetrics(channel, roundStart);
+        if (sortSources) {
+            if (sortMode == HawkConfig.SORT_MODE_QUALITY_SCORE) {
+                sortChannelByScores(channel, roundStart);
+            } else {
+                channel.sortSourcesBySpeed();
+            }
+        }
+    }
+
+    /**
+     * 一条线路测完（含异常）后调用：该频道本轮的线路全部测完时，立即按本轮结果更新这个频道并回调
+     * onChannelComplete，让界面逐个频道刷新，而不是整轮结束才一次性刷新。
+     * 本轮已取消/被顶替/进入收尾时不再更新：收尾会统一处理全部频道。
+     */
+    private void onChannelTaskDone(SpeedTestTask task, Round round, long roundStart,
+                                   boolean sortSources, int sortMode,
+                                   AtomicInteger channelsDone, int channelTotal) {
+        if (task.tracker == null || task.tracker.remaining.decrementAndGet() != 0) return;
+        if (round.cancelled.get() || round.superseded) return;
+        int done;
+        // 与收尾同锁：收尾开始（finished）后不再逐频道改动，避免与整轮剔除/排序交错
+        synchronized (round) {
+            if (round.finished) return;
+            try {
+                applyChannelResults(task.channel, roundStart, sortSources, sortMode);
+            } catch (Throwable t) {
+                Timber.w(t, "更新频道测速结果失败: %s", task.channel.getChannelName());
+            }
+            done = channelsDone.incrementAndGet();
+        }
+        SpeedTestCallback callback = round.callback;
+        if (callback == null || round.cancelled.get() || isFinished(round)) return;
+        try {
+            callback.onChannelComplete(task.channel, done, channelTotal);
+        } catch (Throwable t) {
+            Timber.w(t, "频道测速完成回调异常");
+        }
+    }
+
     /** 关闭指定轮次的线程池（只关自己那一轮的，绝不经共享字段关到别的轮次） */
     private static void shutdownPool(ExecutorService pool) {
         try {
@@ -2017,11 +2081,18 @@ public class SpeedTestEngine {
         final LiveChannel channel;
         final String url;
         final int sourceIndex;
+        final ChannelTracker tracker;
 
-        SpeedTestTask(LiveChannel channel, String url, int sourceIndex) {
+        SpeedTestTask(LiveChannel channel, String url, int sourceIndex, ChannelTracker tracker) {
             this.channel = channel;
             this.url = url;
             this.sourceIndex = sourceIndex;
+            this.tracker = tracker;
         }
+    }
+
+    /** 单个频道本轮尚未测完的线路数 */
+    private static final class ChannelTracker {
+        final AtomicInteger remaining = new AtomicInteger(0);
     }
 }

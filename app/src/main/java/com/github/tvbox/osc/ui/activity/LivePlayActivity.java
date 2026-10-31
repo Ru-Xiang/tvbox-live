@@ -41,6 +41,7 @@ import com.github.tvbox.osc.ui.dialog.EpgDialog;
 import com.github.tvbox.osc.ui.dialog.ScanConfigDialog;
 import com.github.tvbox.osc.util.ActivityCallbacks;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.RunLog;
 import com.github.tvbox.osc.util.StreamUrl;
 import com.google.android.exoplayer2.ExoPlayer;
 import com.google.android.exoplayer2.MediaItem;
@@ -183,6 +184,9 @@ public class LivePlayActivity extends AppCompatActivity {
     private boolean speedTestDecisionPending = false;
     /** 测速流程是否进行中（含准备/拉取列表阶段），用于降低 EPG 加载优先级 */
     private boolean speedTestActive = false;
+    /** 本轮已测完 / 共需测速的频道数（逐频道完成事件更新，用于进度文字；0 表示尚未收到） */
+    private int speedTestChannelsDone = 0;
+    private int speedTestChannelsTotal = 0;
     /** 测速流程开始时间（elapsedRealtime），用于超时兜底，避免 EPG 被永久阻塞 */
     private long speedTestActiveSince = 0L;
     /** 测速进行中时用于重试补拉 EPG 的 Runnable */
@@ -291,6 +295,22 @@ public class LivePlayActivity extends AppCompatActivity {
     private String currentPlayUrl;
     /** 当前播放项是否已按 HLS（显式 mime）加载；为 false 时容器无法识别会再按 HLS 重试一次 */
     private boolean currentItemAsHls;
+    /** 本次起播是否仅因测速缓存的"是 HLS"标记才按 HLS 加载（地址本身看不出是 HLS） */
+    private boolean currentItemHlsFromCache;
+    /** 按缓存 HLS 标记加载失败后，这条地址改按普通流重试，不再采用缓存标记 */
+    private String cacheHlsSuppressedUrl;
+    /**
+     * 起播代次：每次真正起播（setMediaSource）前递增。排队中的换源/超时回调带着发出时的代次，
+     * 代次已变（期间已换台/换源）则作废，避免上一个频道的失败把刚切到的频道换走线路
+     */
+    private int playGen;
+    /**
+     * 正在打开频道列表并定位到播放频道。期间分组列表的焦点变化（面板显示时系统自动把焦点给分组栏、
+     * RecyclerView 整表刷新后的焦点恢复会落到第 0 个分组）不得改动浏览分组，否则会定位到首个分组的首个频道
+     */
+    private boolean positioningList;
+    /** 解除 positioningList 的延时任务（持有引用以便重新打开/关闭列表时取消上一次的） */
+    private final Runnable clearPositioning = () -> positioningList = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -596,6 +616,11 @@ public class LivePlayActivity extends AppCompatActivity {
         channelAdapter = new ChannelListAdapter();
 
         groupAdapter.setOnGroupActionListener((position, group) -> {
+            if (positioningList) {
+                // 打开列表定位期间的自动焦点不是用户操作：保持分组高亮在正在定位的分组上
+                if (position != browsingGroupIndex) groupAdapter.setSelectedIndex(browsingGroupIndex);
+                return;
+            }
             // 焦点回到当前浏览的分组（如从频道列表按左键返回）时不重复刷新，
             // 否则频道列表整表重建、滚动位置被重置
             if (position == browsingGroupIndex && channelAdapter.getItemCount() > 0) return;
@@ -1087,7 +1112,16 @@ public class LivePlayActivity extends AppCompatActivity {
         // 关键：把"当前频道"同步到本次要播放的频道。
         // 否则从频道列表长按菜单（播放此线路/置顶）直接播放非当前频道时，
         // 后续播放超时换源、上下切源仍以旧的"当前频道"为准，会切走播成别的频道。
-        channelManager.syncCurrentTo(channel);
+        boolean synced = channelManager.syncCurrentTo(channel);
+        // 传入的可能是列表被刷新/重载替换前的旧对象（弹窗、长按菜单持有的引用）：
+        // 改为播放管理器现在指向的同一频道对象，否则换源/重排/高亮作用在两个不同对象上；
+        // 旧对象上选定的线路按 URL 带过去
+        LiveChannel resolved = synced ? channelManager.getCurrentChannel() : null;
+        if (resolved != null && resolved != channel) {
+            String chosen = channel.getCurrentSourceUrl();
+            if (chosen != null) resolved.syncSourceIndexTo(chosen);
+            channel = resolved;
+        }
 
         // 同步频道列表的"正在播放"高亮，避免菜单播放后标记停留在旧频道
         try {
@@ -1118,6 +1152,8 @@ public class LivePlayActivity extends AppCompatActivity {
         }
 
         Timber.d("播放频道: %s, 源: %s", channel.getChannelName(), url);
+        RunLog.i("换台: " + channel.getChannelName() + " 线路 " + (channel.getSourceIndex() + 1)
+                + "/" + channel.getSourceCount());
         // 用户主动切换频道：重置本频道的换源尝试计数和提醒状态
         sourceTryCount = 0;
         allSourcesTimeoutPrompted = false;
@@ -1178,7 +1214,7 @@ public class LivePlayActivity extends AppCompatActivity {
      * 依据：测速缓存标记为 HLS、路径以 .m3u8/.m3u 结尾、或查询串里带 m3u8（如 ?type=m3u8）。
      * 不按"没有扩展名"一律当 HLS：不少无扩展名的网关返回的是 FLV/TS，强制 HLS 反而播不了。
      */
-    private boolean shouldPlayAsHls(String rawUrl, Uri uri) {
+    private boolean shouldPlayAsHlsByUrl(Uri uri) {
         String scheme = uri.getScheme();
         if (scheme == null) return false;
         scheme = scheme.toLowerCase(java.util.Locale.ROOT);
@@ -1193,12 +1229,31 @@ public class LivePlayActivity extends AppCompatActivity {
         String query = uri.getEncodedQuery();
         if (query != null && query.toLowerCase(java.util.Locale.ROOT).contains("m3u8")
                 && !hasProgressiveExtension(p)) return true;
+        return false;
+    }
+
+    /** 测速按内容嗅探判为 HLS（只对 HTTP(S) 生效） */
+    private boolean isCachedHls(String rawUrl, Uri uri) {
+        String scheme = uri.getScheme();
+        if (scheme == null) return false;
+        scheme = scheme.toLowerCase(java.util.Locale.ROOT);
+        if (!scheme.equals("http") && !scheme.equals("https")) return false;
         try {
             SpeedTestResult r = speedTestEngine != null ? speedTestEngine.getCachedResult(rawUrl) : null;
-            if (r != null && r.isHls()) return true;
+            return r != null && r.isHls();
         } catch (Throwable ignore) {
+            return false;
         }
-        return false;
+    }
+
+    /** 运行日志里只记协议+主机+路径，去掉查询串（常含鉴权 token） */
+    private static String logUrl(String raw) {
+        try {
+            Uri u = Uri.parse(StreamUrl.playUrl(raw));
+            return u.getScheme() + "://" + u.getHost() + (u.getPath() != null ? u.getPath() : "");
+        } catch (Throwable t) {
+            return "?";
+        }
     }
 
     /** 路径末段带明确的普通文件流扩展名（.flv/.ts/.mp4 等） */
@@ -1375,6 +1430,7 @@ public class LivePlayActivity extends AppCompatActivity {
             return;
         }
         currentPlayUrl = url;
+        playGen++;
         // 告知 LiveChannel 当前实际播放的线路：测速排序/置顶重排时据此保持索引指向这条线路
         LiveChannel.setPlayingHint(channelManager.getCurrentChannel(), url);
         if (exoPlayer == null) {
@@ -1444,8 +1500,25 @@ public class LivePlayActivity extends AppCompatActivity {
                     @Override
                     public void onPlayerError(@NonNull PlaybackException error) {
                         Timber.w("播放出错: %s", error.getMessage());
+                        RunLog.i("播放出错: " + error.getErrorCodeName() + " " + logUrl(currentPlayUrl));
                         cancelPlayTimeout();
                         if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
+                        // 只因测速缓存标记才按 HLS 加载、却报清单/容器解析错误：缓存标记可能已过时
+                        // （或网关按请求头返回不同内容），按普通流重试同一地址一次再换源
+                        if (currentItemHlsFromCache && handler != null && currentPlayUrl != null
+                                && (error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_MALFORMED
+                                || error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+                                || error.errorCode == PlaybackException.ERROR_CODE_PARSING_MANIFEST_UNSUPPORTED)) {
+                            final String retryUrl = currentPlayUrl;
+                            cacheHlsSuppressedUrl = retryUrl;
+                            Timber.i("按测速缓存的 HLS 标记加载失败，改按普通流重试: %s", retryUrl);
+                            handler.post(() -> {
+                                if (!isAlive()) return;
+                                if (!retryUrl.equals(currentPlayUrl)) return;
+                                initPlayer(retryUrl, false);
+                            });
+                            return;
+                        }
                         // 未测速的无扩展名 HLS（如 tv.php?id=1）按普通流加载会报"容器无法识别"：
                         // 先按 HLS 重试同一地址一次，再失败才换源。同样异步执行，不在回调里同步重建。
                         if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
@@ -1482,8 +1555,12 @@ public class LivePlayActivity extends AppCompatActivity {
             // 规则与测速共用 StreamUrl，保证两边请求的是同一个地址。
             Uri uri = Uri.parse(StreamUrl.playUrl(url));
             // forceHls 同样只对 HTTP(S) 生效，与 shouldPlayAsHls 的协议限制一致
-            boolean asHls = (forceHls && isHttpPlayUrl(url)) || shouldPlayAsHls(url, uri);
+            boolean ruleHls = (forceHls && isHttpPlayUrl(url)) || shouldPlayAsHlsByUrl(uri);
+            boolean cacheHls = !ruleHls && !url.equals(cacheHlsSuppressedUrl) && isCachedHls(url, uri);
+            boolean asHls = ruleHls || cacheHls;
             currentItemAsHls = asHls;
+            currentItemHlsFromCache = cacheHls;
+            RunLog.i("起播: " + logUrl(url) + (asHls ? (cacheHls ? " [HLS/测速]" : " [HLS]") : ""));
             // 直播流设置目标偏移：播放点离直播边缘更远，可容忍更大的网络波动而不卡顿
             MediaItem.Builder itemBuilder = new MediaItem.Builder()
                     .setUri(uri)
@@ -1525,8 +1602,14 @@ public class LivePlayActivity extends AppCompatActivity {
      */
     private void postSourceFailure(final boolean byTimeout) {
         if (!isAlive() || handler == null) return;
+        final int gen = playGen;
         handler.post(() -> {
             if (!isAlive()) return;
+            // 排队期间已换台/换源：这是上一次起播的失败，不能拿来换走新线路
+            if (gen != playGen) {
+                Timber.d("忽略过期的换源请求");
+                return;
+            }
             if (!started) {
                 // onStop 之前已排队的失败回调：不在后台换源/重建播放器，回到前台从当前线路重新起播
                 playerReleasedOnStop = true;
@@ -1567,6 +1650,7 @@ public class LivePlayActivity extends AppCompatActivity {
     private void handleSourceFailure(boolean byTimeout) {
         LiveChannel channel = channelManager.getCurrentChannel();
         if (channel == null) return;
+        RunLog.i((byTimeout ? "起播超时: " : "线路失败: ") + channel.getChannelName() + " " + logUrl(currentPlayUrl));
         // 线路可能已被测速重排/刷新替换：先把索引对齐到播放器实际在播的 URL，换源才不会重复或跳过线路
         if (currentPlayUrl != null) channel.syncSourceIndexTo(currentPlayUrl);
 
@@ -1784,6 +1868,9 @@ public class LivePlayActivity extends AppCompatActivity {
     private boolean handleKeyDown(int keyCode, KeyEvent event) {
         // 频道列表显示时，方向键交给列表处理
         if (isChannelListVisible) {
+            // 用户按键即结束定位保护：onKeyDown 先于系统的方向键焦点移动执行，
+            // 随后由按键引起的分组焦点变化走正常的切换分组逻辑
+            positioningList = false;
             if (keyCode == KeyEvent.KEYCODE_BACK) {
                 hideChannelList();
                 return true;
@@ -2340,6 +2427,8 @@ public class LivePlayActivity extends AppCompatActivity {
 
     private void showChannelList() {
         if (channelListPanel == null || !dataLoaded) return;
+        if (channelListView != null) channelListView.removeCallbacks(clearPositioning);
+        positioningList = true;
         refreshGroupAdapter();
         // 分组列表滚动到当前浏览的分组（分组较多时它可能不在可见范围）
         if (groupListView != null) groupListView.scrollToPosition(browsingGroupIndex);
@@ -2357,8 +2446,19 @@ public class LivePlayActivity extends AppCompatActivity {
         // 旧实现会退化为聚焦列表本身（落到第一项）。focusChannelItem 会先滚动过去再聚焦。
         // post 一帧：refreshGroupAdapter 可能因 RecyclerView 繁忙把数据替换推迟到下一帧
         channelListView.post(() -> {
-            if (!isAlive() || !isChannelListVisible) return;
+            if (!isAlive() || !isChannelListVisible) {
+                positioningList = false;
+                return;
+            }
+            // 兜底：浏览分组若仍被改到别处，按播放频道重新定位一次
+            if (!channelManager.isCurrentPinned()
+                    && browsingGroupIndex != channelManager.getCurrentGroupIndex()) {
+                refreshGroupAdapter();
+            }
             focusChannelItem(playingIndexInBrowsingGroup());
+            // focusChannelItem 可能再 post 一帧滚动后聚焦，RecyclerView 的焦点恢复也在之后的布局中进行：
+            // 留出几帧再解除保护，之后的分组焦点变化才是用户操作
+            channelListView.postDelayed(clearPositioning, 300);
         });
     }
 
@@ -2382,6 +2482,8 @@ public class LivePlayActivity extends AppCompatActivity {
     }
 
     private void hideChannelList() {
+        if (channelListView != null) channelListView.removeCallbacks(clearPositioning);
+        positioningList = false;
         if (channelListPanel == null) return;
         try {
             android.view.animation.Animation out = android.view.animation.AnimationUtils
@@ -2725,6 +2827,8 @@ public class LivePlayActivity extends AppCompatActivity {
             speedTestActiveSince = android.os.SystemClock.elapsedRealtime();
         }
         speedTestActive = true;
+        speedTestChannelsDone = 0;
+        speedTestChannelsTotal = 0;
         if (speedTestBar != null) speedTestBar.setVisibility(View.VISIBLE);
         if (speedTestProgress != null) {
             if (event.total > 0) {
@@ -2761,12 +2865,31 @@ public class LivePlayActivity extends AppCompatActivity {
         }
         if (tvSpeedTestInfo != null) {
             int percent = event.total > 0 ? event.current * 100 / event.total : 0;
-            tvSpeedTestInfo.setText(String.format(java.util.Locale.CHINA, "测速 %d%% (%d/%d) %s",
-                    percent, event.current, event.total,
+            String channels = speedTestChannelsTotal > 0
+                    ? String.format(java.util.Locale.CHINA, " · 频道 %d/%d",
+                    speedTestChannelsDone, speedTestChannelsTotal)
+                    : "";
+            tvSpeedTestInfo.setText(String.format(java.util.Locale.CHINA, "测速 %d%% (%d/%d)%s %s",
+                    percent, event.current, event.total, channels,
                     event.channelName != null ? event.channelName : ""));
         }
         // 仅比较引用，开销可忽略；兜住准备阶段事件之后才完成的列表替换
         refreshChannelListIfReplaced();
+    }
+
+    /**
+     * 一个频道测完：引擎已原地更新该频道的测速值与线路排序，只刷新它在列表里的条目，
+     * 不整表刷新（不打断浏览与焦点）。正在播放的频道被重排后，索引重新对准实际播放的线路。
+     */
+    @Subscribe(threadMode = ThreadMode.MAIN)
+    public void onSpeedTestChannel(BackgroundSpeedTestService.SpeedTestChannelEvent event) {
+        if (!isAlive() || event == null || event.channel == null) return;
+        speedTestChannelsDone = Math.max(speedTestChannelsDone, event.completedChannels);
+        speedTestChannelsTotal = event.totalChannels;
+        if (channelAdapter != null) channelAdapter.notifyChannelUpdated(event.channel);
+        if (channelManager != null && channelManager.getCurrentChannel() == event.channel) {
+            resyncPlayingChannel(false);
+        }
     }
 
     @Subscribe(threadMode = ThreadMode.MAIN)
@@ -2775,6 +2898,8 @@ public class LivePlayActivity extends AppCompatActivity {
         // 测速结束（含取消）：解除对 EPG 的让路限制并补拉节目单
         speedTestActive = false;
         speedTestActiveSince = 0L;
+        speedTestChannelsDone = 0;
+        speedTestChannelsTotal = 0;
         // 测速结果已写入缓存，立刻刷新右下角网速（此时能取到各线路的真实速度）
         updateCornerSpeed();
         if (handler != null) handler.removeCallbacks(epgFlushRetry);
@@ -2807,6 +2932,8 @@ public class LivePlayActivity extends AppCompatActivity {
         // 测速失败：同样解除对 EPG 的让路限制并补拉节目单
         speedTestActive = false;
         speedTestActiveSince = 0L;
+        speedTestChannelsDone = 0;
+        speedTestChannelsTotal = 0;
         if (handler != null) handler.removeCallbacks(epgFlushRetry);
         if (speedTestBar != null) speedTestBar.setVisibility(View.GONE);
         ToastUtil.show(this, "测速失败: " + event.errorMsg);
