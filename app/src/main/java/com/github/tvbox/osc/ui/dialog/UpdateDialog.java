@@ -61,6 +61,9 @@ public final class UpdateDialog {
         private UpdateManager.DownloadTask task;
         /** 弹窗已关闭：之后的下载回调一律忽略 */
         private volatile boolean closed = false;
+        /** 是否已为本次安装跳转过授权页（再次点"安装"时不再跳转，直接唤起安装器） */
+        private boolean permissionPageShown;
+
         /** 已下载完成、但因缺少「安装未知应用」授权尚未安装的安装包 */
         private File downloadedApk;
 
@@ -138,6 +141,8 @@ public final class UpdateDialog {
             root.addView(row);
 
             btnInstall.setOnClickListener(v -> {
+                // 遥控器连按 OK 时，弹窗关闭后仍可能收到排队的点击：不再重复唤起安装器
+                if (closed) return;
                 // 已下载好（等待授权）时直接安装，不再重新下载
                 if (downloadedApk != null && downloadedApk.isFile()) {
                     installDownloaded(downloadedApk);
@@ -200,25 +205,53 @@ public final class UpdateDialog {
          * 此时保留弹窗并把按钮改为「安装」，用户授权后按返回即可直接安装，无需重新下载。
          */
         private void installDownloaded(File apkFile) {
-            boolean needPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
-                    && !ctx.getPackageManager().canRequestPackageInstalls();
-            if (!needPermission) {
+            if (apkFile == null || !apkFile.isFile()) {
+                // 安装包被清理或下载目录不可用：引导重新下载，而不是提示去开"未知来源"
+                downloadedApk = null;
+                downloading = false;
+                progress.setVisibility(android.view.View.GONE);
                 tvState.setVisibility(android.view.View.VISIBLE);
-                tvState.setText("下载完成，正在唤起安装器");
-                dismiss();
-                UpdateManager.installApk(ctx, apkFile);
+                tvState.setText("安装包丢失，请重新下载");
+                btnInstall.setText("重新下载");
+                btnInstall.setEnabled(true);
+                btnInstall.setFocusable(true);
+                btnInstall.requestFocus();
                 return;
             }
+            // 已经去过一次授权页仍报告未授权：部分电视 ROM 的授权状态不可靠，直接唤起安装器，
+            // 否则会陷入"去授权 → 返回 → 再去授权"的死循环
+            int result = UpdateManager.installApk(ctx, apkFile, permissionPageShown);
             downloadedApk = apkFile;
             downloading = false;
             progress.setVisibility(android.view.View.GONE);
             tvState.setVisibility(android.view.View.VISIBLE);
-            tvState.setText("需要允许「安装未知应用」：授权后按返回键回到这里，再点「安装」");
-            btnInstall.setText("安装");
+            if (result == UpdateManager.INSTALL_LAUNCHED) {
+                boolean permissionKnown = Build.VERSION.SDK_INT < Build.VERSION_CODES.O
+                        || ctx.getPackageManager().canRequestPackageInstalls();
+                if (permissionKnown) {
+                    dismiss();
+                    return;
+                }
+                // 授权状态未确认就唤起了安装器（当贝等无授权页的系统）：安装器可能因"未知来源"
+                // 未开启而拦截，此时保留弹窗，让用户开启后能直接重试，而不必等下次检查更新
+                tvState.setText("已唤起安装器；若提示禁止安装，请在系统设置中开启「未知来源」"
+                        + "（通常在 设置 → 安全/通用），然后返回点「重试安装」");
+                btnInstall.setText("重试安装");
+                btnInstall.setEnabled(true);
+                btnInstall.setFocusable(true);
+                return;
+            }
+            if (result == UpdateManager.INSTALL_NEED_PERMISSION) {
+                permissionPageShown = true;
+                tvState.setText("需要允许「安装未知应用」：授权后按返回键回到这里，再点「安装」");
+            } else {
+                tvState.setText("未能唤起安装器：请在系统设置中开启「未知来源」后点「重试安装」，"
+                        + "或用文件管理器安装：" + apkFile.getAbsolutePath());
+            }
+            btnInstall.setText(result == UpdateManager.INSTALL_NEED_PERMISSION ? "安装" : "重试安装");
             btnInstall.setEnabled(true);
             btnInstall.setFocusable(true);
             btnInstall.requestFocus();
-            UpdateManager.installApk(ctx, apkFile);
         }
 
         void show() {

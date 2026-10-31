@@ -611,36 +611,49 @@ public final class UpdateManager {
 
     // ============ 安装 ============
 
+    /** installApk 结果：已唤起安装器 */
+    public static final int INSTALL_LAUNCHED = 0;
+    /** installApk 结果：已跳转"安装未知应用"授权页，需用户授权后返回再装 */
+    public static final int INSTALL_NEED_PERMISSION = 1;
+    /** installApk 结果：失败（已提示安装包路径） */
+    public static final int INSTALL_FAILED = 2;
+
+    public static void installApk(Context ctx, File apk) {
+        installApk(ctx, apk, false);
+    }
+
     /**
      * 唤起系统安装器。
      *
      * <p>Android 7.0+ 禁止对外暴露 file:// URI，必须用 FileProvider 生成 content://
      * 并授予读权限；同时需要在 Manifest 中声明 REQUEST_INSTALL_PACKAGES。
+     *
+     * @param skipPermissionPage true 时即使系统报告未授权也直接唤起安装器（用户已去过授权页、
+     *                           或本机根本没有授权页时使用）
+     * @return INSTALL_LAUNCHED / INSTALL_NEED_PERMISSION / INSTALL_FAILED
      */
-    public static void installApk(Context ctx, File apk) {
+    public static int installApk(Context ctx, File apk, boolean skipPermissionPage) {
         try {
             if (apk == null || !apk.exists()) {
                 ToastUtil.show(ctx, "安装包不存在，请重新下载");
-                return;
+                return INSTALL_FAILED;
             }
             String path = apk.getAbsolutePath();
             com.github.tvbox.osc.util.RunLog.i("准备安装 APK: " + path);
 
-            // Android 8+ 需要"允许安装未知应用"授权，未授权则先引导去设置页
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            // Android 8+ 需要"允许安装未知应用"授权，未授权则先引导去设置页。
+            // 但当贝等电视系统没有"按应用授权"的设置页（只有全局"未知来源"开关），
+            // canRequestPackageInstalls 也可能一直返回 false：打不开授权页、或用户已去过一次时，
+            // 不能就此放弃，直接唤起安装器——确需授权时安装器会自行提示，全局开关已开则可直接安装。
+            if (!skipPermissionPage && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                     && !ctx.getPackageManager().canRequestPackageInstalls()) {
-                com.github.tvbox.osc.util.RunLog.i("缺少未知来源安装授权，跳转设置页");
-                try {
-                    Intent i = new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                            Uri.parse("package:" + ctx.getPackageName()));
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    ctx.startActivity(i);
+                if (openUnknownSourcesSettings(ctx)) {
+                    com.github.tvbox.osc.util.RunLog.i("缺少未知来源安装授权，已跳转设置页");
                     // 更新弹窗会保留并提供「安装」按钮，授权后返回即可直接安装，无需文件管理器
                     ToastUtil.show(ctx, "请开启「允许安装未知应用」，然后按返回键回到本应用点「安装」");
-                } catch (Throwable t) {
-                    fallbackManual(ctx, apk, "无法打开授权设置页");
+                    return INSTALL_NEED_PERMISSION;
                 }
-                return;
+                com.github.tvbox.osc.util.RunLog.i("本机无按应用授权的设置页（当贝等电视系统），直接唤起安装器");
             }
 
             makeInternalApkReadable(ctx, apk);
@@ -652,13 +665,38 @@ public final class UpdateManager {
             }
             if (ok) {
                 com.github.tvbox.osc.util.RunLog.i("已唤起安装器");
-            } else {
-                fallbackManual(ctx, apk, "未找到可用的安装器");
+                return INSTALL_LAUNCHED;
             }
+            fallbackManual(ctx, apk, "未能唤起系统安装器，请在系统设置中开启「未知来源」后重试");
+            return INSTALL_FAILED;
         } catch (Throwable t) {
             Timber.w(t, "唤起安装器失败");
             fallbackManual(ctx, apk, "安装失败：" + describe(t));
+            return INSTALL_FAILED;
         }
+    }
+
+    /**
+     * 打开"安装未知应用"授权页。部分 ROM 只注册了不带 package: 参数的该 Action，故两种都试；
+     * 都打不开（当贝等电视系统常见）返回 false。
+     */
+    private static boolean openUnknownSourcesSettings(Context ctx) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false;
+        Intent[] candidates = {
+                new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                        Uri.parse("package:" + ctx.getPackageName())),
+                new Intent(android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES),
+        };
+        for (Intent i : candidates) {
+            try {
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(i);
+                return true;
+            } catch (Throwable t) {
+                com.github.tvbox.osc.util.RunLog.i("打开授权设置页失败: " + describe(t));
+            }
+        }
+        return false;
     }
 
     /**
@@ -695,9 +733,10 @@ public final class UpdateManager {
             java.util.List<android.content.pm.ResolveInfo> list =
                     ctx.getPackageManager().queryIntentActivities(intent, 0);
             if (list == null || list.isEmpty()) {
-                com.github.tvbox.osc.util.RunLog.i("无应用可处理安装 Intent，方案="
+                // 查询结果为空不一定是真没有安装器：Android 11+ 受软件包可见性限制、
+                // 部分定制 ROM 的安装器也查不出来。仍尝试启动，真没有时由 ActivityNotFoundException 兜住
+                com.github.tvbox.osc.util.RunLog.i("未查询到安装器，仍尝试启动，方案="
                         + (useFileProvider ? "content://" : "file://"));
-                return false;
             }
             ctx.startActivity(intent);
             return true;

@@ -6,8 +6,8 @@ buildscript {
         compileSdkVersion = 33
         minSdkVersion = 21
         targetSdkVersion = 33
-        versionCode = 9
-        versionName = "1.2.5"
+        versionCode = 10
+        versionName = "1.2.6"
         // 依赖版本
         okhttpVersion = '4.12.0'
         gsonVersion = '2.10.1'
