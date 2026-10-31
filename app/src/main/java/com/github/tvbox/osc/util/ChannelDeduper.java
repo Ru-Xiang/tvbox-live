@@ -28,6 +28,27 @@ public final class ChannelDeduper {
     private ChannelDeduper() {}
 
     /**
+     * 线路去重键：按实际请求的地址（{@link StreamUrl#playUrl}，去掉 '$标签' 与 '|请求头'）比较，
+     * 同一路流只是标签不同（"$电信" / "$联通" / 无标签）视为同一条线路，避免重复测速、
+     * 占两个线路名额后把真正不同的备用线路挤掉。
+     *
+     * <p>附带的请求头仍计入键（名称大小写不敏感、按名称排序）：同一地址配不同 UA/Referer
+     * 时服务器可能只放行其中一种，不能随手合并掉需要请求头的那条。
+     * 只用于比较；列表里保留首次出现的原始串（含标签，界面照常显示）。
+     */
+    public static String lineKey(String raw) {
+        if (raw == null) return "";
+        String play = StreamUrl.playUrl(raw);
+        java.util.Map<String, String> headers = StreamUrl.headers(raw);
+        if (headers.isEmpty()) return play;
+        java.util.TreeMap<String, String> sorted = new java.util.TreeMap<>();
+        for (java.util.Map.Entry<String, String> e : headers.entrySet()) {
+            sorted.put(e.getKey().toLowerCase(java.util.Locale.ROOT), e.getValue());
+        }
+        return play + "\u0002" + sorted;
+    }
+
+    /**
      * 根据配置模式对分组列表进行去重。
      * mode 取值参见 HawkConfig.DEDUP_MODE_*。
      */
@@ -80,7 +101,7 @@ public final class ChannelDeduper {
 
         for (int i = 0; i < n; i++) {
             String u = urls.get(i);
-            boolean keep = u != null && !u.isEmpty() && seen.add(u.trim());
+            boolean keep = u != null && !u.isEmpty() && seen.add(lineKey(u));
             if (keep) {
                 if (newUrls != null) {
                     newUrls.add(u);
@@ -124,7 +145,7 @@ public final class ChannelDeduper {
                 for (int i = 0; i < urls.size(); i++) {
                     String u = urls.get(i);
                     if (u == null || u.isEmpty()) continue;
-                    if (seen.add(u.trim())) {
+                    if (seen.add(lineKey(u))) {
                         keep.add(u);
                         if (hasSpeeds) keepSpeeds.add(speeds.get(i));
                     } else {
@@ -161,7 +182,7 @@ public final class ChannelDeduper {
                 for (int i = 0; i < urls.size(); i++) {
                     String u = urls.get(i);
                     if (u == null || u.isEmpty()) continue;
-                    String combined = key + "\u0001" + u.trim();
+                    String combined = key + "\u0001" + lineKey(u);
                     if (seen.add(combined)) {
                         keep.add(u);
                         if (hasSpeeds) keepSpeeds.add(speeds.get(i));

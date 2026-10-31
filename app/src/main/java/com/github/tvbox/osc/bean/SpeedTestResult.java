@@ -50,8 +50,18 @@ public class SpeedTestResult implements Serializable {
     /** 综合质量评分（0-100，越高越好），由 StreamQualityScorer 计算 */
     private int qualityScore;
 
-    /** 失败原因分类：TIMEOUT / HTTP_ERROR / DNS / OTHER，用于智能重试判定 */
+    /**
+     * 失败原因分类：TIMEOUT / HTTP_ERROR / DNS / OTHER / UNTESTABLE，
+     * 以及无异常但判为不可用时的 ZERO_SPEED（没测到数据）/ BELOW_MIN（低于速度阈值），用于智能重试判定
+     */
     private String failureType;
+
+    /**
+     * 测速时按内容嗅探（#EXTM3U 头 / mpegurl Content-Type / .m3u8 扩展名）判定为 HLS。
+     * 播放器只按扩展名推断类型，无扩展名的 HLS（如 tv.php?id=1）需要据此显式指定 HLS，
+     * 否则会按渐进式流打开而黑屏。
+     */
+    private boolean hls;
 
     public SpeedTestResult() {
         this.testTime = System.currentTimeMillis();
@@ -138,6 +148,9 @@ public class SpeedTestResult implements Serializable {
 
     public String getFailureType() { return failureType; }
     public void setFailureType(String failureType) { this.failureType = failureType; }
+
+    public boolean isHls() { return hls; }
+    public void setHls(boolean hls) { this.hls = hls; }
 
     /** 是否为超时失败（用于智能重试判定） */
     public boolean isTimeoutFailure() {

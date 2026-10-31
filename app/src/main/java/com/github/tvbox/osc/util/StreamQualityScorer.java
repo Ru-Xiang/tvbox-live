@@ -44,6 +44,10 @@ public final class StreamQualityScorer {
     private static final long LATENCY_BEST = 100;
     private static final long LATENCY_WORST = 3000;
 
+    /** 未知分辨率 / 编码的得分（直链拿不到这些元信息） */
+    private static final double RES_UNKNOWN = 40;
+    private static final double CODEC_UNKNOWN = 50;
+
     /**
      * 计算综合质量评分（0-100 整数），并把结果写入 result.qualityScore。
      * 不可用的源直接返回 0 分。
@@ -53,10 +57,24 @@ public final class StreamQualityScorer {
             if (result != null) result.setQualityScore(0);
             return 0;
         }
+        double res = scoreResolution(result.getResolution());
+        double codec = scoreCodec(result.getCodecs());
+        // HLS 声明了码率（BANDWIDTH）时，用实测速度检验它跟不跟得上：
+        // 跟不上的线路实际会卡顿 / 只能降到低码率，它声明的 1080P/HEVC 并不兑现，
+        // 分辨率与编码的加分按"实测速度 / 所需速度"折算回"未知"水平，
+        // 否则 60 KB/s 的 1080P 线路会排在 300 KB/s 的流畅直链前面。
+        // 速度足够（ratio=1）或未声明码率（直链、媒体列表）时评分与以前完全一致。
+        long bandwidth = result.getBandwidth();
+        if (bandwidth > 0) {
+            double needKBps = bandwidth / 8.0 / 1024.0;
+            double ratio = needKBps > 0 ? Math.max(0, Math.min(1, result.getSpeed() / needKBps)) : 1;
+            if (res > RES_UNKNOWN) res = RES_UNKNOWN + (res - RES_UNKNOWN) * ratio;
+            if (codec > CODEC_UNKNOWN) codec = CODEC_UNKNOWN + (codec - CODEC_UNKNOWN) * ratio;
+        }
         double s = scoreSpeed(result.getSpeed()) * W_SPEED
-                + scoreResolution(result.getResolution()) * W_RES
+                + res * W_RES
                 + scoreLatency(result.getLatency()) * W_LATENCY
-                + scoreCodec(result.getCodecs()) * W_CODEC;
+                + codec * W_CODEC;
         int score = (int) Math.round(Math.max(0, Math.min(100, s)));
         result.setQualityScore(score);
         return score;
@@ -96,7 +114,8 @@ public final class StreamQualityScorer {
     }
 
     private static double scoreLatency(long latencyMs) {
-        if (latencyMs <= 0) return 50; // 未知
+        // 只有负数（测速失败记 -1）才是"未知"；0 是同一毫秒内就响应的局域网 / udpxy 线路，应得满分
+        if (latencyMs < 0) return 50; // 未知
         if (latencyMs <= LATENCY_BEST) return 100;
         if (latencyMs >= LATENCY_WORST) return 0;
         double t = (latencyMs - LATENCY_BEST) / (double) (LATENCY_WORST - LATENCY_BEST);

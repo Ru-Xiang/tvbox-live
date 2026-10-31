@@ -2,14 +2,21 @@ package com.github.tvbox.osc.api;
 
 import com.github.tvbox.osc.bean.ChannelGroup;
 import com.github.tvbox.osc.bean.LiveChannel;
+import com.github.tvbox.osc.util.ChannelDeduper;
+import com.github.tvbox.osc.util.StreamUrl;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.StringReader;
+import java.net.URLDecoder;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,6 +59,15 @@ public class LiveSourceParser {
     );
     private static final Pattern TVG_LOGO_PATTERN = Pattern.compile(
             "tvg-logo\\s*=\\s*\"([^\"]*)\""
+    );
+
+    /**
+     * TVBox 多线路写法 "url1#url2#url3" 的分隔符：只有 '#' 后面紧跟 "协议://" 才算分隔，
+     * 普通的 URL 片段（如 ...m3u8#t=10）保持原样。任意协议都拆开（rtp:// 等拆出后由 isValidUrl 丢弃），
+     * 否则不支持的协议会粘在前一条线路的地址尾部。
+     */
+    private static final Pattern MULTI_URL_SEPARATOR = Pattern.compile(
+            "#(?=[A-Za-z][A-Za-z0-9+.-]{1,15}://)"
     );
 
     // TXT 格式分组标记
@@ -107,6 +123,8 @@ public class LiveSourceParser {
         Map<String, ChannelGroup> groupMap = new LinkedHashMap<>();
         // "分组名+频道名" → 频道 的索引，避免逐行线性查找退化为 O(n²)
         Map<String, LiveChannel> channelIndex = new java.util.HashMap<>();
+        // 频道 → 已收录线路的去重键（见 ChannelDeduper.lineKey），仅解析期间使用
+        Map<LiveChannel, Set<String>> lineKeys = new java.util.IdentityHashMap<>();
         List<ChannelGroup> groups = new ArrayList<>();
 
         if (content == null || content.isEmpty()) return groups;
@@ -115,6 +133,9 @@ public class LiveSourceParser {
         try (BufferedReader reader = new BufferedReader(new StringReader(content))) {
             String line;
             String currentExtInf = null;
+            // 当前条目的 #EXTVLCOPT / #KODIPROP / #EXTHTTP 请求头，遇到地址行后清空。
+            // 不在 #EXTINF 处清空：部分列表把 #EXTVLCOPT 写在 #EXTINF 之前。
+            Map<String, String> pendingHeaders = new LinkedHashMap<>();
 
             while ((line = reader.readLine()) != null) {
                 // 畸形源可能把整份内容压成一行（数 MB），正则在其上会产生灾难性回溯导致卡死，
@@ -135,14 +156,26 @@ public class LiveSourceParser {
                     continue;
                 }
 
-                // 跳过其他注释行
-                if (line.startsWith("#")) continue;
+                // 单条线路的请求头：服务器常按 UA/Referer 放行，丢掉后测速 403、线路被误删
+                if (line.startsWith("#")) {
+                    collectM3UHeaders(line, pendingHeaders);
+                    // 跳过其他注释行
+                    continue;
+                }
 
                 // 这是一个URL行，配合前面的 EXTINF 解析
-                if (currentExtInf != null && isValidUrl(line)) {
-                    parseM3UEntry(currentExtInf, line, groupMap, channelIndex);
-                    currentExtInf = null;
+                if (currentExtInf != null) {
+                    boolean added = false;
+                    for (String part : splitMultiUrl(line)) {
+                        if (!isValidUrl(part)) continue;
+                        // 以 "url|User-Agent=..&Referer=.." 形式附在地址上，测速与播放按 StreamUrl 解析
+                        parseM3UEntry(currentExtInf, StreamUrl.withHeaders(part, pendingHeaders),
+                                groupMap, channelIndex, lineKeys);
+                        added = true;
+                    }
+                    if (added) currentExtInf = null;
                 }
+                pendingHeaders.clear();
             }
         } catch (IOException e) {
             Timber.e(e, "解析 M3U 数据失败");
@@ -177,6 +210,8 @@ public class LiveSourceParser {
         Map<String, ChannelGroup> groupMap = new LinkedHashMap<>();
         // "分组名+频道名" → 频道 的索引，避免逐行线性查找退化为 O(n²)
         Map<String, LiveChannel> channelIndex = new java.util.HashMap<>();
+        // 频道 → 已收录线路的去重键（见 ChannelDeduper.lineKey），仅解析期间使用
+        Map<LiveChannel, Set<String>> lineKeys = new java.util.IdentityHashMap<>();
         List<ChannelGroup> groups = new ArrayList<>();
 
         if (content == null || content.isEmpty()) return groups;
@@ -211,8 +246,14 @@ public class LiveSourceParser {
                     String channelName = line.substring(0, commaIndex).trim();
                     String url = line.substring(commaIndex + 1).trim();
 
-                    if (!channelName.isEmpty() && isValidUrl(url)) {
-                        addChannelToGroup(groupMap, channelIndex, currentGroupName, channelName, url, null, null);
+                    if (!channelName.isEmpty()) {
+                        // "url1#url2#url3" 是 TVBox 常见的多线路写法：拆成独立线路（各自保留 $标签），
+                        // 否则只有第一条被测速/播放，其余备用线路全部丢失
+                        for (String part : splitMultiUrl(url)) {
+                            if (isValidUrl(part)) {
+                                addChannelToGroup(groupMap, channelIndex, lineKeys, currentGroupName, channelName, part, null, null);
+                            }
+                        }
                     }
                 }
             }
@@ -309,8 +350,98 @@ public class LiveSourceParser {
         return s;
     }
 
+    /** 拆分 "url1#url2" 多线路写法；不含分隔符时原样返回单元素列表 */
+    static List<String> splitMultiUrl(String field) {
+        List<String> out = new ArrayList<>();
+        if (field == null) return out;
+        for (String part : MULTI_URL_SEPARATOR.split(field)) {
+            String p = part.trim();
+            if (!p.isEmpty()) out.add(p);
+        }
+        return out;
+    }
+
+    /**
+     * 收集 M3U 注释行里的单条线路请求头：
+     * #EXTVLCOPT:http-user-agent= / http-referrer= / http-referer= / http-origin=，
+     * #KODIPROP:inputstream.adaptive.stream_headers=名=值&名=值（值为 URL 编码），
+     * #EXTHTTP:{"User-Agent":"...","Referer":"..."}。同名请求头后出现的覆盖先出现的。
+     */
+    private static void collectM3UHeaders(String line, Map<String, String> out) {
+        String upper = line.length() > 16 ? line.substring(0, 16).toUpperCase(Locale.ROOT) : line.toUpperCase(Locale.ROOT);
+        if (upper.startsWith("#EXTVLCOPT:")) {
+            String opt = line.substring("#EXTVLCOPT:".length()).trim();
+            int eq = opt.indexOf('=');
+            if (eq <= 0) return;
+            String name = opt.substring(0, eq).trim().toLowerCase(Locale.ROOT);
+            String value = stripQuotes(opt.substring(eq + 1).trim());
+            if (value.isEmpty()) return;
+            if (name.equals("http-user-agent")) {
+                putHeader(out, "User-Agent", value);
+            } else if (name.equals("http-referrer") || name.equals("http-referer")) {
+                putHeader(out, "Referer", value);
+            } else if (name.equals("http-origin")) {
+                putHeader(out, "Origin", value);
+            }
+        } else if (upper.startsWith("#KODIPROP:")) {
+            String prop = line.substring("#KODIPROP:".length()).trim();
+            int eq = prop.indexOf('=');
+            if (eq <= 0) return;
+            String name = prop.substring(0, eq).trim().toLowerCase(Locale.ROOT);
+            if (!name.equals("inputstream.adaptive.stream_headers")
+                    && !name.equals("inputstream.adaptive.manifest_headers")) return;
+            for (String pair : prop.substring(eq + 1).split("&")) {
+                int e2 = pair.indexOf('=');
+                if (e2 <= 0) continue;
+                String k = pair.substring(0, e2).trim();
+                String v = decodeQuietly(pair.substring(e2 + 1).trim());
+                if (!k.isEmpty() && !v.isEmpty()) putHeader(out, k, v);
+            }
+        } else if (upper.startsWith("#EXTHTTP:")) {
+            String json = line.substring("#EXTHTTP:".length()).trim();
+            try {
+                org.json.JSONObject obj = new org.json.JSONObject(json);
+                Iterator<String> keys = obj.keys();
+                while (keys.hasNext()) {
+                    String k = keys.next();
+                    // 只接受字符串值；AOSP 的 optString 对 null 会返回 "null"，故先判类型
+                    Object v = obj.opt(k);
+                    if (k != null && !k.trim().isEmpty() && v instanceof String && !((String) v).isEmpty()) {
+                        putHeader(out, k.trim(), (String) v);
+                    }
+                }
+            } catch (Exception e) {
+                Timber.w("忽略无法解析的 #EXTHTTP: %s", json);
+            }
+        }
+    }
+
+    /** 按名称大小写不敏感地写入请求头（后写覆盖） */
+    private static void putHeader(Map<String, String> out, String name, String value) {
+        for (Iterator<String> it = out.keySet().iterator(); it.hasNext(); ) {
+            if (it.next().equalsIgnoreCase(name)) it.remove();
+        }
+        out.put(name, value);
+    }
+
+    private static String stripQuotes(String v) {
+        if (v.length() >= 2 && v.charAt(0) == '"' && v.charAt(v.length() - 1) == '"') {
+            return v.substring(1, v.length() - 1).trim();
+        }
+        return v;
+    }
+
+    private static String decodeQuietly(String v) {
+        try {
+            return URLDecoder.decode(v, "UTF-8");
+        } catch (Exception e) {
+            return v;
+        }
+    }
+
     private void parseM3UEntry(String extInfLine, String url, Map<String, ChannelGroup> groupMap,
-                               Map<String, LiveChannel> channelIndex) {
+                               Map<String, LiveChannel> channelIndex,
+                               Map<LiveChannel, Set<String>> lineKeys) {
         Matcher prefix = EXTINF_PREFIX_PATTERN.matcher(extInfLine);
         if (!prefix.find()) return;
         int start = prefix.end();
@@ -351,7 +482,7 @@ public class LiveSourceParser {
         // 标准化频道名称
         channelName = normalizeChannelName(channelName);
 
-        addChannelToGroup(groupMap, channelIndex, groupName, channelName, url, epgId, logoUrl);
+        addChannelToGroup(groupMap, channelIndex, lineKeys, groupName, channelName, url, epgId, logoUrl);
     }
 
     private String extractAttribute(String attributes, Pattern pattern) {
@@ -369,6 +500,7 @@ public class LiveSourceParser {
      */
     private void addChannelToGroup(Map<String, ChannelGroup> groupMap,
                                     Map<String, LiveChannel> channelIndex,
+                                    Map<LiveChannel, Set<String>> lineKeys,
                                     String groupName, String channelName,
                                     String url, String epgId, String logoUrl) {
         // 获取或创建分组
@@ -389,8 +521,16 @@ public class LiveSourceParser {
             channelIndex.put(key, channel);
         }
 
-        // 添加播放源
-        channel.addSourceUrl(url);
+        // 添加播放源。同一路流只是 '$标签' 不同（"$电信"/"$联通"）只收第一条：
+        // addSourceUrl 按原串去重拦不住，重复项会被测两次、多占线路名额
+        Set<String> keys = lineKeys.get(channel);
+        if (keys == null) {
+            keys = new HashSet<>();
+            lineKeys.put(channel, keys);
+        }
+        if (keys.add(ChannelDeduper.lineKey(url))) {
+            channel.addSourceUrl(url);
+        }
     }
 
     /**

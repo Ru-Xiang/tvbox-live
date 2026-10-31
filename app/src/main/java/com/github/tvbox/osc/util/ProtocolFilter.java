@@ -13,7 +13,8 @@ import timber.log.Timber;
  * 播放协议过滤器：剔除播放器无法播放的线路。
  *
  * <p>当前播放内核为 ExoPlayer，已引入 core / hls / dash / rtsp / extension-rtmp 模块，
- * 因此可播放 HTTP(S)（含 HLS、DASH、渐进式）、RTSP、RTMP 以及本地 file / content。
+ * 因此可播放 HTTP(S)（含 HLS、DASH、渐进式）、RTSP、RTMP(T) 以及本地 file / content。
+ * rtsps / rtmps / rtmpe 在当前内核下打不开，同样视为不支持。
  *
  * <p>以下协议一律不支持，需在<b>测速之前</b>就过滤掉，避免：
  * <ul>
@@ -41,20 +42,20 @@ public final class ProtocolFilter {
         if (u.isEmpty()) return false;
         // 统一小写比较协议头，避免 RTP:// 之类的大写写法绕过过滤
         String lower = u.toLowerCase(java.util.Locale.ROOT);
+        // 不收 rtsps:// rtmps:// rtmpe://：ExoPlayer 2.19 只把 "rtsp" 协议交给 RTSP 模块（rtsps 会落到 HTTP 数据源），
+        // extension-rtmp 内置的 librtmp 未编入加密支持（rtmps/rtmpe 打不开）。
+        // 它们又测不了速，会以"不可测速"身份一直被当成可播线路保留，最后只能黑屏。
         return lower.startsWith("http://")
                 || lower.startsWith("https://")
                 || lower.startsWith("rtsp://")
-                || lower.startsWith("rtsps://")
                 || lower.startsWith("rtmp://")
-                || lower.startsWith("rtmps://")
-                || lower.startsWith("rtmpe://")
                 || lower.startsWith("rtmpt://")
                 || lower.startsWith("file://")
                 || lower.startsWith("content://");
     }
 
     /**
-     * 该线路能否用 HTTP 方式测速。
+     * 该线路能否用 HTTP 方式测速（url 可以是带 '$标签' / '|请求头' 的原始串，只看协议头）。
      *
      * <p>RTSP/RTMP 是流式协议，无法像HTTP 那样下载片段来测算速度，
      * 因此它们只能"跳过测速"，但<b>不应被当作不可用线路而删除</b>。

@@ -8,6 +8,7 @@ import com.github.tvbox.osc.bean.SpeedTestResult;
 import com.github.tvbox.osc.cache.LiveChannelDatabase;
 import com.github.tvbox.osc.service.SpeedTestEngine;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.StreamUrl;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.orhanobut.hawk.Hawk;
@@ -98,6 +99,50 @@ public class ChannelManager {
     private volatile Runnable speedTestPersistedListener;
     private final android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 
+    /**
+     * 刷新源替换 rawGroups 与测速后持久化（重排/裁剪/写库/生成本地列表）互斥。
+     * 刷新回调在拉源线程、持久化在 ioExecutor，两者交错会让刷新结果覆盖已测速排序的列表，
+     * 或让持久化裁剪到一半的列表被替换。不用 this：主线程换台方法同步在 this 上，避免被长时间阻塞。
+     */
+    private final Object rawLock = new Object();
+
+    /** 最近一次由"刷新源"整体替换 rawGroups 的时间（用于识别测速进行中列表被替换） */
+    private volatile long rawReplacedAt = 0L;
+
+    /**
+     * 因"网络不可用"而未被采用的测速轮次的开始时间（Hawk）。
+     * 该轮及之后（直到下一轮开始）写入缓存的失败结果一律视为"未测"，不据此隐藏频道/剔除线路。
+     */
+    private static final String KEY_NET_ABORTED_ROUND_AT = "live_speed_net_aborted_round_at";
+
+    /**
+     * 最近一轮"被采用"（非断网）的测速开始时间（Hawk）。测速引擎在断网轮次仍会把
+     * lastRoundStartedAt 记为该轮，若只认引擎的值，上一轮正常测速的结果全被当作旧结果（未测），
+     * 之后刷新按拉取顺序重排，已知失效的线路又排回首位。断网轮次期间改以此值作为轮次起点。
+     */
+    private static final String KEY_LAST_HEALTHY_ROUND_AT = "live_speed_last_healthy_round_at";
+
+    /** 本地列表内容只落盘到文件时，Hawk 中存放的小标记（避免大段 JSON 进 SharedPreferences） */
+    private static final String LOCAL_PLAYLIST_FILE_MARKER = "@file:tvbox-live-local-v2";
+
+    /** 不限制单频道线路数时，本地列表每个频道最多写入的线路数（含最佳线路），控制文件体积 */
+    private static final int LOCAL_PLAYLIST_MAX_URLS_UNLIMITED = 20;
+
+    /** 读取本地列表文件的大小上限，超出视为损坏（低内存设备上避免一次性读入超大文件 OOM） */
+    private static final long LOCAL_PLAYLIST_MAX_FILE_BYTES = 16L * 1024 * 1024;
+
+    /** 生成本地列表时的直播源配置指纹（Hawk），配置变化后本地列表不再阻止刷新 */
+    private static final String KEY_LOCAL_PLAYLIST_SRC_FP = "live_local_playlist_src_fp";
+
+    /** 本地列表 v2（JSON）格式标记；旧版为 TXT（分组,#genre# + 名称,URL），读取时兼容 */
+    private static final String LOCAL_PLAYLIST_JSON_FORMAT = "tvbox-live-local-v2";
+
+    /** 线路测速状态：可用 / 未测（含无记录、过期、断网轮次的失败） / 无法测速（RTSP 等） / 本轮明确失败 */
+    private static final int ST_OK = 0;
+    private static final int ST_UNTESTED = 1;
+    private static final int ST_UNTESTABLE = 2;
+    private static final int ST_FAILED = 3;
+
     /** 频道管理回调 */
     public interface ChannelCallback {
         void onChannelsLoaded(List<ChannelGroup> groups);
@@ -170,7 +215,7 @@ public class ChannelManager {
                 // 先从本地数据库加载
                 List<ChannelGroup> cachedGroups = loadFromDatabase();
                 // 已存在测速生成的本地列表时，默认直接使用它（下次打开仍可用），
-                // 不因自动更新周期而重新联网覆盖，保证优先使用最佳线路本地列表。
+                // 到更新周期或源配置变更时仍在后台刷新，刷新结果按测速缓存重排后合并（不会丢掉最佳线路的优先级）。
                 boolean hasLocal = hasLocalPlaylist();
                 if (!cachedGroups.isEmpty()) {
                     rawGroups = cachedGroups;
@@ -178,10 +223,13 @@ public class ChannelManager {
                     Timber.d("从%s加载: %d 个分组",
                             hasLocal ? "本地测速列表" : "缓存", cachedGroups.size());
                     if (callback != null) callback.onChannelsLoaded(channelGroups);
-                    // 缓存过期（且不是测速生成的本地列表）：界面先用缓存，后台再刷新。
+                    // 缓存过期：界面先用缓存，后台再刷新。
                     // 原先直接阻塞联网，数十个源拉完前一直转圈，断网时还要等全部超时。
-                    if (!hasLocal && iptvApiService.needsUpdate()) {
-                        Timber.d("缓存已过期，后台刷新直播源...");
+                    // 有本地测速列表时同样按更新周期刷新、且源配置改动后立即刷新：否则过期 token/换域名
+                    // 的线路与新加的源永远进不来。刷新结果会按测速缓存重排（见 applyRefreshedGroups），
+                    // 测速可用的线路仍排在前面，保持"优先使用最佳线路"。
+                    if (shouldRefreshOnLaunch()) {
+                        Timber.d("缓存已过期或直播源配置已变更，后台刷新直播源...");
                         refreshInBackground(callback);
                     }
                     return;
@@ -197,6 +245,7 @@ public class ChannelManager {
                         saveToDatabase(restored);
                         Timber.i("数据库为空，已从本地播放列表恢复: %d 个分组", restored.size());
                         if (callback != null) callback.onChannelsLoaded(channelGroups);
+                        if (shouldRefreshOnLaunch()) refreshInBackground(callback);
                         return;
                     }
                 }
@@ -225,6 +274,8 @@ public class ChannelManager {
      * @param background 是否为启动时的后台静默刷新（用户没有主动要求刷新）
      */
     private void refreshChannels(ChannelCallback callback, final boolean background) {
+        // 拉取前记下配置指纹：拉取途中配置又被修改时，记录的是本次拉取实际用的配置，下次启动仍会刷新
+        final String fp = sourceConfigFingerprint();
         iptvApiService.fetchAndMergeSources(new IptvApiService.FetchCallback() {
             @Override
             public void onSuccess(List<ChannelGroup> groups, int totalChannels) {
@@ -247,10 +298,8 @@ public class ChannelManager {
                     }
                     return;
                 }
-                rawGroups = groups;
-                rebuildDisplayGroups();
-                // 异步保存到数据库
-                saveToDatabase(groups);
+                // 替换、按测速缓存重排、重建展示列表并写库（与测速后持久化互斥）
+                applyRefreshedGroups(groups, fp);
                 Timber.i("刷新频道完成: %d 个分组, %d 个频道", groups.size(), totalChannels);
                 if (callback != null) callback.onChannelsUpdated(channelGroups, totalChannels);
             }
@@ -284,6 +333,96 @@ public class ChannelManager {
                 Timber.w("后台刷新直播源失败，继续使用缓存: %s", errorMsg);
             }
         }, true);
+    }
+
+    /**
+     * 用刷新得到的新分组替换 rawGroups：先按测速缓存（以 URL 为键）重排线路再展示、写库。
+     *
+     * <p>原先直接按拉取顺序替换并写库：测速判定失效的线路排回第 0 条，且本地列表存在时
+     * 启动不再刷新，这份未排序列表会一直沿用。这里不裁剪：刷新可能带来尚未测速的新线路，
+     * 裁掉会丢失候选；可用线路靠前、未测居中、失败垫底即可保证优先播放测速最佳线路。
+     * 与测速后持久化互斥，避免两者交错覆盖彼此的结果。
+     */
+    private void applyRefreshedGroups(List<ChannelGroup> groups, String sourceFp) {
+        synchronized (rawLock) {
+            rawGroups = groups;
+            rawReplacedAt = System.currentTimeMillis();
+            try {
+                reorderRawByCachedResults();
+            } catch (Throwable t) {
+                Timber.w(t, "刷新后按测速缓存重排线路失败");
+            }
+            rebuildDisplayGroups();
+            // 异步保存到数据库
+            saveToDatabase(groups);
+            markSourceConfigApplied(sourceFp);
+        }
+    }
+
+    /**
+     * 启动时是否需要后台刷新：到了更新周期，或直播源配置（自定义源/订阅/多仓/模板/IP 版本）
+     * 自上次成功刷新或测速后已改变。有本地测速列表时也照此执行（刷新结果会按测速缓存重排）。
+     */
+    private boolean shouldRefreshOnLaunch() {
+        try {
+            if (iptvApiService.needsUpdate()) return true;
+        } catch (Throwable ignore) {
+        }
+        return isSourceConfigChanged();
+    }
+
+    /** 直播源相关配置的指纹；任何一项改变都会让已缓存的列表（含本地测速列表）失去代表性 */
+    private static String sourceConfigFingerprint() {
+        String[] keys = {
+                HawkConfig.IPTV_CUSTOM_SOURCES,
+                HawkConfig.IPTV_SUBSCRIBE_LIST_URL,
+                HawkConfig.IPTV_MULTI_REPO_URLS,
+                HawkConfig.IPTV_IP_VERSION,
+                HawkConfig.IPTV_TEMPLATE_ENABLED,
+                HawkConfig.IPTV_TEMPLATE_URL,
+                HawkConfig.IPTV_ALIAS_URL,
+        };
+        StringBuilder sb = new StringBuilder();
+        for (String k : keys) {
+            Object v = null;
+            try {
+                // 不带默认值读取：各键类型不同（String/Boolean），带错类型的默认值会 ClassCastException
+                v = Hawk.get(k);
+            } catch (Throwable ignore) {
+            }
+            sb.append(k).append('=').append(v == null ? "" : String.valueOf(v)).append('\n');
+        }
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-1");
+            byte[] d = md.digest(sb.toString().getBytes("UTF-8"));
+            StringBuilder hex = new StringBuilder(d.length * 2);
+            for (byte b : d) hex.append(String.format(java.util.Locale.ROOT, "%02x", b & 0xff));
+            return hex.toString();
+        } catch (Throwable t) {
+            return Integer.toHexString(sb.toString().hashCode()) + ":" + sb.length();
+        }
+    }
+
+    /** 当前直播源配置与上次成功刷新/测速时是否不同（从未记录过也视为不同，刷新一次后即记录） */
+    private boolean isSourceConfigChanged() {
+        try {
+            String saved = Hawk.get(KEY_LOCAL_PLAYLIST_SRC_FP, "");
+            return saved == null || !saved.equals(sourceConfigFingerprint());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 记录某份直播源配置已被采用。只在"按该配置拉取的结果真正替换了列表"时调用，
+     * fp 取自拉取开始前：测速前拉源失败回退旧列表、或拉取途中配置被改时，都不应记为已采用。
+     */
+    private void markSourceConfigApplied(String fp) {
+        if (fp == null) return;
+        try {
+            Hawk.put(KEY_LOCAL_PLAYLIST_SRC_FP, fp);
+        } catch (Throwable ignore) {
+        }
     }
 
     /**
@@ -341,15 +480,21 @@ public class ChannelManager {
      * 保证测速仍可进行。
      */
     public void reloadForSpeedTest(SpeedTestReloadCallback callback) {
+        final String fp = sourceConfigFingerprint();
         iptvApiService.fetchAndMergeSources(new IptvApiService.FetchCallback() {
             @Override
             public void onSuccess(List<ChannelGroup> groups, int totalChannels) {
                 try {
                     if (groups != null && !groups.isEmpty()
                             && !shouldKeepCurrentOnDegraded(groups, totalChannels)) {
-                        rawGroups = groups;
-                        rebuildDisplayGroups();
-                        saveToDatabase(groups);
+                        // 不按测速缓存重排：测速按每频道配额只测前几条，重排会让上轮失败的线路永远测不到
+                        synchronized (rawLock) {
+                            rawGroups = groups;
+                            rawReplacedAt = System.currentTimeMillis();
+                            rebuildDisplayGroups();
+                            saveToDatabase(groups);
+                            markSourceConfigApplied(fp);
+                        }
                     }
                 } catch (Throwable t) {
                     Timber.w(t, "测速前刷新源后处理异常");
@@ -825,10 +970,22 @@ public class ChannelManager {
             blocked.add(url);
             persistSourceMap(HawkConfig.LIVE_SOURCE_BLACKLIST, sourceBlacklist);
         }
-        // 同步更新自定义顺序（移除该 url）
+        // 同步更新自定义顺序：拉黑的正是置顶线路时整条顺序作废。置顶线路按顺序首条推断，
+        // 只移除该 url 会让原第二条"继承"置顶保护（不被剔除/裁剪、失败也保留频道），并非用户本意
         List<String> order = sourceOrder.get(key);
-        if (order != null && order.remove(url)) {
+        // 顺序表可能是 1.2.4 保存的旧写法（无 '|请求头'），按 sameStoredLine 兼容匹配
+        if (order != null && !order.isEmpty() && sameStoredLine(order.get(0), url)) {
+            sourceOrder.remove(key);
             persistSourceMap(HawkConfig.LIVE_SOURCE_ORDER, sourceOrder);
+        } else if (order != null) {
+            boolean changed = false;
+            for (java.util.Iterator<String> it = order.iterator(); it.hasNext(); ) {
+                if (sameStoredLine(it.next(), url)) {
+                    it.remove();
+                    changed = true;
+                }
+            }
+            if (changed) persistSourceMap(HawkConfig.LIVE_SOURCE_ORDER, sourceOrder);
         }
         return removed;
     }
@@ -837,7 +994,43 @@ public class ChannelManager {
     public boolean isSourceBlacklisted(LiveChannel channel, String url) {
         if (channel == null || url == null) return false;
         List<String> blocked = sourceBlacklist.get(channel.getKey());
-        return blocked != null && blocked.contains(url);
+        if (blocked == null || blocked.isEmpty()) return false;
+        if (blocked.contains(url)) return true;
+        for (String b : blocked) {
+            if (sameStoredLine(b, url)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 保存的线路串（黑名单 / 置顶顺序）与频道里的实际线路是否为同一条。
+     *
+     * <p>先精确比较；不相等时，若保存的串不带请求头，再按 {@link StreamUrl#playUrl} 比较。
+     * 为什么：1.2.4 保存的是 'url' 或 'url$标签'，1.2.5 起带 UA/Referer 的线路原样存为
+     * 'url|User-Agent=..'，且同地址不同标签已合并为一条，精确比较会让升级前的置顶/拉黑静默失效。
+     * 为什么只在保存的串不带请求头时回退：带请求头的串一定是 1.2.5 保存的，精确匹配就够；
+     * 同地址不同请求头的线路被刻意保留为两条（见 ChannelDeduper#lineKey），不能互相"连坐"。
+     */
+    static boolean sameStoredLine(String stored, String line) {
+        if (stored == null || line == null) return false;
+        if (stored.equals(line)) return true;
+        // 带请求头的保存串：按"地址 + 请求头"比较（只改了 $标签 仍算同一线路；请求头不同则仍区分开）
+        if (!StreamUrl.headers(stored).isEmpty()) {
+            return com.github.tvbox.osc.util.ChannelDeduper.lineKey(stored)
+                    .equals(com.github.tvbox.osc.util.ChannelDeduper.lineKey(line));
+        }
+        String p = StreamUrl.playUrl(stored);
+        return p != null && !p.isEmpty() && p.equals(StreamUrl.playUrl(line));
+    }
+
+    /** 把保存的线路串解析为 urls 中的实际线路（规则同 sameStoredLine，精确匹配优先）；找不到返回 null */
+    private static String resolveStoredLine(List<String> urls, String stored) {
+        if (urls == null || stored == null) return null;
+        if (urls.contains(stored)) return stored;
+        for (String u : urls) {
+            if (u != null && sameStoredLine(stored, u)) return u;
+        }
+        return null;
     }
 
     /** 清空所有频道的线路黑名单与自定义置顶顺序 */
@@ -858,12 +1051,26 @@ public class ChannelManager {
         List<String> blocked = sourceBlacklist.get(key);
         if (blocked != null && !blocked.isEmpty()) {
             for (String url : new ArrayList<>(blocked)) {
-                channel.removeSource(url);
+                if (channel.removeSource(url)) continue;
+                // 升级兼容：1.2.4 拉黑的旧写法匹配现在带 '|请求头' 的同一路流（见 sameStoredLine）
+                String actual;
+                int guard = 0;
+                while (guard++ < LiveChannel.MAX_SOURCE_URLS
+                        && (actual = resolveStoredLine(channel.getSourceUrls(), url)) != null) {
+                    if (!channel.removeSource(actual)) break;
+                }
             }
         }
         List<String> order = sourceOrder.get(key);
         if (order != null && !order.isEmpty()) {
-            channel.reorderSourcesBy(order);
+            // 升级兼容：顺序表里的旧写法先换成列表中的实际线路，否则重排时找不到而失效
+            List<String> urls = channel.getSourceUrls();
+            List<String> resolved = new ArrayList<>(order.size());
+            for (String o : order) {
+                String actual = resolveStoredLine(urls, o);
+                resolved.add(actual != null ? actual : o);
+            }
+            channel.reorderSourcesBy(resolved);
         }
     }
 
@@ -957,6 +1164,9 @@ public class ChannelManager {
             if (src == null) src = new ArrayList<>();
 
             int hidden = 0;
+            // 每次重建只读一次（Hawk 读取有反序列化开销，不能按频道重复读）
+            final long roundStart = currentRoundStart();
+            final long abortedAt = netAbortedRoundAt();
             for (ChannelGroup raw : new ArrayList<>(src)) {
                 if (raw == null) continue;
                 ChannelGroup g = new ChannelGroup(raw.getGroupName());
@@ -967,7 +1177,7 @@ public class ChannelManager {
                         if (channel == null) continue;
                         try { applySourcePrefs(channel); } catch (Exception ignore) {}
                         // 线路偏好应用后再判断可用性（黑名单可能已移除全部可用线路）
-                        if (!hasPlayableSource(channel)) {
+                        if (!hasPlayableSource(channel, roundStart, abortedAt)) {
                             hidden++;
                             continue;
                         }
@@ -1063,24 +1273,123 @@ public class ChannelManager {
      * 规则与 {@link #pickBestSource} 一致：
      * - 有任意线路测速可用 → 可播；
      * - 有 RTSP/RTMP 等无法测速的线路 → 视为可播（不能因测不了就删）；
-     * - 全部线路都有测速记录且均失败 → 不可播；
-     * - 完全没有测速记录（未测过 / 被配额截断） → 视为可播，避免误删。
+     * - 有任意线路未测（无记录 / 被配额截断 / 早于最近一轮的旧结果 / 断网轮次的失败） → 视为可播：
+     *   原先只要测过的线路都失败就隐藏，配额外从未测过、可能可用的线路被一并丢掉；
+     * - 用户置顶的线路 → 视为可播（用户确认能播，测速可能因缺 UA/Referer 误判）；
+     * - 只有全部线路都在最近一轮明确测速失败 → 不可播。
      */
-    private boolean hasPlayableSource(LiveChannel channel) {
+    private boolean hasPlayableSource(LiveChannel channel, long roundStart, long abortedAt) {
         if (channel == null) return false;
         List<String> urls = channel.getSourceUrls();
         if (urls == null || urls.isEmpty()) return false;
-
-        boolean anyTested = false;
+        String pinned = pinnedUrl(channel);
         for (String url : urls) {
-            SpeedTestResult r = speedTestEngine.getCachedResult(url);
-            if (r == null) continue;
-            if (r.isAvailable()) return true;
-            if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) return true;
-            anyTested = true;
+            if (url != null && url.equals(pinned)) return true;
+            if (lineStatus(url, roundStart, abortedAt) != ST_FAILED) return true;
         }
-        // 有测速记录且全部失败 → 不可播；否则（无任何记录）保留
-        return !anyTested;
+        return false;
+    }
+
+    /** 测速引擎记录的最近一轮开始时间（含断网轮次；0 表示未知/从未测速） */
+    private long engineRoundStart() {
+        try {
+            return Math.max(0L, speedTestEngine.getLastRoundStartedAt());
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 判定新旧结果所用的轮次起点（0 表示不按轮次判断）。
+     * 最近一轮是断网轮次（未被采用）时，改用上一轮被采用的测速开始时间：
+     * 否则上一轮正常测出的可用/失败结论全部变成"未测"，失效线路会在之后的刷新中重新排到首位。
+     * 断网轮次自身的失败仍由 lineStatus 按 abortedAt 视为"未测"。
+     * 断网标记只在下一轮被采用时清除，因此连续多轮断网、或断网后新一轮尚未结束时都沿用上一正常轮。
+     */
+    private long currentRoundStart() {
+        if (netAbortedRoundAt() > 0) return lastHealthyRoundAt();
+        return engineRoundStart();
+    }
+
+    private static long lastHealthyRoundAt() {
+        try {
+            Long v = Hawk.get(KEY_LAST_HEALTHY_ROUND_AT, 0L);
+            return v == null ? 0L : Math.max(0L, v);
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    /** 因断网而未被采用的测速轮次开始时间（0 表示没有） */
+    private static long netAbortedRoundAt() {
+        try {
+            Long v = Hawk.get(KEY_NET_ABORTED_ROUND_AT, 0L);
+            return v == null ? 0L : v;
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    /**
+     * 线路的测速状态（过滤 / 排序 / 选最佳线路共用同一判定，避免三处口径不一致）。
+     *
+     * <p>早于最近一轮开始时间的结果视为"未测"：该线路本轮没测到（配额/列表被替换），
+     * 旧结果既不能当作失败去隐藏/剔除，也不能当作本轮的可用结论。
+     * 断网轮次（见 {@link #KEY_NET_ABORTED_ROUND_AT}）写入的失败同样视为"未测"。
+     */
+    private int lineStatus(String url, long roundStart, long abortedAt) {
+        SpeedTestResult r = url == null ? null : speedTestEngine.getCachedResult(url);
+        if (r == null) return ST_UNTESTED;
+        if (roundStart > 0 && r.getTestTime() < roundStart) return ST_UNTESTED;
+        if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) return ST_UNTESTABLE;
+        if (r.isAvailable()) return ST_OK;
+        if (abortedAt > 0 && abortedAt >= roundStart && r.getTestTime() >= abortedAt) return ST_UNTESTED;
+        return ST_FAILED;
+    }
+
+    /**
+     * 两条"可用"线路的优劣比较（&lt;0 表示 a 更好）：按当前排序模式的主键降序，再按另一指标降序；
+     * 全部相等返回 0，由调用方保持原顺序。重排与本地列表选最佳线路共用，保证同分时结论一致。
+     */
+    private static int compareAvailable(SpeedTestResult a, SpeedTestResult b, boolean byScore) {
+        double sa = safe(a.getSpeed()), sb = safe(b.getSpeed());
+        int qa = a.getQualityScore(), qb = b.getQualityScore();
+        int c = byScore ? Integer.compare(qb, qa) : Double.compare(sb, sa);
+        if (c != 0) return c;
+        return byScore ? Double.compare(sb, sa) : Integer.compare(qb, qa);
+    }
+
+    private static double safe(double v) {
+        return Double.isNaN(v) ? 0d : v;
+    }
+
+    private static boolean isSortByScore() {
+        try {
+            return Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE)
+                    == HawkConfig.SORT_MODE_QUALITY_SCORE;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** 用户置顶的线路（pinSource 保存的顺序首条）；没有置顶返回 null */
+    private String pinnedUrl(LiveChannel channel) {
+        if (channel == null) return null;
+        List<String> order = sourceOrder.get(channel.getKey());
+        if (order == null || order.isEmpty()) return null;
+        String stored = order.get(0);
+        // 返回频道里实际的那条线路：1.2.4 保存的旧写法（无 '|请求头'）也能对上，
+        // 下游一律按 equals/indexOf/contains 比较，无需逐处改；列表里没有时原样返回（补回置顶线路用）
+        String actual = resolveStoredLine(channel.getSourceUrls(), stored);
+        return actual != null ? actual : stored;
+    }
+
+    /**
+     * 某线路是否为用户置顶线路。测速剔除不可用线路时应跳过它（用户已确认能播，
+     * 测速可能因缺少请求头或阈值误判）。
+     */
+    public boolean isSourcePinned(LiveChannel channel, String url) {
+        return url != null && url.equals(pinnedUrl(channel));
     }
 
     /**
@@ -1103,10 +1412,22 @@ public class ChannelManager {
                 // 裁剪前记下当前线路：重排时只有正在播放的频道（播放提示）索引非 0，
                 // 一律复位 0 会让它的索引指向播放器并未在播的线路（稳定线路记录/自动换源错位）
                 String cur = ch.getCurrentSourceUrl();
-                List<String> kept = new ArrayList<>(urls.subList(0, urlsLimit));
-                ch.setSourceUrls(kept);
+                // 保留下标：前 urlsLimit 条；用户置顶的线路排在上限之外时换掉最后一条保留，
+                // 否则置顶线路被裁掉、置顶偏好随之静默失效
+                List<Integer> keepIdx0 = new ArrayList<>(urlsLimit);
+                for (int i = 0; i < urlsLimit; i++) keepIdx0.add(i);
+                String pinned = pinnedUrl(ch);
+                int pinnedIdx = pinned == null ? -1 : urls.indexOf(pinned);
+                if (pinnedIdx >= urlsLimit) keepIdx0.set(urlsLimit - 1, pinnedIdx);
+                List<String> kept = new ArrayList<>(urlsLimit);
+                for (int i : keepIdx0) kept.add(urls.get(i));
                 List<Double> speeds = ch.getSpeeds();
-                if (speeds != null && speeds.size() > urlsLimit) {
+                ch.setSourceUrls(kept);
+                if (speeds != null && speeds.size() == urls.size()) {
+                    List<Double> keptSpeeds = new ArrayList<>(urlsLimit);
+                    for (int i : keepIdx0) keptSpeeds.add(speeds.get(i));
+                    ch.setSpeeds(keptSpeeds);
+                } else if (speeds != null && speeds.size() > urlsLimit) {
                     ch.setSpeeds(new ArrayList<>(speeds.subList(0, urlsLimit)));
                 }
                 int keepIdx = cur == null ? -1 : kept.indexOf(cur);
@@ -1128,8 +1449,9 @@ public class ChannelManager {
         if (!Hawk.get(HawkConfig.SPEED_SORT_SOURCES, true)) return;
         List<ChannelGroup> groups = rawGroups;
         if (groups == null) return;
-        final boolean byScore = Hawk.get(HawkConfig.SPEED_SORT_MODE, HawkConfig.SORT_MODE_QUALITY_SCORE)
-                == HawkConfig.SORT_MODE_QUALITY_SCORE;
+        final boolean byScore = isSortByScore();
+        final long roundStart = currentRoundStart();
+        final long abortedAt = netAbortedRoundAt();
         for (ChannelGroup group : new ArrayList<>(groups)) {
             if (group == null) continue;
             for (LiveChannel ch : group.snapshotChannels()) {
@@ -1137,25 +1459,27 @@ public class ChannelManager {
                 List<String> urls = ch.getSourceUrls();
                 if (urls == null || urls.size() < 2) continue;
                 final int n = urls.size();
-                final int[] tier = new int[n];      // 0 可用 / 1 未测(含无法测速) / 2 测速失败
-                final double[] key = new double[n]; // 可用线路的排序值（越大越靠前）
+                final int[] tier = new int[n];      // 0 可用 / 1 未测(含无法测速、旧结果) / 2 测速失败
+                final SpeedTestResult[] res = new SpeedTestResult[n]; // 可用线路的测速结果
                 for (int i = 0; i < n; i++) {
-                    SpeedTestResult r = speedTestEngine.getCachedResult(urls.get(i));
-                    if (r == null || SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) {
-                        tier[i] = 1;
-                    } else if (r.isAvailable()) {
+                    int st = lineStatus(urls.get(i), roundStart, abortedAt);
+                    if (st == ST_OK) {
                         tier[i] = 0;
-                        double v = byScore ? r.getQualityScore() : r.getSpeed();
-                        key[i] = Double.isNaN(v) ? 0d : v;
-                    } else {
+                        res[i] = speedTestEngine.getCachedResult(urls.get(i));
+                        if (res[i] == null) tier[i] = 1; // 读取间隙被清缓存
+                    } else if (st == ST_FAILED) {
                         tier[i] = 2;
+                    } else {
+                        tier[i] = 1;
                     }
                 }
                 List<Integer> order = new ArrayList<>(n);
                 for (int i = 0; i < n; i++) order.add(i);
+                // 同档内与 pickBestSource 同一比较规则（主键 → 次键 → 原顺序），
+                // 否则同分时播放的首条与本地列表写入的"最佳线路"不是同一条
                 java.util.Collections.sort(order, (a, b) -> {
                     if (tier[a] != tier[b]) return Integer.compare(tier[a], tier[b]);
-                    if (tier[a] == 0) return Double.compare(key[b], key[a]);
+                    if (tier[a] == 0) return compareAvailable(res[a], res[b], byScore);
                     return 0;
                 });
                 // 把排序结果转成名次分数交给 LiveChannel（稳定排序，speeds 同步跟随）
@@ -1187,28 +1511,276 @@ public class ChannelManager {
     public void persistAfterSpeedTest() {
         ioExecutor.execute(() -> {
             try {
-                // 裁剪前按测速缓存（以 URL 为键）重排当前 rawGroups 的线路：若测速期间
-                // rawGroups 被源刷新整体替换，测速引擎排序的是已被丢弃的旧对象，
-                // 新对象仍是拉取顺序，直接截断会丢掉测出的最佳线路。对未被替换的情况幂等。
-                reorderRawByCachedResults();
-                // 测速已覆盖全部线路，此处按“单频道最多线路”只保留最佳的若干条
-                // （可用线路已按质量排在前面），控制长期内存与数据库体积
-                applyUrlsLimitToRaw();
-                // 重建展示列表以反映测速后的线路排序与过滤
-                rebuildDisplayGroups();
-                // 重建完成后通知界面重同步（列表与播放线路索引），见 speedTestPersistedListener
-                notifySpeedTestPersisted();
-                // 持久化频道数据（含排序后的线路顺序与速度）
-                saveToDatabase(rawGroups);
-                // 生成并持久化"最佳线路"本地播放列表
-                String playlist = generateLocalPlaylist();
-                saveLocalPlaylist(playlist);
-                Timber.i("测速后已生成并持久化最佳线路本地播放列表");
+                // 与刷新源替换 rawGroups 互斥：刷新结果不会在重排/裁剪/写库中途换掉列表，
+                // 也不会在持久化之后以未排序的拉取顺序覆盖测速结果（刷新侧同样会按缓存重排）
+                synchronized (rawLock) {
+                    persistAfterSpeedTestLocked();
+                }
             } catch (Throwable e) {
                 // 生成/序列化大列表在低内存设备上可能 OOM（Error），需兜住
                 Timber.e(e, "测速后持久化本地播放列表失败");
             }
         });
+    }
+
+    private void persistAfterSpeedTestLocked() {
+        // 用引擎记录的本轮起点判定本轮是否断网（currentRoundStart 在断网标记存在时会回退到上一正常轮）
+        final long roundStart = engineRoundStart();
+        // 断网/网络异常的一轮：几乎所有线路都因网络错误失败。若照常应用，所有频道都会被判为
+        // "全部线路不可用"而隐藏，本地列表被空列表覆盖，且失败结果已落盘，之后每次启动都是空列表。
+        // 此时不过滤、不裁剪、不写库、不生成本地列表，并把本轮失败记为"未测"。
+        long[] stats = countRoundResults(rawGroups, roundStart);
+        if (isNetworkDownRound(stats)) {
+            long at = roundStart > 0 ? roundStart : stats[3];
+            try {
+                // 连续多轮断网：保留最早一轮的起点，前几轮断网写入的失败同样继续视为"未测"
+                long prev = netAbortedRoundAt();
+                Hawk.put(KEY_NET_ABORTED_ROUND_AT, Math.max(1L, prev > 0 ? Math.min(prev, at) : at));
+            } catch (Throwable ignore) {
+            }
+            restorePinnedSources(roundStart, rawReplacedAt > roundStart);
+            // 引擎已按本轮（断网）结果重排：之前最佳的线路因网络失败被排到末尾。
+            // 按上一正常轮的结论重排回去（断网失败视为未测），避免会话内与之后刷新都先播失效线路
+            try {
+                reorderRawByCachedResults();
+            } catch (Throwable t) {
+                Timber.w(t, "断网轮次后按测速缓存重排线路失败");
+            }
+            rebuildDisplayGroups();
+            notifySpeedTestPersisted();
+            Timber.w("本轮测速 %d 条线路中仅 %d 条可用、%d 条因网络错误失败，疑似网络不可用，测速结果未应用",
+                    stats[0], stats[1], stats[2]);
+            return;
+        }
+        // 正常的一轮：之前断网轮次的标记失效（其失败结果已早于本轮开始，按"旧结果"处理）
+        try {
+            Hawk.delete(KEY_NET_ABORTED_ROUND_AT);
+            if (roundStart > 0) Hawk.put(KEY_LAST_HEALTHY_ROUND_AT, roundStart);
+        } catch (Throwable ignore) {
+        }
+
+        // 测速期间 rawGroups 被刷新整体替换：测速引擎的剔除/测速值/排序作用在已被丢弃的旧对象上，
+        // 这里按 URL 对当前列表补做一遍（与引擎同一规则），否则失败线路留在列表里、速度不显示
+        final boolean swapped = roundStart > 0 && rawReplacedAt > roundStart;
+        if (swapped) {
+            applyRoundResultsByUrl(roundStart);
+        } else {
+            // 未被替换：引擎可能已把用户置顶的线路当作不可用删掉，按 URL 补回
+            restorePinnedSources(roundStart, false);
+        }
+        // 裁剪前按测速缓存（以 URL 为键）重排当前 rawGroups 的线路：若测速期间
+        // rawGroups 被源刷新整体替换，测速引擎排序的是已被丢弃的旧对象，
+        // 新对象仍是拉取顺序，直接截断会丢掉测出的最佳线路。对未被替换的情况幂等。
+        reorderRawByCachedResults();
+        // 测速已覆盖全部线路，此处按“单频道最多线路”只保留最佳的若干条
+        // （可用线路已按质量排在前面，置顶线路始终保留），控制长期内存与数据库体积
+        applyUrlsLimitToRaw();
+        // 重建展示列表以反映测速后的线路排序与过滤
+        rebuildDisplayGroups();
+        // 重建完成后通知界面重同步（列表与播放线路索引），见 speedTestPersistedListener
+        notifySpeedTestPersisted();
+        // 持久化频道数据（含排序后的线路顺序与速度）
+        saveToDatabase(rawGroups);
+        // 生成并持久化"最佳线路"本地播放列表
+        String playlist = generateLocalPlaylist();
+        if (playlist == null || playlist.isEmpty()) {
+            // 一个可用频道都没有：绝不用空列表覆盖已有的本地列表
+            Timber.w("测速后没有可写入本地列表的频道，保留原有本地列表");
+            return;
+        }
+        // 列表在测速中途被替换且有频道一条线路都没测到：内容照常保存（供恢复），
+        // 但不刷新"本地列表生成时间"，不把未测速的列表当作测速结果
+        boolean stamp = !(swapped && countUntestedChannels(roundStart) > 0);
+        saveLocalPlaylist(playlist, stamp);
+        Timber.i("测速后已生成并持久化最佳线路本地播放列表%s", stamp ? "" : "（列表中途被刷新，未记为已测速）");
+    }
+
+    /**
+     * 统计 groups 中各线路在本轮（roundStart 之后）的测速结果。
+     *
+     * @return [已测(不含无法测速), 可用, 网络类失败(DNS/连接/超时), 最早测速时间]
+     */
+    private long[] countRoundResults(List<ChannelGroup> groups, long roundStart) {
+        long tested = 0, ok = 0, netFail = 0, minTime = Long.MAX_VALUE;
+        if (groups == null) return new long[]{0, 0, 0, 0};
+        java.util.HashSet<String> seen = new java.util.HashSet<>();
+        for (ChannelGroup g : new ArrayList<>(groups)) {
+            if (g == null) continue;
+            for (LiveChannel ch : g.snapshotChannels()) {
+                if (ch == null || ch.getSourceUrls() == null) continue;
+                for (String url : ch.getSourceUrls()) {
+                    if (url == null || !seen.add(url)) continue;
+                    SpeedTestResult r = speedTestEngine.getCachedResult(url);
+                    if (r == null || r.getTestTime() < roundStart) continue;
+                    if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) continue;
+                    tested++;
+                    if (r.getTestTime() > 0 && r.getTestTime() < minTime) minTime = r.getTestTime();
+                    if (r.isAvailable()) {
+                        ok++;
+                    } else if (isNetworkFailure(r.getFailureType())) {
+                        netFail++;
+                    }
+                }
+            }
+        }
+        return new long[]{tested, ok, netFail, minTime == Long.MAX_VALUE ? 0 : minTime};
+    }
+
+    /** DNS 解析失败 / 连接失败等（OTHER）/ 超时：断网或网络异常时线路全部表现为这几类 */
+    public static boolean isNetworkFailure(String failureType) {
+        return "DNS".equals(failureType) || "OTHER".equals(failureType) || "TIMEOUT".equals(failureType);
+    }
+
+    /**
+     * 本轮是否疑似网络不可用：一条可用线路都没有；或可用不足 2% 且 90% 以上的失败是网络类错误。
+     * 网络正常时总有相当比例的线路可用，不会触发。
+     */
+    public static boolean isNetworkDownRound(long[] stats) {
+        long tested = stats[0], ok = stats[1], netFail = stats[2];
+        if (tested <= 0) return false;
+        if (ok == 0) return true;
+        return ok * 50 < tested && netFail * 10 >= tested * 9;
+    }
+
+    /**
+     * 列表在测速中途被替换时，按 URL 把本轮结果补用到当前 rawGroups：
+     * 剔除本轮明确失败的线路（与测速引擎同一规则：全部失败时保留；置顶线路不剔除），
+     * 并写入各线路速度与频道最佳速度/评分/分辨率。
+     */
+    private void applyRoundResultsByUrl(long roundStart) {
+        List<ChannelGroup> groups = rawGroups;
+        if (groups == null) return;
+        boolean filter = true;
+        try {
+            filter = Hawk.get(HawkConfig.SPEED_FILTER_UNAVAILABLE, true);
+        } catch (Throwable ignore) {
+        }
+        long now = System.currentTimeMillis();
+        for (ChannelGroup g : new ArrayList<>(groups)) {
+            if (g == null) continue;
+            for (LiveChannel ch : g.snapshotChannels()) {
+                if (ch == null) continue;
+                synchronized (ch) {
+                    List<String> urls = ch.getSourceUrls();
+                    if (urls == null || urls.isEmpty()) continue;
+                    boolean anyTested = false;
+                    if (filter) {
+                        String pinned = pinnedUrl(ch);
+                        List<String> toRemove = new ArrayList<>();
+                        // 与引擎 removeUnavailableSources 同一口径："全部失败"按本轮实际测到的线路算
+                        // （不含无法测速/未测/旧结果）。原先按全部线路算，测到的都失败但还有一条未测时
+                        // 会把测到的全删掉，比未替换列表的正常路径更激进
+                        int tested = 0, failed = 0;
+                        for (String url : urls) {
+                            if (url == null) continue;
+                            int st = lineStatus(url, roundStart, 0L);
+                            if (st != ST_OK && st != ST_FAILED) continue;
+                            tested++;
+                            if (st != ST_FAILED) continue;
+                            failed++;
+                            if (!url.equals(pinned)) toRemove.add(url);
+                        }
+                        if (!toRemove.isEmpty() && failed < tested) {
+                            for (String url : toRemove) ch.removeSource(url);
+                        }
+                    }
+                    urls = ch.getSourceUrls();
+                    List<Double> speeds = new ArrayList<>(urls.size());
+                    List<Double> oldSpeeds = ch.getSpeeds();
+                    double bestSpeed = 0;
+                    int bestScore = 0;
+                    String bestResolution = null;
+                    for (int i = 0; i < urls.size(); i++) {
+                        SpeedTestResult r = speedTestEngine.getCachedResult(urls.get(i));
+                        boolean current = r != null && r.getTestTime() >= roundStart;
+                        double old = oldSpeeds != null && i < oldSpeeds.size() && oldSpeeds.get(i) != null
+                                ? oldSpeeds.get(i) : 0d;
+                        speeds.add(current ? safe(r.getSpeed()) : old);
+                        if (!current) continue;
+                        anyTested = true;
+                        if (r.getSpeed() > bestSpeed) bestSpeed = r.getSpeed();
+                        if (r.getQualityScore() > bestScore) {
+                            bestScore = r.getQualityScore();
+                            if (r.getResolution() != null) bestResolution = r.getResolution();
+                        }
+                    }
+                    ch.setSpeeds(speeds);
+                    if (anyTested) {
+                        ch.setBestSpeed(bestSpeed);
+                        ch.setBestQualityScore(bestScore);
+                        if (bestResolution != null) ch.setBestResolution(bestResolution);
+                        ch.setLastSpeedTestTime(now);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 把被测速剔除的用户置顶线路补回频道首位。
+     * 仅当列表未被替换、且该线路本轮确实测过（说明测速开始时它就在列表里，是被测速删掉的，
+     * 而不是上游已下线）时补回；被拉黑的线路不会补回（拉黑时已从置顶顺序中移除）。
+     */
+    private void restorePinnedSources(long roundStart, boolean swapped) {
+        if (swapped || roundStart <= 0 || sourceOrder.isEmpty()) return;
+        List<ChannelGroup> groups = rawGroups;
+        if (groups == null) return;
+        int restored = 0;
+        for (ChannelGroup g : new ArrayList<>(groups)) {
+            if (g == null) continue;
+            for (LiveChannel ch : g.snapshotChannels()) {
+                if (ch == null) continue;
+                String pinned = pinnedUrl(ch);
+                if (pinned == null || isSourceBlacklisted(ch, pinned)) continue;
+                SpeedTestResult r = speedTestEngine.getCachedResult(pinned);
+                if (r == null || r.getTestTime() < roundStart) continue;
+                synchronized (ch) {
+                    List<String> urls = ch.getSourceUrls();
+                    if (urls == null || urls.contains(pinned)) continue;
+                    List<String> newUrls = new ArrayList<>(urls.size() + 1);
+                    newUrls.add(pinned);
+                    newUrls.addAll(urls);
+                    List<Double> sp = ch.getSpeeds();
+                    List<Double> newSpeeds = new ArrayList<>(urls.size() + 1);
+                    newSpeeds.add(safe(r.getSpeed()));
+                    if (sp != null && sp.size() == urls.size()) {
+                        newSpeeds.addAll(sp);
+                    } else {
+                        newSpeeds.addAll(java.util.Collections.nCopies(urls.size(), 0d));
+                    }
+                    int idx = Math.max(0, ch.getSourceIndex());
+                    ch.setSourceUrls(newUrls);
+                    ch.setSpeeds(newSpeeds);
+                    // 插到首位后原索引整体后移一位，保持指向原来在播的线路
+                    ch.setSourceIndex(urls.isEmpty() ? 0 : Math.min(idx, urls.size() - 1) + 1);
+                    restored++;
+                }
+            }
+        }
+        if (restored > 0) Timber.i("已补回 %d 条被测速剔除的置顶线路", restored);
+    }
+
+    /** 当前 rawGroups 中所有线路都没有本轮测速结果的频道数 */
+    private int countUntestedChannels(long roundStart) {
+        List<ChannelGroup> groups = rawGroups;
+        if (groups == null) return 0;
+        int n = 0;
+        for (ChannelGroup g : new ArrayList<>(groups)) {
+            if (g == null) continue;
+            for (LiveChannel ch : g.snapshotChannels()) {
+                if (ch == null || ch.getSourceUrls() == null || ch.getSourceUrls().isEmpty()) continue;
+                boolean any = false;
+                for (String url : ch.getSourceUrls()) {
+                    SpeedTestResult r = speedTestEngine.getCachedResult(url);
+                    if (r != null && r.getTestTime() >= roundStart) {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any) n++;
+            }
+        }
+        return n;
     }
 
     /** 设置测速后持久化（重建展示列表）完成的主线程回调；传 null 清除 */
@@ -1236,18 +1808,34 @@ public class ChannelManager {
     }
 
     /**
-     * 为每个频道选出最佳线路，生成 TXT 格式的本地播放列表。
-     * 格式：分组名,#genre# 起始，随后每行 "频道名,最佳URL"。
+     * 为每个频道选出最佳线路，生成本地播放列表（v2 JSON 格式）。
      *
-     * <p>无可用播放源的频道会被<b>整个剔除</b>，不写入列表；
-     * 剔除后若某分组一个频道都不剩，该分组标题也不会出现（headerWritten 惰性写入）。
+     * <p>旧版写 TXT（"频道名,最佳URL"）：频道名含逗号（如 "CCTV-1,综合"）恢复时被拆坏，
+     * 且只留一条线路、丢掉 EPG id 与台标。这里改为 JSON，字符串全部转义，每个频道写入：
+     * 名称、编号、EPG id、台标，以及最佳线路在首位、其余未明确失败的备用线路（已按上限裁剪）。
+     * 读取时仍兼容旧 TXT（见 {@link #restoreFromLocalPlaylist}）。
+     *
+     * <p>无可用播放源的频道会被<b>整个剔除</b>，不写入列表；剔除后为空的分组也不写入。
+     * 一个频道都没有时返回空串（调用方据此不覆盖已有本地列表）。
      */
     public synchronized String generateLocalPlaylist() {
-        StringBuilder sb = new StringBuilder();
         List<ChannelGroup> groups = rawGroups;
         if (groups == null) return "";
+        final long roundStart = currentRoundStart();
+        final long abortedAt = netAbortedRoundAt();
+        final boolean byScore = isSortByScore();
+        int urlsLimit = HawkConfig.DEFAULT_URLS_LIMIT;
+        try {
+            urlsLimit = Hawk.get(HawkConfig.IPTV_URLS_LIMIT, HawkConfig.DEFAULT_URLS_LIMIT);
+        } catch (Throwable ignore) {
+        }
+        final int maxUrls = urlsLimit > 0 ? urlsLimit : LOCAL_PLAYLIST_MAX_URLS_UNLIMITED;
+        StringBuilder sb = new StringBuilder();
+        sb.append("{\"format\":").append(org.json.JSONObject.quote(LOCAL_PLAYLIST_JSON_FORMAT))
+                .append(",\"groups\":[");
         int kept = 0;
         int skipped = 0;
+        boolean firstGroup = true;
         for (ChannelGroup group : new ArrayList<>(groups)) {
             if (group == null || group.getChannels() == null || group.getChannels().isEmpty()) continue;
             String groupName = group.getGroupName() != null ? group.getGroupName() : "未分类";
@@ -1256,106 +1844,195 @@ public class ChannelManager {
                 if (channel == null) continue;
                 String name = channel.getChannelName();
                 if (name == null || name.trim().isEmpty()) continue;
-                String bestUrl = pickBestSource(channel);
+                String bestUrl = pickBestSource(channel, roundStart, abortedAt, byScore);
                 if (bestUrl == null || bestUrl.isEmpty()) {
                     // 该频道所有线路均无可用源：不写入节目列表
                     skipped++;
                     continue;
                 }
                 if (!headerWritten) {
-                    sb.append(groupName).append(",#genre#").append('\n');
+                    if (!firstGroup) sb.append(',');
+                    firstGroup = false;
+                    sb.append("{\"name\":").append(org.json.JSONObject.quote(groupName))
+                            .append(",\"channels\":[");
                     headerWritten = true;
+                } else {
+                    sb.append(',');
                 }
-                sb.append(name).append(',').append(bestUrl).append('\n');
+                sb.append("{\"name\":").append(org.json.JSONObject.quote(name));
+                appendOptional(sb, "num", channel.getChannelNum());
+                appendOptional(sb, "epg", channel.getEpgId());
+                appendOptional(sb, "logo", channel.getLogoUrl());
+                sb.append(",\"urls\":[").append(org.json.JSONObject.quote(bestUrl));
+                // 备用线路：保持当前顺序（已按测速排序），跳过明确失败的（置顶线路除外）。
+                // 线路数已按上限裁剪；"不限制"时另设上限，避免大列表生成数 MB 的文件
+                String pinned = pinnedUrl(channel);
+                List<String> urls = channel.getSourceUrls();
+                if (urls != null) {
+                    int written = 1;
+                    // 置顶线路尚未写入时为它留一个名额，保证它总在列表里
+                    boolean pinnedPending = pinned != null && !bestUrl.equals(pinned) && urls.contains(pinned);
+                    for (String url : urls) {
+                        if (url == null || url.isEmpty() || url.equals(bestUrl)) continue;
+                        boolean isPinned = url.equals(pinned);
+                        if (!isPinned && lineStatus(url, roundStart, abortedAt) == ST_FAILED) continue;
+                        if (!isPinned && maxUrls - written - (pinnedPending ? 1 : 0) <= 0) continue;
+                        sb.append(',').append(org.json.JSONObject.quote(url));
+                        written++;
+                        if (isPinned) pinnedPending = false;
+                    }
+                }
+                sb.append("]}");
                 kept++;
             }
+            if (headerWritten) sb.append("]}");
         }
+        sb.append("]}");
         Timber.i("生成本地播放列表: 保留 %d 个频道，剔除 %d 个无可用源频道", kept, skipped);
-        return sb.toString();
+        return kept > 0 ? sb.toString() : "";
+    }
+
+    private static void appendOptional(StringBuilder sb, String key, String value) {
+        if (value == null || value.isEmpty()) return;
+        sb.append(",\"").append(key).append("\":").append(org.json.JSONObject.quote(value));
     }
 
     /**
      * 选出频道的最佳线路 URL：
-     * 优先取测速缓存中"可用 + 综合评分最高（同分取速度更快）"的线路。
+     * 优先取"本轮测速可用"的线路，比较规则与线路重排一致（见 {@link #compareAvailable}：
+     * 当前排序模式的主键 → 另一指标 → 原顺序），保证同分时与播放的首条是同一条。
      *
-     * <p><b>无可用线路时返回 null</b>，由调用方把该频道从节目列表中剔除：
-     * 若回退到"排序后的首个线路"，那些已被测速判定为不可用的频道也会出现在
-     * 本地节目列表里，用户点进去只会黑屏/转圈，体验比直接不显示更差。
-     *
-     * <p>例外：RTSP/RTMP 等协议无法测速（标记 UNTESTABLE），它们没有测速结果
-     * 但线路本身可能可播，这类线路仍然保留。同理，若整个频道的所有线路都没有
-     * 测速记录（例如被单轮测速的线路配额截断、从未测过），也保留首个线路，
-     * 避免因"未测速"而误删实际可用的频道。
+     * <p>没有可用线路时依次回退：无法测速的协议线路（RTSP/RTMP）→ 未测线路
+     * （无记录、被单轮配额截断、早于本轮的旧结果、断网轮次的失败；取列表中第一条，
+     * 重排后未测线路排在失败线路之前）→ 用户置顶线路。
+     * <b>只有全部线路都在本轮明确失败时返回 null</b>，由调用方把该频道从节目列表中剔除，
+     * 避免用户点进去只能黑屏/转圈。原先只要测过的线路都失败就剔除整个频道，
+     * 配额外从未测过、可能可用的线路被一并丢掉。
      */
-    private String pickBestSource(LiveChannel channel) {
+    private String pickBestSource(LiveChannel channel, long roundStart, long abortedAt, boolean byScore) {
         List<String> urls = channel.getSourceUrls();
         if (urls == null || urls.isEmpty()) return null;
 
         String bestUrl = null;
-        int bestScore = Integer.MIN_VALUE;
-        double bestSpeed = -1;
-        boolean anyTested = false;      // 是否有任意线路存在测速记录
+        SpeedTestResult best = null;
         String untestableUrl = null;    // 无法测速但可能可播的线路（RTSP/RTMP）
+        String untestedUrl = null;      // 本轮未测到的线路
 
         for (String url : urls) {
-            SpeedTestResult r = speedTestEngine.getCachedResult(url);
-            if (r == null) continue;    // 无测速记录
-            if (!r.isAvailable()) {
-                // 无法测速的协议不算"测速失败"，记下来作为兜底候选
-                if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) {
-                    if (untestableUrl == null) untestableUrl = url;
-                } else {
-                    anyTested = true;   // 明确测出不可用
+            int st = lineStatus(url, roundStart, abortedAt);
+            if (st == ST_OK) {
+                SpeedTestResult r = speedTestEngine.getCachedResult(url);
+                if (r == null) {
+                    if (untestedUrl == null) untestedUrl = url;
+                    continue;
                 }
-                continue;
-            }
-            anyTested = true;
-            int score = r.getQualityScore();
-            double speed = r.getSpeed();
-            if (score > bestScore || (score == bestScore && speed > bestSpeed)) {
-                bestScore = score;
-                bestSpeed = speed;
-                bestUrl = url;
+                // 严格更优才替换：完全相同时保留列表中靠前的一条，与稳定排序一致
+                if (best == null || compareAvailable(r, best, byScore) < 0) {
+                    best = r;
+                    bestUrl = url;
+                }
+            } else if (st == ST_UNTESTABLE) {
+                if (untestableUrl == null) untestableUrl = url;
+            } else if (st == ST_UNTESTED) {
+                if (untestedUrl == null) untestedUrl = url;
             }
         }
 
         if (bestUrl != null) return bestUrl;
         // 无可用线路，但有无法测速的协议线路 → 保留它
         if (untestableUrl != null) return untestableUrl;
-        // 所有线路都明确测速失败 → 返回 null，调用方剔除该频道
-        if (anyTested) return null;
-        // 完全没有测速记录（未测过/被配额截断）→ 保留首个线路，避免误删
-        return urls.get(0);
+        // 有本轮未测到的线路 → 保留它，避免误删
+        if (untestedUrl != null) return untestedUrl;
+        // 用户置顶的线路（用户确认能播）→ 保留
+        String pinned = pinnedUrl(channel);
+        if (pinned != null && urls.contains(pinned)) return pinned;
+        // 所有线路都在本轮明确测速失败 → 返回 null，调用方剔除该频道
+        return null;
     }
 
     /**
-     * 持久化本地播放列表：写入 Hawk（含生成时间）并落盘到 filesDir。
+     * 持久化本地播放列表：写入 Hawk 并落盘到 filesDir。
+     *
+     * @param stamp 是否刷新"生成时间"。列表在测速中途被替换、含未测速频道时传 false：
+     *              内容照常保存（供数据库丢失时恢复），但不当作一次完整测速的结果。
      */
-    private void saveLocalPlaylist(String content) {
+    private void saveLocalPlaylist(String content, boolean stamp) {
         if (content == null) content = "";
-        try {
-            Hawk.put(HawkConfig.LIVE_LOCAL_PLAYLIST, content);
-            Hawk.put(HawkConfig.LIVE_LOCAL_PLAYLIST_TIME, System.currentTimeMillis());
-        } catch (Exception e) {
-            Timber.w(e, "写入本地播放列表到 Hawk 失败");
-        }
+        // 完整内容只落盘到文件，Hawk 里只放小标记：v2 JSON 带全部备用线路，大列表可达 MB 级，
+        // 而 Hawk 整个存在一份 SharedPreferences XML 里，启动时整份解析、任何 Hawk.put 都整份重写，
+        // 低内存盒子上会明显卡顿/占内存。先写临时文件再改名，写到一半断电不会留下半截 JSON。
+        boolean onDisk = false;
         try {
             File file = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME);
-            try (FileOutputStream fos = new FileOutputStream(file)) {
+            File tmp = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME + ".tmp");
+            try (FileOutputStream fos = new FileOutputStream(tmp)) {
                 fos.write(content.getBytes("UTF-8"));
+                try {
+                    fos.getFD().sync();
+                } catch (Throwable ignore) {
+                }
             }
+            if (!tmp.renameTo(file)) {
+                // 个别文件系统不允许覆盖式改名：删掉旧文件再改名
+                file.delete();
+                if (!tmp.renameTo(file)) throw new java.io.IOException("rename failed");
+            }
+            onDisk = true;
             Timber.d("本地播放列表已落盘: %s", file.getAbsolutePath());
         } catch (Exception e) {
             Timber.w(e, "本地播放列表落盘失败");
         }
+        try {
+            // 落盘失败（如存储已满）时退回把内容存进 Hawk，保证仍能恢复
+            Hawk.put(HawkConfig.LIVE_LOCAL_PLAYLIST, onDisk ? LOCAL_PLAYLIST_FILE_MARKER : content);
+            if (stamp) Hawk.put(HawkConfig.LIVE_LOCAL_PLAYLIST_TIME, System.currentTimeMillis());
+        } catch (Exception e) {
+            Timber.w(e, "写入本地播放列表到 Hawk 失败");
+        }
     }
 
-    /** 获取已持久化的最佳线路本地播放列表（无则返回空串） */
+    /** 获取已持久化的最佳线路本地播放列表（无则返回空串）。内容只在文件中时读文件 */
     public String getLocalPlaylist() {
+        String content = "";
         try {
-            return Hawk.get(HawkConfig.LIVE_LOCAL_PLAYLIST, "");
-        } catch (Exception e) {
-            return "";
+            content = Hawk.get(HawkConfig.LIVE_LOCAL_PLAYLIST, "");
+        } catch (Exception ignore) {
+        }
+        if (content == null || content.isEmpty() || LOCAL_PLAYLIST_FILE_MARKER.equals(content)) {
+            String fromFile = readLocalPlaylistFile();
+            return fromFile != null ? fromFile : "";
+        }
+        return content;
+    }
+
+    /**
+     * 完整读取本地列表文件。原先单次 read 且截断到 8MB：JSON 被截断/短读后整体解析失败。
+     * 这里循环读到 EOF；超过上限视为异常文件直接放弃（不读半截）。
+     */
+    private String readLocalPlaylistFile() {
+        try {
+            File file = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME);
+            if (!file.exists()) return null;
+            long len = file.length();
+            if (len <= 0) return null;
+            if (len > LOCAL_PLAYLIST_MAX_FILE_BYTES) {
+                Timber.w("本地播放列表文件过大(%d 字节)，放弃读取", len);
+                return null;
+            }
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream((int) len);
+            byte[] buf = new byte[64 * 1024];
+            try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
+                int n;
+                while ((n = fis.read(buf)) != -1) {
+                    bos.write(buf, 0, n);
+                    if (bos.size() > LOCAL_PLAYLIST_MAX_FILE_BYTES) return null;
+                }
+            }
+            return bos.size() > 0 ? new String(bos.toByteArray(), "UTF-8") : null;
+        } catch (Throwable e) {
+            // 含低内存下的 OOM
+            Timber.w(e, "读取本地播放列表文件失败");
+            return null;
         }
     }
 
@@ -1364,26 +2041,15 @@ public class ChannelManager {
      * 用于数据库为空但本地列表仍存在时的兜底复用，避免必须联网重新拉取。
      */
     private List<ChannelGroup> restoreFromLocalPlaylist() {
+        // Hawk 内容为文件标记或缺失时读取落盘文件（见 getLocalPlaylist）
         String content = getLocalPlaylist();
-        // Hawk 内容缺失时尝试读取落盘文件
-        if (content == null || content.isEmpty()) {
-            try {
-                File file = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME);
-                if (file.exists()) {
-                    byte[] buf = new byte[(int) Math.min(file.length(), 8 * 1024 * 1024)];
-                    try (java.io.FileInputStream fis = new java.io.FileInputStream(file)) {
-                        int read = fis.read(buf);
-                        if (read > 0) content = new String(buf, 0, read, "UTF-8");
-                    }
-                }
-            } catch (Exception e) {
-                Timber.w(e, "读取本地播放列表文件失败");
-            }
-        }
         if (content == null || content.trim().isEmpty()) return null;
         try {
-            // 本地列表为 TXT 格式（分组,#genre# + 频道名,URL）
-            List<ChannelGroup> restored = new LiveSourceParser().parseTxt(content);
+            // v2 为 JSON（含编号/EPG id/台标/备用线路）；旧版为 TXT 格式（分组,#genre# + 频道名,URL）
+            List<ChannelGroup> restored = content.trim().startsWith("{")
+                    ? parseLocalPlaylistJson(content)
+                    : new LiveSourceParser().parseTxt(content);
+            if (restored == null) return null;
             // 兜底清理历史本地列表中可能残留的不支持协议线路
             com.github.tvbox.osc.util.ProtocolFilter.filter(restored);
             return restored;
@@ -1394,14 +2060,73 @@ public class ChannelManager {
     }
 
     /**
+     * 解析 v2（JSON）本地列表。格式不符时返回 null。
+     * 频道名原样保留（不做名称标准化），保证置顶/拉黑等按"分组+名称"保存的偏好仍能匹配。
+     */
+    static List<ChannelGroup> parseLocalPlaylistJson(String content) throws org.json.JSONException {
+        org.json.JSONObject root = new org.json.JSONObject(content.trim());
+        if (!LOCAL_PLAYLIST_JSON_FORMAT.equals(jsonString(root, "format"))) return null;
+        org.json.JSONArray groups = root.optJSONArray("groups");
+        List<ChannelGroup> result = new ArrayList<>();
+        if (groups == null) return result;
+        for (int gi = 0; gi < groups.length(); gi++) {
+            org.json.JSONObject go = groups.optJSONObject(gi);
+            if (go == null) continue;
+            String groupName = jsonString(go, "name");
+            if (groupName == null || groupName.isEmpty()) groupName = "未分类";
+            ChannelGroup group = new ChannelGroup(groupName, result.size());
+            org.json.JSONArray chs = go.optJSONArray("channels");
+            if (chs == null) continue;
+            for (int ci = 0; ci < chs.length(); ci++) {
+                org.json.JSONObject co = chs.optJSONObject(ci);
+                if (co == null) continue;
+                String name = jsonString(co, "name");
+                if (name == null || name.trim().isEmpty()) continue;
+                LiveChannel ch = new LiveChannel(name, groupName);
+                String num = jsonString(co, "num");
+                if (num != null) ch.setChannelNum(num);
+                String epg = jsonString(co, "epg");
+                if (epg != null) ch.setEpgId(epg);
+                String logo = jsonString(co, "logo");
+                if (logo != null) ch.setLogoUrl(logo);
+                org.json.JSONArray urls = co.optJSONArray("urls");
+                if (urls != null) {
+                    for (int ui = 0; ui < urls.length(); ui++) {
+                        // 先判类型：AOSP 的 optString 对 null 值会返回 "null"
+                        Object u = urls.opt(ui);
+                        if (u instanceof String) ch.addSourceUrl((String) u);
+                    }
+                }
+                if (ch.getSourceCount() > 0) group.addChannel(ch);
+            }
+            if (group.getChannelCount() > 0) {
+                group.setGroupIndex(result.size());
+                result.add(group);
+            }
+        }
+        return result;
+    }
+
+    /** 读取字符串字段；缺失或非字符串（含 JSON null）返回 null */
+    private static String jsonString(org.json.JSONObject o, String key) {
+        Object v = o.opt(key);
+        return v instanceof String ? (String) v : null;
+    }
+
+    /**
      * 是否已存在测速生成的本地播放列表。
      * 作为"默认使用本地列表 / 否则提醒测速"的判定依据。
      */
     public boolean hasLocalPlaylist() {
         try {
             long time = Hawk.get(HawkConfig.LIVE_LOCAL_PLAYLIST_TIME, 0L);
+            if (time <= 0) return false;
+            // 只读 Hawk 中的小标记 + 文件是否存在，不加载整份列表内容（启动/界面会多次调用）
             String content = Hawk.get(HawkConfig.LIVE_LOCAL_PLAYLIST, "");
-            return time > 0 && content != null && !content.isEmpty();
+            if (content == null || content.isEmpty()) return false;
+            if (!LOCAL_PLAYLIST_FILE_MARKER.equals(content)) return true; // 旧版或落盘失败时的内嵌内容
+            File file = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME);
+            return file.exists() && file.length() > 0;
         } catch (Exception e) {
             return false;
         }
@@ -1418,6 +2143,8 @@ public class ChannelManager {
         try {
             File file = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME);
             if (file.exists()) file.delete();
+            File tmp = new File(context.getFilesDir(), HawkConfig.LOCAL_PLAYLIST_FILE_NAME + ".tmp");
+            if (tmp.exists()) tmp.delete();
         } catch (Exception e) {
             Timber.w(e, "删除本地播放列表文件失败");
         }
@@ -1426,12 +2153,11 @@ public class ChannelManager {
     // ============ 私有方法 ============
 
     private void fetchAndUpdateChannels(ChannelCallback callback) {
+        final String fp = sourceConfigFingerprint();
         iptvApiService.fetchAndMergeSources(new IptvApiService.FetchCallback() {
             @Override
             public void onSuccess(List<ChannelGroup> groups, int totalChannels) {
-                rawGroups = groups;
-                rebuildDisplayGroups();
-                saveToDatabase(groups);
+                applyRefreshedGroups(groups, fp);
                 if (callback != null) callback.onChannelsLoaded(channelGroups);
             }
 

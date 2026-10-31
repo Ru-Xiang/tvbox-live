@@ -5,11 +5,13 @@ import com.github.tvbox.osc.bean.LiveChannel;
 import com.github.tvbox.osc.util.ChannelNameMatcher;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.IpVersionFilter;
+import com.github.tvbox.osc.util.StreamUrl;
 import com.github.tvbox.osc.api.LiveSourceParser;
 import com.orhanobut.hawk.Hawk;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -17,11 +19,13 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 import org.json.JSONArray;
@@ -100,6 +104,46 @@ public class IptvApiService {
      */
     private static final long CALL_TIMEOUT_SEC = 300L;
 
+    /** 嵌套多仓（多仓的子仓又是多仓 / storeHouse）最多展开的层数 */
+    private static final int MAX_REPO_DEPTH = 2;
+    /** 一次展开（含各层子仓）累计下载的子仓数上限，防止嵌套多仓把请求数放大成成百上千 */
+    private static final int MAX_TOTAL_REPOS = 100;
+
+    /** 探测源类型时先读取的字节数：足以判断是不是 JSON / Base64 / 图片配置 */
+    private static final int PROBE_SNIFF_BYTES = 16 * 1024;
+    /** 探测阶段的整体等待上限（毫秒）；超时未完成的探测按普通源保留 */
+    private static final long PROBE_PHASE_TIMEOUT_MS = 25_000L;
+    /** 单个探测请求的整体超时（秒） */
+    private static final long PROBE_CALL_TIMEOUT_SEC = 30L;
+    /** 图片配置（配置藏在图片末尾）最多读取的总字节数；超过上限部分只保留尾部 */
+    private static final long IMAGE_MAX_TOTAL_BYTES = 8L * 1024 * 1024;
+
+    /** 未设置 ua 时拉取播放列表的默认 UA（与旧版一致） */
+    private static final String SOURCE_FETCH_UA = "TVBoxOS-Live/1.0";
+    private static final String REPO_FETCH_UA = "okhttp/4.9.0";
+
+    /**
+     * 本轮展开得到的 lives 条目参数（地址 → ua/header/内联频道）。
+     * 聚合任务同一时刻只有一个（见 {@link #fetching}），每轮开始时清空。
+     * 用旁路表而不是把请求头编进源地址：源地址同时是失败计数、健康集合的键，必须保持稳定。
+     */
+    // 声明为 ConcurrentMap：putIfAbsent 绑定到 ConcurrentMap 接口（API 1 起即有）；
+    // 声明成 Map 会编译成 Java 8 的 Map.putIfAbsent 默认方法，Android 7.0 以下直接 NoSuchMethodError
+    private final java.util.concurrent.ConcurrentMap<String, MultiRepoParser.LiveEntry> liveMeta = new ConcurrentHashMap<>();
+
+    /**
+     * 本轮探测时明确连不上（DNS 失败 / 拒绝连接 / 无路由）的地址。
+     * 拉源阶段仍会拨号一次（瞬时故障可能已恢复），只是不再让 OkHttp 换路由重试；
+     * 连接超时不记：探测的连接超时（8s）比拉源（15s）短，慢主机在拉源阶段仍可能连上。
+     */
+    private final Map<String, IOException> probeConnectFailures = new ConcurrentHashMap<>();
+
+    /** 本轮探测确认为 TVBox 配置的原始地址（无论是否展开出直播源），不参与自动删除 */
+    private final Set<String> probedConfigUrls = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
+    /** 本轮探测确认为 TVBox 配置、但展开不出任何直播源的原始地址 */
+    private final Set<String> probedEmptyConfigs = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
+
     /** 并发拦截时回调的错误信息；ChannelManager 据此识别"忙"并排队等待当前任务结束 */
     public static final String ERROR_BUSY = "正在获取直播源，请稍候";
 
@@ -172,37 +216,114 @@ public class IptvApiService {
      * @return 频道分组列表
      */
     public List<ChannelGroup> fetchFromUrl(String url, String format) throws IOException {
-        Request request = new Request.Builder()
-                .url(url)
-                .header("User-Agent", "TVBoxOS-Live/1.0")
-                .header("Accept", "*/*")
-                .build();
+        MultiRepoParser.LiveEntry meta = url == null ? null : liveMeta.get(url);
+        // 旧格式 lives 直接写出的频道：内容已在内存里，不发请求
+        if (meta != null && meta.inlineTxt != null) {
+            return parseContent(meta.inlineTxt, "txt");
+        }
+        // 探测阶段明确连不上的主机：仍按正常超时拨号一次（不直接判死，避免瞬时故障被计入未入选），
+        // 只关掉连接失败重试，少等一轮
+        OkHttpClient client = httpClient;
+        if (url != null && probeConnectFailures.containsKey(url)) {
+            client = httpClient.newBuilder().retryOnConnectionFailure(false).build();
+        }
+        // 探测阶段已确认是展开不出直播源的配置：不再重复下载展开，也不计入未入选
+        if (url != null && probedEmptyConfigs.contains(url)) {
+            throw new ConfigNoLivesException("TVBox 配置未包含可用直播源: " + url);
+        }
+        Map<String, String> headers = meta != null ? meta.headers : Collections.<String, String>emptyMap();
 
-        try (Response response = httpClient.newCall(request).execute()) {
+        Body fetched;
+        try (Response response = client.newCall(buildRequest(url, headers, SOURCE_FETCH_UA)).execute()) {
             if (!response.isSuccessful()) {
                 throw new SourceContentException("请求失败: HTTP " + response.code() + " " + response.message());
             }
-
             // 有上限地读取响应体，避免个别源返回超大/异常内容导致 OOM（尤其在低内存电视上）
-            String body = readBodyLimited(response, sourceBodyLimit());
-            if (body.isEmpty()) {
-                throw new SourceContentException("返回数据为空");
+            fetched = readBody(response, sourceBodyLimit(), false);
+        }
+        String body = fetched.text;
+        if (body.isEmpty()) {
+            throw new SourceContentException("返回数据为空");
+        }
+
+        Timber.d("获取到直播源数据，大小: %d 字节", body.length());
+
+        // 兜底：若该地址实际是 TVBox 配置（订阅列表里混入、或探测超时未展开的情况），
+        // 直接按 M3U/TXT 解析会得到 0 个频道。这里就地展开其 lives（多仓则先展开子仓）并抓取。
+        if (MultiRepoParser.looksLikeTvBoxConfig(body)) {
+            String cfg = MultiRepoParser.normalizeConfig(body);
+            body = null; // 先释放原始正文（可能是图片），内联抓取期间不再占堆
+            // 相对地址按重定向后的最终地址解析（短链 / dc.txt 跳转到 raw 的情况）
+            List<ChannelGroup> fromRepo = fetchFromTvBoxConfig(cfg, fetched.finalUrl != null ? fetched.finalUrl : url);
+            if (!fromRepo.isEmpty()) return fromRepo;
+            // 展开失败则继续按普通格式尝试解析（少数以 '{' 开头的 TXT 列表会被误判为配置）
+            List<ChannelGroup> asPlaylist = parseContent(cfg, autoDetectFormat(cfg, format));
+            if (!asPlaylist.isEmpty()) {
+                applyLineHeaders(asPlaylist, headers);
+                return asPlaylist;
             }
+            // JSON 配置按 TXT 解析只会得到 0 个频道，且不应算作"源失效"：配置本身是有效的
+            throw new ConfigNoLivesException("TVBox 配置未展开出可用直播源: " + url);
+        }
 
-            Timber.d("获取到直播源数据，大小: %d 字节", body.length());
+        // 自动识别格式
+        String detectedFormat = autoDetectFormat(body, format);
+        List<ChannelGroup> groups = parseContent(body, detectedFormat);
+        // 配置里给这个直播源设置的 ua/header：附到每条线路上，播放与测速才能带同样的请求头
+        applyLineHeaders(groups, headers);
+        return groups;
+    }
 
-            // 兜底：若该地址实际是 TVBox 单仓配置（订阅列表里混入的情况），
-            // 直接按 M3U/TXT 解析会得到 0 个频道。这里就地展开其 lives
-            // 并抓取第一个可用的直播源，避免整条源白白浪费。
-            if (MultiRepoParser.looksLikeTvBoxConfig(body)) {
-                List<ChannelGroup> fromRepo = fetchFromTvBoxConfig(body, url);
-                if (!fromRepo.isEmpty()) return fromRepo;
-                // 展开失败则继续按普通格式尝试解析
+    /**
+     * TVBox 配置有效但未展开出任何频道（只有 sites、子仓全部失败、只有爬虫直播等）。
+     * 与 {@link SourceContentException} 区分：不计入连续未入选，避免用户填写的配置被自动删除。
+     */
+    static final class ConfigNoLivesException extends IOException {
+        ConfigNoLivesException(String msg) {
+            super(msg);
+        }
+    }
+
+    /** 构造请求：配置给出的 ua/header 优先，否则用默认 UA；非法请求头跳过，不让整个请求失败 */
+    private static Request buildRequest(String url, Map<String, String> headers, String defaultUa) {
+        Request.Builder b = new Request.Builder().url(url).header("Accept", "*/*");
+        boolean hasUa = false;
+        if (headers != null) {
+            for (Map.Entry<String, String> e : headers.entrySet()) {
+                if (e.getKey() == null || e.getValue() == null) continue;
+                try {
+                    b.header(e.getKey(), e.getValue());
+                    if ("User-Agent".equalsIgnoreCase(e.getKey())) hasUa = true;
+                } catch (IllegalArgumentException ignore) {
+                    Timber.d("忽略非法请求头: %s", e.getKey());
+                }
             }
+        }
+        if (!hasUa) b.header("User-Agent", defaultUa);
+        return b.build();
+    }
 
-            // 自动识别格式
-            String detectedFormat = autoDetectFormat(body, format);
-            return parseContent(body, detectedFormat);
+    /**
+     * 给解析出的每条线路附加请求头（StreamUrl 的 "url|User-Agent=.." 写法）；
+     * 线路自己已带的同名请求头优先（如 M3U 的 #EXTVLCOPT）。
+     */
+    private static void applyLineHeaders(List<ChannelGroup> groups, Map<String, String> headers) {
+        if (groups == null || headers == null || headers.isEmpty()) return;
+        for (ChannelGroup g : groups) {
+            if (g == null || g.getChannels() == null) continue;
+            for (LiveChannel ch : g.getChannels()) {
+                if (ch == null) continue;
+                List<String> urls = ch.getSourceUrls();
+                if (urls == null || urls.isEmpty()) continue;
+                Set<String> out = new LinkedHashSet<>();
+                for (String u : urls) {
+                    if (u != null) out.add(StreamUrl.withHeaders(u, headers));
+                }
+                List<Double> speeds = new ArrayList<>(out.size());
+                for (int i = 0; i < out.size(); i++) speeds.add(0.0);
+                ch.setSourceUrls(new ArrayList<>(out));
+                ch.setSpeeds(speeds);
+            }
         }
     }
 
@@ -210,30 +331,48 @@ public class IptvApiService {
      * 把 TVBox 配置地址就地展开并抓取其中的直播源。
      *
      * <p>用于「某个源地址其实是仓库配置」的兜底场景。只抓取前若干个 lives
-     * 地址并合并，避免单个配置无限展开拖慢整体加载。
+     * 地址并合并，避免单个配置无限展开拖慢整体加载。多仓（urls / storeHouse）先展开子仓。
+     *
+     * @param cfg 已还原（Base64/图片）的配置正文
      */
-    private List<ChannelGroup> fetchFromTvBoxConfig(String body, String baseUrl) {
+    private List<ChannelGroup> fetchFromTvBoxConfig(String cfg, String baseUrl) {
         List<ChannelGroup> merged = new ArrayList<>();
         try {
-            List<String> lives = MultiRepoParser.extractLiveUrls(body, baseUrl);
+            List<MultiRepoParser.LiveEntry> lives = MultiRepoParser.extractLiveEntries(cfg, baseUrl);
+            if (lives.isEmpty() && !MultiRepoParser.extractRepoUrls(cfg, baseUrl).isEmpty()) {
+                // 多仓：没有 lives，展开子仓后再取直播源（订阅列表里直接写多仓链接的情况）
+                lives = new ArrayList<>();
+                for (String u : expandTvBoxConfig(cfg, baseUrl, null)) {
+                    MultiRepoParser.LiveEntry e = liveMeta.get(u);
+                    lives.add(e != null ? e : new MultiRepoParser.LiveEntry(u, null, null, null, null));
+                }
+            }
+            cfg = null; // 配置正文不再需要，抓取播放列表前释放
             if (lives.isEmpty()) return merged;
             int limit = Math.min(lives.size(), MAX_INLINE_LIVES);
             for (int i = 0; i < limit; i++) {
-                String liveUrl = lives.get(i);
+                MultiRepoParser.LiveEntry live = lives.get(i);
                 try {
-                    String content = fetchTextLimited(liveUrl, repoBodyLimit());
-                    if (content == null || content.trim().isEmpty()) continue;
-                    List<ChannelGroup> groups =
-                            parseContent(content, autoDetectFormat(content, "auto"));
-                    if (!groups.isEmpty()) mergeGroups(merged, groups, liveUrl);
+                    List<ChannelGroup> groups;
+                    if (live.inlineTxt != null) {
+                        groups = parseContent(live.inlineTxt, "txt");
+                    } else {
+                        // 这里下载的是播放列表而不是配置：用直播源的上限，低内存设备上 512KB 会截掉大量频道
+                        Body b = fetchText(live.url, sourceBodyLimit(), live.headers);
+                        String content = b.text;
+                        if (content == null || content.trim().isEmpty()) continue;
+                        groups = parseContent(content, autoDetectFormat(content, "auto"));
+                        applyLineHeaders(groups, live.headers);
+                    }
+                    if (!groups.isEmpty()) mergeGroups(merged, groups, live.url);
                 } catch (Exception e) {
-                    Timber.d("内联直播源获取失败(%s): %s", liveUrl, e.getMessage());
+                    Timber.d("内联直播源获取失败(%s): %s", live.url, e.getMessage());
                 }
             }
             if (!merged.isEmpty()) {
                 Timber.i("源 %s 为 TVBox 配置，内联展开得到 %d 个分组", baseUrl, merged.size());
             }
-        } catch (Exception e) {
+        } catch (Exception | StackOverflowError e) {
             Timber.w(e, "内联展开 TVBox 配置失败");
         }
         return merged;
@@ -270,30 +409,134 @@ public class IptvApiService {
         return available < Math.min(8L * 1024 * 1024, max / 8);
     }
 
-    /** 有上限地读取响应体为字符串（UTF-8），超过 maxBytes 即截断，防止 OOM */
-    private String readBodyLimited(Response response, int maxBytes) throws IOException {
-        if (response.body() == null) return "";
+    /** 一次下载的结果：正文、重定向后的最终地址、是否被截断 / 探测时被判定为非配置 */
+    static final class Body {
+        String text = "";
+        String finalUrl;
+        boolean truncated;
+        /** 探测模式下前若干 KB 已判定不是配置，未继续下载 */
+        boolean notConfig;
+    }
+
+    /**
+     * 有上限地读取响应体。
+     *
+     * <p>图片配置（JPEG/PNG/GIF/WebP 末尾附带 Base64 配置）的有效内容在<b>尾部</b>，
+     * 按普通上限截断会把标记和 Base64 一起丢掉；这类正文只保留最后 maxBytes 字节
+     * （总读取量受 {@link #IMAGE_MAX_TOTAL_BYTES} 约束）。
+     *
+     * @param probe true 时先读 {@link #PROBE_SNIFF_BYTES} 判断像不像配置，不像就立即停止下载
+     */
+    private Body readBody(Response response, int maxBytes, boolean probe) throws IOException {
+        Body result = new Body();
+        try {
+            result.finalUrl = response.request().url().toString();
+        } catch (Exception ignore) {
+            // 取不到最终地址时由调用方回退到原地址
+        }
+        if (response.body() == null) return result;
         try (java.io.InputStream in = response.body().byteStream()) {
             java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
             byte[] buf = new byte[8192];
+            byte[] head = new byte[12];
+            int headLen = 0;
+            boolean image = false;
+            boolean decided = !probe;
+            long total = 0;
             int n;
             while ((n = in.read(buf)) != -1) {
                 // 被取消（内存吃紧提前收尾时 cancel(true)）后立即停止下载，不再继续占用堆
                 if (Thread.currentThread().isInterrupted()) {
                     throw new java.io.InterruptedIOException("cancelled");
                 }
-                if (bos.size() + n > maxBytes) {
-                    bos.write(buf, 0, maxBytes - bos.size());
-                    Timber.w("源内容过大，已截断至 %d MB", maxBytes / 1024 / 1024);
-                    break;
+                if (headLen < head.length) {
+                    int c = Math.min(head.length - headLen, n);
+                    System.arraycopy(buf, 0, head, headLen, c);
+                    headLen += c;
+                    image = isImageMagic(head, headLen);
                 }
-                bos.write(buf, 0, n);
+                total += n;
+                if (!image) {
+                    if (bos.size() + n > maxBytes) {
+                        bos.write(buf, 0, Math.max(0, maxBytes - bos.size()));
+                        result.truncated = true;
+                        Timber.w("源内容过大，已截断至 %d KB", maxBytes / 1024);
+                        break;
+                    }
+                    bos.write(buf, 0, n);
+                } else {
+                    bos.write(buf, 0, n);
+                    if (bos.size() >= 2 * maxBytes) keepTail(bos, maxBytes);
+                    if (total > IMAGE_MAX_TOTAL_BYTES) {
+                        result.truncated = true;
+                        Timber.w("图片内容过大，读取 %d KB 后停止", total / 1024);
+                        break;
+                    }
+                }
+                if (!decided && bos.size() >= PROBE_SNIFF_BYTES) {
+                    decided = true;
+                    if (!image && !sniffConfigLike(bos.toByteArray())) {
+                        result.notConfig = true;
+                        return result;
+                    }
+                }
+            }
+            if (image && bos.size() > maxBytes) keepTail(bos, maxBytes);
+            if (!decided && !image && !sniffConfigLike(bos.toByteArray())) {
+                result.notConfig = true;
+                return result;
             }
             // 直接按字节解码不会像 OkHttp body.string() 那样去掉 UTF-8 BOM，
             // 且 String.trim() 不会删 U+FEFF：残留时首个分组/频道名带不可见前缀，
             // 会出现两个同名分组、或频道名与模板对不上被丢弃
-            return stripBom(bos.toString("UTF-8"));
+            result.text = stripBom(bos.toString("UTF-8"));
+            return result;
         }
+    }
+
+    /** 只保留缓冲区最后 keep 字节 */
+    private static void keepTail(java.io.ByteArrayOutputStream bos, int keep) {
+        byte[] all = bos.toByteArray();
+        if (all.length <= keep) return;
+        bos.reset();
+        bos.write(all, all.length - keep, keep);
+    }
+
+    /** 文件头是否为常见图片格式（JPEG / PNG / GIF / WebP） */
+    private static boolean isImageMagic(byte[] h, int len) {
+        if (len >= 3 && (h[0] & 0xFF) == 0xFF && (h[1] & 0xFF) == 0xD8 && (h[2] & 0xFF) == 0xFF) return true;
+        if (len >= 4 && (h[0] & 0xFF) == 0x89 && h[1] == 'P' && h[2] == 'N' && h[3] == 'G') return true;
+        if (len >= 4 && h[0] == 'G' && h[1] == 'I' && h[2] == 'F' && h[3] == '8') return true;
+        return len >= 12 && h[0] == 'R' && h[1] == 'I' && h[2] == 'F' && h[3] == 'F'
+                && h[8] == 'W' && h[9] == 'E' && h[10] == 'B' && h[11] == 'P';
+    }
+
+    /**
+     * 探测用：正文开头是否可能是 TVBox 配置（JSON / 注释开头的 JSON / 整段 Base64 / 含图片标记）。
+     * 普通 M3U（#EXTM3U）与 TXT（名称,地址）在首个字符或首行就会被排除。
+     */
+    private static boolean sniffConfigLike(byte[] prefix) {
+        String s;
+        try {
+            s = new String(prefix, "UTF-8");
+        } catch (Exception e) {
+            return true;
+        }
+        int i = 0;
+        while (i < s.length() && (s.charAt(i) == '﻿' || Character.isWhitespace(s.charAt(i)))) i++;
+        if (i >= s.length()) return false;
+        char c = s.charAt(i);
+        if (c == '{' || s.startsWith("//", i) || s.startsWith("/*", i)) return true;
+        if (s.indexOf("**") >= 0) return true;
+        // 整段 Base64：截取的前缀末尾可能断在多字节字符中间，只检查前面的部分
+        int end = Math.max(i, s.length() - 4);
+        for (int k = i; k < end; k++) {
+            char ch = s.charAt(k);
+            boolean ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')
+                    || ch == '+' || ch == '/' || ch == '=' || ch == '-' || ch == '_' || Character.isWhitespace(ch);
+            if (!ok) return false;
+        }
+        return true;
     }
 
     /** 去掉字符串开头的 UTF-8 BOM（U+FEFF） */
@@ -439,15 +682,13 @@ public class IptvApiService {
     /**
      * 下载文本内容并限制最大读取字节数。
      *
-     * <p>用于抓取子仓配置：多仓里的子仓 JSON 大小不可控（实测有 100KB+ 的），
+     * <p>用于抓取子仓配置与内联播放列表：多仓里的子仓 JSON 大小不可控（实测有 100KB+ 的），
      * 且部分地址会返回网页或大文件，必须限流。
      * 单个子仓使用更短的超时，避免失效地址拖慢整体展开。
+     * 返回值带重定向后的最终地址，相对路径要按它解析。
      */
-    private String fetchTextLimited(String url, int maxBytes) throws IOException {
-        Request request = new Request.Builder()
-                .url(url)
-                .header("User-Agent", "okhttp/4.9.0")
-                .build();
+    private Body fetchText(String url, int maxBytes, Map<String, String> headers) throws IOException {
+        Request request = buildRequest(url, headers, REPO_FETCH_UA);
         // 子仓用独立的短超时：派生自共享客户端，复用连接池，开销极小
         OkHttpClient client = httpClient.newBuilder()
                 .connectTimeout(8, TimeUnit.SECONDS)
@@ -457,8 +698,53 @@ public class IptvApiService {
             if (!response.isSuccessful()) {
                 throw new IOException("HTTP " + response.code());
             }
-            return readBodyLimited(response, maxBytes);
+            return readBody(response, maxBytes, false);
         }
+    }
+
+    /**
+     * 探测一个源地址是不是 TVBox 配置。
+     *
+     * <p>只先读前 {@link #PROBE_SNIFF_BYTES}：普通 M3U/TXT 立即停止下载（不再整份下载两遍），
+     * 像配置时在同一个响应上继续读完，不发第二次请求。
+     *
+     * @return 还原后的配置正文与最终地址；不是配置时 text 为空
+     */
+    private Body probeConfig(String url) throws IOException {
+        Request request = buildRequest(url, null, REPO_FETCH_UA);
+        OkHttpClient client = httpClient.newBuilder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(10, TimeUnit.SECONDS)
+                .callTimeout(PROBE_CALL_TIMEOUT_SEC, TimeUnit.SECONDS)
+                .build();
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                Body b = new Body();
+                b.notConfig = true;
+                return b;
+            }
+            Body b = readBody(response, repoBodyLimit(), true);
+            if (b.notConfig) return b;
+            String cfg = MultiRepoParser.normalizeConfig(b.text);
+            if (!MultiRepoParser.looksLikeTvBoxConfig(cfg)) {
+                b.notConfig = true;
+                b.text = "";
+                return b;
+            }
+            if (b.truncated) Timber.w("配置 %s 超过 %d KB 被截断，可能解析失败", url, repoBodyLimit() / 1024);
+            b.text = cfg;
+            return b;
+        }
+    }
+
+    /**
+     * 是否"明确连不上主机"类失败（DNS 失败、拒绝连接、无路由）。
+     * 不含连接超时：探测用的连接超时比拉源短，慢主机（gh-proxy、国内访问 GitHub raw）拉源时仍可能连上。
+     */
+    private static boolean isConnectFailure(Throwable t) {
+        return t instanceof java.net.UnknownHostException
+                || t instanceof java.net.ConnectException
+                || t instanceof java.net.NoRouteToHostException;
     }
 
     /**
@@ -479,6 +765,11 @@ public class IptvApiService {
             ExecutorService pool = null;
             try {
                 com.github.tvbox.osc.util.RunLog.i("fetchAndMergeSources: 开始");
+                // 每轮重新探测/展开：上一轮的 lives 参数与探测结论不能沿用
+                liveMeta.clear();
+                probeConnectFailures.clear();
+                probedConfigUrls.clear();
+                probedEmptyConfigs.clear();
                 // 0) 加载频道改名（别名）规则，解析阶段即按规则改名
                 loadAliasRules(callback);
 
@@ -494,14 +785,17 @@ public class IptvApiService {
                 // 子直播源写回设置（否则用户的多仓链接会被替换成成百上千个固化的子地址）
                 List<String> rawCustomUrls =
                         parseCustomSourceUrls(Hawk.get(HawkConfig.IPTV_CUSTOM_SOURCES, ""));
-                List<String> customUrls = expandCustomSources(rawCustomUrls, callback);
-                com.github.tvbox.osc.util.RunLog.i("自定义源展开完成: " + customUrls.size() + " 个");
                 // 多仓链接（配置页/手机配置页显式指定，其中的子仓会被展开为具体直播源）
-                List<String> multiRepoUrls = expandCustomSources(
-                        parseCustomSourceUrls(Hawk.get(HawkConfig.IPTV_MULTI_REPO_URLS, "")), callback);
-                com.github.tvbox.osc.util.RunLog.i("多仓链接展开完成: " + multiRepoUrls.size() + " 个");
-                // 订阅列表展开的源
+                final List<String> rawMultiRepoUrls =
+                        parseCustomSourceUrls(Hawk.get(HawkConfig.IPTV_MULTI_REPO_URLS, ""));
+                // 三类来源按固定顺序依次展开：同一直播源出现在多处时，ua/header 以先展开的
+                // （自定义 > 多仓 > 订阅）为准，结果确定；并行展开会让请求头随网络快慢变化，
+                // 并成倍抬高内存峰值（各自的探测池与子仓下载池叠加），故不并行。
+                List<String> customUrls = expandCustomSources(rawCustomUrls, callback);
+                List<String> multiRepoUrls = expandCustomSources(rawMultiRepoUrls, callback);
                 List<String> subscribeUrls = loadSubscribeList(callback);
+                com.github.tvbox.osc.util.RunLog.i("自定义源展开完成: " + customUrls.size() + " 个");
+                com.github.tvbox.osc.util.RunLog.i("多仓链接展开完成: " + multiRepoUrls.size() + " 个");
                 com.github.tvbox.osc.util.RunLog.i("订阅列表展开完成: " + subscribeUrls.size() + " 个");
 
                 // 所有"外部源"（自定义 + 多仓 + 订阅），它们都参与连续未入选自动删除统计
@@ -620,6 +914,10 @@ public class IptvApiService {
                         if (cause instanceof SourceContentException) {
                             // HTTP 错误码 / 空内容：服务器明确答复无效，视为未入选
                             sourceUrlMap.put(srcUrl, new HashSet<>());
+                        } else if (cause instanceof ConfigNoLivesException) {
+                            // 配置有效但本轮没展开出直播源（子仓失效、只有 sites 等）：
+                            // 不是源本身失效，不计入未入选，也不算网络失败
+                            Timber.i("配置源本轮未展开出直播源，不计入未入选: %s", srcUrl);
                         } else if (isTotalTimeout(cause)) {
                             // 整体超时：源有效只是大/慢，不计入（否则慢速大源 3 次后被误删）
                             timeoutFailed++;
@@ -703,7 +1001,8 @@ public class IptvApiService {
 
                 // 更新连续未入选计数，并自动删除连续 N 次失败的自定义源。
                 // 仅用户原始填写、且未被展开为多仓/单仓的地址可被删除（见 rawCustomUrls）
-                updateSourceFailCounts(rawCustomUrls, customUrls, sourceUrlMap, finalUrls, externalSet);
+                updateSourceFailCounts(rawCustomUrls, customUrls, sourceUrlMap, finalUrls, externalSet,
+                        new HashSet<>(probedConfigUrls));
 
                 // 网络受损且结果被上层弃用时，ChannelManager 会把该时间复位，让下次启动重试
                 Hawk.put(HawkConfig.IPTV_LAST_UPDATE_TIME, System.currentTimeMillis());
@@ -1026,7 +1325,7 @@ public class IptvApiService {
             return readAssetTemplate();
         }
         if (url.startsWith("http://") || url.startsWith("https://")) {
-            return fetchPlainText(url);
+            return fetchPlainText(url, sourceBodyLimit());
         }
         // 兜底：当作内置模板
         return readAssetTemplate();
@@ -1065,12 +1364,13 @@ public class IptvApiService {
             // 导致随后进入拉源阶段时进度条从满格跳回小比例
             if (callback != null) callback.onProgress(0, 0, "正在加载频道改名规则...");
             com.github.tvbox.osc.util.RunLog.i("loadAliasRules: 开始下载 " + aliasUrl.trim());
-            String content = fetchPlainText(aliasUrl.trim());
+            String content = fetchPlainText(aliasUrl.trim(), sourceBodyLimit());
             com.github.tvbox.osc.util.RunLog.i("loadAliasRules: 下载完成 "
                     + (content == null ? 0 : content.length()) + " 字符，开始解析");
             aliasService.parse(content);
             com.github.tvbox.osc.util.RunLog.i("loadAliasRules: 解析完成");
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // 兜住 Error（超大文件 OOM 等）：改名规则失败只跳过改名，不能拖垮整轮拉源
             Timber.w(e, "加载别名规则失败，跳过改名");
             com.github.tvbox.osc.util.RunLog.i("loadAliasRules: 失败(可忽略) " + e);
         }
@@ -1086,72 +1386,136 @@ public class IptvApiService {
         try {
             // total=0 表示"总数未知"（此刻还不知道订阅列表里有多少个源）
             if (callback != null) callback.onProgress(0, 0, "正在加载订阅列表...");
-            String content = fetchPlainText(listUrl.trim());
+            Body fetched = fetchPlain(listUrl.trim(), sourceBodyLimit());
+            String content = fetched.text;
+            String base = fetched.finalUrl != null ? fetched.finalUrl : listUrl.trim();
 
-            // 订阅列表本身可能是 TVBox 多仓/单仓 JSON，需要先展开出直播源地址
+            // 订阅列表本身可能是 TVBox 多仓/单仓 JSON（含 Base64 / 图片包装），需要先展开出直播源地址
             if (MultiRepoParser.looksLikeTvBoxConfig(content)) {
-                List<String> expanded = expandTvBoxConfig(content, listUrl.trim(), callback);
-                for (String u : expanded) {
-                    if (!urls.contains(u)) urls.add(u);
-                }
+                String cfg = MultiRepoParser.normalizeConfig(content);
+                content = null;
+                List<String> expanded = expandTvBoxConfig(cfg, base, callback);
+                Set<String> seen = new LinkedHashSet<>(expanded);
+                urls.addAll(seen);
                 Timber.i("订阅列表(多仓)展开完成: %d 个直播源", urls.size());
                 return urls;
             }
 
             // 纯文本列表：每行一个直播源地址
+            Set<String> lines = new LinkedHashSet<>();
             for (String raw : content.split("\\r?\\n")) {
                 String line = raw.trim();
                 if (line.isEmpty() || line.startsWith("#")) continue;
                 // 修正可能存在的 Markdown 转义残留
                 line = line.replace("\\_", "_");
-                if (line.startsWith("http://") || line.startsWith("https://")) {
-                    if (!urls.contains(line)) urls.add(line);
+                if (line.regionMatches(true, 0, "http://", 0, 7) || line.regionMatches(true, 0, "https://", 0, 8)) {
+                    lines.add(line);
                 }
             }
-            Timber.i("订阅列表加载完成: %d 个源", urls.size());
-        } catch (Exception e) {
+            content = null;
+            // 行里可能是多仓 / 单仓链接：与自定义源一样先并发探测并展开，否则多仓只会得到 0 个频道
+            urls.addAll(expandCustomSources(new ArrayList<>(lines), callback));
+            Timber.i("订阅列表加载完成: %d 行，展开后 %d 个源", lines.size(), urls.size());
+        } catch (Throwable e) {
+            // 兜住 Error（超大文件 OOM、畸形配置 StackOverflowError）：订阅列表失败只丢它自己
             Timber.w(e, "加载订阅列表失败");
         }
         return urls;
     }
 
+    /** 一个子仓的展开结果：其中的直播源，以及（嵌套多仓时）其中的下一层子仓 */
+    private static final class RepoResult {
+        final List<MultiRepoParser.LiveEntry> lives;
+        final List<String> subRepos;
+
+        RepoResult(List<MultiRepoParser.LiveEntry> lives, List<String> subRepos) {
+            this.lives = lives;
+            this.subRepos = subRepos;
+        }
+    }
+
     /**
      * 把 TVBox 配置展开为直播源地址列表。
      *
-     * <p>支持两种入口：
+     * <p>支持以下入口：
      * <ul>
-     *   <li><b>多仓</b>（含 {@code urls} 字段）：逐个下载子仓配置，再从各自的
-     *       {@code lives} 中提取直播源地址；</li>
+     *   <li><b>多仓</b>（含 {@code urls} 或 {@code storeHouse} 字段）：逐个下载子仓配置，再从各自的
+     *       {@code lives} 中提取直播源地址；子仓本身又是多仓时再展开一层（最多 {@link #MAX_REPO_DEPTH} 层，
+     *       已访问地址去重防止循环引用）；</li>
      *   <li><b>单仓</b>（直接含 {@code lives}）：直接提取。</li>
      * </ul>
      *
      * <p>子仓下载采用并发 + 独立超时：多仓常包含数十个子仓，其中不少已失效，
      * 串行下载会让"获取订阅列表"这一步卡住数分钟。单个子仓失败只跳过它，
-     * 不影响其余子仓。
+     * 不影响其余子仓。每条 lives 的 ua/header 记入 {@link #liveMeta}，拉取该直播源时使用。
      *
      * @param content 配置正文
-     * @param baseUrl 配置自身地址，用于解析相对路径
+     * @param baseUrl 配置自身地址（重定向后的最终地址），用于解析相对路径
      */
     private List<String> expandTvBoxConfig(String content, String baseUrl, FetchCallback callback) {
-        List<String> result = new ArrayList<>();
-        Set<String> seen = new LinkedHashSet<>();
+        String cfg = MultiRepoParser.normalizeConfig(content);
+        Map<String, MultiRepoParser.LiveEntry> seen = new LinkedHashMap<>();
 
         // 入口本身就是单仓：直接取 lives
-        for (String u : MultiRepoParser.extractLiveUrls(content, baseUrl)) {
-            seen.add(u);
+        for (MultiRepoParser.LiveEntry e : MultiRepoParser.extractLiveEntries(cfg, baseUrl)) {
+            if (!seen.containsKey(e.url)) seen.put(e.url, e);
         }
 
-        List<String> repoUrls = MultiRepoParser.extractRepoUrls(content, baseUrl);
-        if (repoUrls.isEmpty()) {
-            result.addAll(seen);
-            return result;
+        List<String> repoUrls = MultiRepoParser.extractRepoUrls(cfg, baseUrl);
+        cfg = null;
+        if (!repoUrls.isEmpty()) {
+            Set<String> visited = new HashSet<>();
+            if (baseUrl != null) visited.add(baseUrl);
+            List<String> level = new ArrayList<>();
+            for (String u : repoUrls) {
+                if (visited.add(u) && level.size() < MAX_TOTAL_REPOS) level.add(u);
+            }
+            int budget = MAX_TOTAL_REPOS - level.size();
+            for (int depth = 1; depth <= MAX_REPO_DEPTH && !level.isEmpty(); depth++) {
+                Timber.i("多仓配置第 %d 层包含 %d 个子仓，开始并发展开", depth, level.size());
+                if (callback != null) {
+                    try {
+                        callback.onProgress(0, 0, "正在展开多仓订阅(" + level.size() + " 个仓库)");
+                    } catch (Throwable ignore) {
+                    }
+                }
+                List<RepoResult> results = fetchRepos(level, depth < MAX_REPO_DEPTH);
+                List<String> next = new ArrayList<>();
+                // 按提交顺序合并，保证每次展开的源顺序稳定；下一层结果排在本层之后
+                for (RepoResult r : results) {
+                    for (MultiRepoParser.LiveEntry e : r.lives) {
+                        if (!seen.containsKey(e.url)) seen.put(e.url, e);
+                    }
+                    for (String s : r.subRepos) {
+                        if (budget <= 0) break;
+                        if (visited.add(s)) {
+                            next.add(s);
+                            budget--;
+                        }
+                    }
+                }
+                level = next;
+            }
         }
 
-        Timber.i("多仓配置包含 %d 个子仓，开始并发展开", repoUrls.size());
-        if (callback != null) {
-            callback.onProgress(0, 0, "正在展开多仓订阅(" + repoUrls.size() + " 个仓库)");
+        List<String> result = new ArrayList<>(seen.size());
+        for (MultiRepoParser.LiveEntry e : seen.values()) {
+            result.add(e.url);
+            // 同一直播源被多个仓库引用时保留首次出现的参数
+            liveMeta.putIfAbsent(e.url, e);
         }
+        if (!repoUrls.isEmpty()) Timber.i("多仓展开得到 %d 个直播源", result.size());
+        return result;
+    }
 
+    /**
+     * 并发下载一层子仓并解析。
+     *
+     * @param collectNested 是否同时提取子仓里的下一层子仓（嵌套多仓）
+     * @return 与 repoUrls 一一对应的结果（失败/超时为空结果）
+     */
+    private List<RepoResult> fetchRepos(List<String> repoUrls, final boolean collectNested) {
+        List<RepoResult> out = new ArrayList<>(repoUrls.size());
         // 低内存设备降低并发：并发下载会让 N 份配置正文同时驻留堆上，是拉源阶段的主要峰值来源
         int maxThreads = isLowMemoryDevice() ? REPO_FETCH_CONCURRENCY_LOW : REPO_FETCH_CONCURRENCY;
         int threads = Math.min(maxThreads, Math.max(1, repoUrls.size()));
@@ -1160,37 +1524,47 @@ public class IptvApiService {
             t.setDaemon(true);
             return t;
         });
-        // 子仓解析结果按提交顺序收集，保证每次展开的源顺序稳定
-        List<Future<List<String>>> futures = new ArrayList<>(repoUrls.size());
+        final RepoResult empty = new RepoResult(Collections.<MultiRepoParser.LiveEntry>emptyList(),
+                Collections.<String>emptyList());
+        List<Future<RepoResult>> futures = new ArrayList<>(repoUrls.size());
         try {
             for (final String repoUrl : repoUrls) {
                 futures.add(pool.submit(() -> {
                     try {
-                        String body = fetchTextLimited(repoUrl, repoBodyLimit());
-                        return MultiRepoParser.extractLiveUrls(body, repoUrl);
+                        Body b = fetchText(repoUrl, repoBodyLimit(), null);
+                        // 子仓也可能是 Base64 / 图片包装；相对地址按重定向后的最终地址解析
+                        String body = MultiRepoParser.normalizeConfig(b.text);
+                        String base = b.finalUrl != null ? b.finalUrl : repoUrl;
+                        List<MultiRepoParser.LiveEntry> lives = MultiRepoParser.extractLiveEntries(body, base);
+                        List<String> subs = collectNested
+                                ? MultiRepoParser.extractRepoUrls(body, base)
+                                : Collections.<String>emptyList();
+                        if (b.truncated && lives.isEmpty() && subs.isEmpty()) {
+                            Timber.w("子仓 %s 超过 %d KB 被截断，未能解析", repoUrl, repoBodyLimit() / 1024);
+                        }
+                        return new RepoResult(lives, subs);
                     } catch (Throwable t) {
                         // 失效子仓很常见，降级为 debug 日志避免刷屏
                         Timber.d("子仓获取失败(%s): %s", repoUrl, t.getMessage());
-                        return new ArrayList<String>();
+                        return empty;
                     }
                 }));
             }
-            for (Future<List<String>> f : futures) {
+            for (Future<RepoResult> f : futures) {
+                RepoResult r = empty;
                 try {
-                    List<String> lives = f.get(REPO_FETCH_TIMEOUT_SEC, TimeUnit.SECONDS);
-                    if (lives != null) seen.addAll(lives);
+                    RepoResult got = f.get(REPO_FETCH_TIMEOUT_SEC, TimeUnit.SECONDS);
+                    if (got != null) r = got;
                 } catch (Exception e) {
                     // 单个子仓超时/异常不影响整体
                     f.cancel(true);
                 }
+                out.add(r);
             }
         } finally {
             pool.shutdownNow();
         }
-
-        result.addAll(seen);
-        Timber.i("多仓展开得到 %d 个直播源", result.size());
-        return result;
+        return out;
     }
 
     /**
@@ -1206,10 +1580,12 @@ public class IptvApiService {
      * @param sourceUrlMap       每个源产出的 URL 集合（仅含本轮有明确结论的源）
      * @param finalUrls          最终保留的所有线路 URL
      * @param knownSources       本轮全部外部源地址，用于清理已不存在的源的历史计数
+     * @param configUrls         本轮探测确认为 TVBox 配置的原始地址：配置仍能正常下载说明链接有效，
+     *                           展开不出直播源多半是子仓/网络问题，绝不自动删除
      */
     private void updateSourceFailCounts(List<String> rawCustomUrls, List<String> expandedCustomUrls,
                                         Map<String, Set<String>> sourceUrlMap, Set<String> finalUrls,
-                                        Set<String> knownSources) {
+                                        Set<String> knownSources, Set<String> configUrls) {
         JSONObject counts;
         try {
             counts = new JSONObject(Hawk.get(HawkConfig.IPTV_SOURCE_FAIL_COUNT, "{}"));
@@ -1221,18 +1597,25 @@ public class IptvApiService {
         Set<String> expandedSet = new HashSet<>(expandedCustomUrls);
         Set<String> deletable = new HashSet<>();
         for (String u : rawCustomUrls) {
-            if (expandedSet.contains(u)) deletable.add(u);
+            if (expandedSet.contains(u) && (configUrls == null || !configUrls.contains(u))) deletable.add(u);
         }
         List<String> toRemove = new ArrayList<>();
 
-        // 遍历所有外部源，判断是否"入选"（其产出 URL 与最终结果有交集）
+        // 遍历所有外部源，判断是否"入选"（其产出 URL 与最终结果有交集）。
+        // 合并阶段按实际播放地址去重（同一流的不同 $标签 只留一条、无请求头的会被带请求头的同址线路替换），
+        // 因此这里同样按 playUrl 比较；只比原始串会把镜像源一直判为"未入选"，3 次后被误删。
+        Set<String> finalPlays = new HashSet<>(Math.max(16, finalUrls.size() * 2));
+        for (String u : finalUrls) finalPlays.add(StreamUrl.playUrl(u));
         Set<String> allExternal = new HashSet<>(sourceUrlMap.keySet());
         for (String src : allExternal) {
             boolean selected = false;
             Set<String> produced = sourceUrlMap.get(src);
             if (produced != null) {
                 for (String u : produced) {
-                    if (finalUrls.contains(u)) { selected = true; break; }
+                    if (finalUrls.contains(u) || finalPlays.contains(StreamUrl.playUrl(u))) {
+                        selected = true;
+                        break;
+                    }
                 }
             }
 
@@ -1292,9 +1675,15 @@ public class IptvApiService {
     }
 
     /**
-     * 拉取纯文本（用于频道模板）
+     * 拉取纯文本（用于频道模板、改名规则）。
+     * 有上限地读取：地址误指向超大文件 / 无尽流时，body().string() 会把整份读进内存直接 OOM。
      */
-    private String fetchPlainText(String url) throws IOException {
+    private String fetchPlainText(String url, int maxBytes) throws IOException {
+        return fetchPlain(url, maxBytes).text;
+    }
+
+    /** 拉取纯文本并带回重定向后的最终地址（订阅列表本身是配置时，相对地址按它解析） */
+    private Body fetchPlain(String url, int maxBytes) throws IOException {
         Request request = new Request.Builder()
                 .url(url)
                 .header("User-Agent", "TVBoxOS-Live/1.0")
@@ -1303,14 +1692,14 @@ public class IptvApiService {
             if (!response.isSuccessful() || response.body() == null) {
                 throw new IOException("模板请求失败: HTTP " + response.code());
             }
-            return response.body().string();
+            return readBody(response, maxBytes, false);
         }
     }
 
     /**
-     * 展开自定义源中的 TVBox 多仓/单仓链接。
+     * 展开自定义源 / 多仓链接 / 订阅列表行中的 TVBox 多仓/单仓链接。
      *
-     * <p>用户可能把一个多仓地址（如 {@code https://xmbjm.fh4u.org/dc.txt}）直接加为自定义源。
+     * <p>用户可能把一个多仓地址（如 {@code https://xmbjm.fh4u.org/dc.txt}）直接加为源。
      * 这类地址本身不含频道，直接当直播源解析会得到 0 个频道。
      * 这里先探测内容：
      * <ul>
@@ -1318,37 +1707,109 @@ public class IptvApiService {
      *   <li>不是 → 原样保留，交给既有流程按 TXT/M3U 解析。</li>
      * </ul>
      *
-     * <p>探测请求的响应会被直接丢弃（后续 {@code fetchFromUrl} 会重新下载），
-     * 但仅对少量自定义源执行，且共享连接池，代价可接受。
+     * <p>探测并发执行并有整体时限：原先逐个串行探测，每个失效主机都要等满连接超时，
+     * 十几个源就能让"正在获取直播源"卡上几分钟。探测只读前 16KB 判断类型，
+     * 普通播放列表不会被完整下载两遍。超时未完成的探测按普通源保留，结果仍按原顺序合并。
      */
     private List<String> expandCustomSources(List<String> customUrls, FetchCallback callback) {
         if (customUrls == null || customUrls.isEmpty()) return new ArrayList<>();
-        List<String> result = new ArrayList<>();
-        Set<String> seen = new LinkedHashSet<>();
-
+        List<String> inputs = new ArrayList<>();
+        Set<String> inputSet = new HashSet<>();
         for (String url : customUrls) {
             if (url == null || url.trim().isEmpty()) continue;
             String u = url.trim();
-            try {
-                String probe = fetchTextLimited(u, repoBodyLimit());
-                if (MultiRepoParser.looksLikeTvBoxConfig(probe)) {
-                    List<String> expanded = expandTvBoxConfig(probe, u, callback);
+            if (inputSet.add(u)) inputs.add(u);
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        if (inputs.isEmpty()) return new ArrayList<>();
+
+        int window = isLowMemoryDevice() ? SOURCE_FETCH_CONCURRENCY_LOW : SOURCE_FETCH_CONCURRENCY;
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(window, inputs.size()), r -> {
+            Thread t = new Thread(r, "SourceProbe");
+            t.setDaemon(true);
+            return t;
+        });
+        List<Future<Body>> futures = new ArrayList<>(inputs.size());
+        try {
+            for (final String u : inputs) {
+                if (isObviousPlaylist(u)) {
+                    // 扩展名明确是 m3u/m3u8 的不可能是配置，不必探测
+                    futures.add(null);
+                    continue;
+                }
+                futures.add(pool.submit(() -> probeConfig(u)));
+            }
+            if (callback != null) {
+                try {
+                    callback.onProgress(0, 0, "正在识别源类型...");
+                } catch (Throwable ignore) {
+                }
+            }
+            long deadline = System.currentTimeMillis() + PROBE_PHASE_TIMEOUT_MS;
+            for (int i = 0; i < inputs.size(); i++) {
+                String u = inputs.get(i);
+                Future<Body> f = futures.get(i);
+                futures.set(i, null);
+                Body probe = null;
+                if (f != null) {
+                    try {
+                        // 已完成的探测不受整体时限影响（前面的展开耗时不应让它们作废）
+                        long remain = Math.max(0L, deadline - System.currentTimeMillis());
+                        probe = f.isDone() ? f.get() : f.get(remain, TimeUnit.MILLISECONDS);
+                    } catch (TimeoutException e) {
+                        f.cancel(true);
+                        Timber.d("自定义源探测超时，按普通源保留(%s)", u);
+                    } catch (Exception e) {
+                        Throwable cause = (e instanceof ExecutionException && e.getCause() != null)
+                                ? e.getCause() : e;
+                        // 探测失败不影响原地址使用。明确连不上主机且设备确实在线时记下，
+                        // 拉源阶段只拨号一次、不再换路由重试；
+                        // 断网时不记（开机 Wi-Fi 未就绪，拉源阶段还应再试一次）
+                        if (cause instanceof IOException && isConnectFailure(cause) && isNetworkConnected()) {
+                            probeConnectFailures.put(u, (IOException) cause);
+                        }
+                        Timber.d("自定义源探测失败(%s): %s", u, cause.getMessage());
+                    }
+                }
+                if (probe != null && !probe.notConfig && !probe.text.isEmpty()
+                        && MultiRepoParser.parsesAsConfig(probe.text)) {
+                    probedConfigUrls.add(u);
+                    List<String> expanded = new ArrayList<>();
+                    try {
+                        String base = probe.finalUrl != null ? probe.finalUrl : u;
+                        String cfg = probe.text;
+                        probe = null;
+                        expanded = expandTvBoxConfig(cfg, base, callback);
+                    } catch (Exception | StackOverflowError e) {
+                        // 单个畸形配置只回退为原地址，不能中断其余源的展开
+                        Timber.w("展开 TVBox 配置失败(%s): %s", u, e);
+                    }
                     if (!expanded.isEmpty()) {
                         Timber.i("自定义源 %s 为 TVBox 配置，展开出 %d 个直播源", u, expanded.size());
                         seen.addAll(expanded);
                         continue;
                     }
-                    // 展开不出直播源（例如只有 sites 没有 lives）：保留原地址，
-                    // 让后续流程按普通源再试一次，避免误丢用户配置
+                    // 展开不出直播源（例如只有 sites 没有 lives、子仓全部失效）：保留原地址，
+                    // 拉源阶段直接按"配置无直播源"处理，不计入未入选，避免误删用户配置
+                    probedEmptyConfigs.add(u);
                 }
-            } catch (Exception e) {
-                // 探测失败不影响原地址使用，后续 fetchFromUrl 会重试并记录失败
-                Timber.d("自定义源探测失败(%s): %s", u, e.getMessage());
+                seen.add(u);
             }
-            seen.add(u);
+        } finally {
+            pool.shutdownNow();
         }
-        result.addAll(seen);
-        return result;
+        return new ArrayList<>(seen);
+    }
+
+    /** 路径扩展名为 .m3u / .m3u8 的地址（忽略查询参数） */
+    private static boolean isObviousPlaylist(String url) {
+        String p = url;
+        int q = p.indexOf('?');
+        if (q >= 0) p = p.substring(0, q);
+        int h = p.indexOf('#');
+        if (h >= 0) p = p.substring(0, h);
+        p = p.toLowerCase(java.util.Locale.ROOT);
+        return p.endsWith(".m3u") || p.endsWith(".m3u8");
     }
 
     /**

@@ -41,6 +41,7 @@ import com.github.tvbox.osc.ui.dialog.EpgDialog;
 import com.github.tvbox.osc.ui.dialog.ScanConfigDialog;
 import com.github.tvbox.osc.util.ActivityCallbacks;
 import com.github.tvbox.osc.util.HawkConfig;
+import com.github.tvbox.osc.util.StreamUrl;
 import com.google.android.exoplayer2.ExoPlayer;
 import com.google.android.exoplayer2.MediaItem;
 import com.google.android.exoplayer2.PlaybackException;
@@ -49,6 +50,7 @@ import com.google.android.exoplayer2.source.DefaultMediaSourceFactory;
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout;
 import com.google.android.exoplayer2.ui.StyledPlayerView;
 import com.google.android.exoplayer2.upstream.DefaultHttpDataSource;
+import com.google.android.exoplayer2.util.MimeTypes;
 import com.google.android.exoplayer2.video.VideoSize;
 import com.orhanobut.hawk.Hawk;
 
@@ -287,6 +289,8 @@ public class LivePlayActivity extends AppCompatActivity {
     private List<ChannelGroup> shownGroups;
     /** 播放器当前实际在播的线路 URL（存储形式，未去 $ 后缀）；线路管理据此判断"删的是不是正在播的线路" */
     private String currentPlayUrl;
+    /** 当前播放项是否已按 HLS（显式 mime）加载；为 false 时容器无法识别会再按 HLS 重试一次 */
+    private boolean currentItemAsHls;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -1141,17 +1145,77 @@ public class LivePlayActivity extends AppCompatActivity {
     }
 
     /**
-     * 去掉 TVBox 常见的 "url$标签"（如 ...m3u8$高清 / $线路1）后缀。
-     * 测速（SpeedTestEngine.cleanUrl）测的是去掉后缀的地址，播放器却拿原串去请求，
-     * 路径变成 ".m3u8$%E9%AB%98..." 导致 404、HLS 也识别不出，测得最快的线路反而播不了。
-     * 规则与 SpeedTestEngine.cleanUrl 保持一致：截掉第一个 '$' 之后的内容。
+     * 构建按协议分发的媒体源工厂，带上指定的 UA 与请求头。
+     * 允许跨协议重定向（http<->https）、放宽超时、默认使用通用浏览器 UA
+     * （部分 IPTV 源会拒绝 ExoPlayer 默认 UA），这些差异是导致"其他播放器能播、ExoPlayer 播不了"的常见原因。
      */
-    private static String stripSourceLabel(String url) {
-        if (url == null) return null;
-        String u = url.trim();
-        int idx = u.indexOf('$');
-        if (idx > 0) u = u.substring(0, idx).trim();
-        return u;
+    private DefaultMediaSourceFactory createMediaSourceFactory(String userAgent,
+                                                               java.util.Map<String, String> requestHeaders) {
+        DefaultHttpDataSource.Factory httpDataSourceFactory = new DefaultHttpDataSource.Factory()
+                .setUserAgent(userAgent)
+                .setConnectTimeoutMs(15000)
+                .setReadTimeoutMs(15000)
+                .setAllowCrossProtocolRedirects(true)
+                .setKeepPostFor302Redirects(true);
+        if (requestHeaders != null && !requestHeaders.isEmpty()) {
+            httpDataSourceFactory.setDefaultRequestProperties(requestHeaders);
+        }
+        return new DefaultMediaSourceFactory(this)
+                // 按协议分发：rtmp:// 走 RtmpDataSource，其余走 HTTP 数据源。
+                // rtsp:// 由 DefaultMediaSourceFactory 直接创建 RtspMediaSource，无需数据源支持。
+                .setDataSourceFactory(
+                        new com.github.tvbox.osc.player.SchemeDataSourceFactory(httpDataSourceFactory))
+                // 单次读取失败后在放弃前多重试几次，抵抗瞬时网络抖动
+                .setLoadErrorHandlingPolicy(
+                        new com.google.android.exoplayer2.upstream.DefaultLoadErrorHandlingPolicy(
+                                LOAD_ERROR_RETRY_COUNT));
+    }
+
+    /**
+     * 是否显式按 HLS 播放。ExoPlayer 只凭路径末尾 ".m3u8" 推断 HLS，
+     * 而 tv.php?id=1、/live/cctv1、.m3u 这类网关地址实际返回 #EXTM3U 播放列表时会被当成普通文件流，
+     * 报"无法识别的容器"黑屏换源——测速按内容嗅探判为 HLS 且速度最快，结果最快的线路反而播不了。
+     * 依据：测速缓存标记为 HLS、路径以 .m3u8/.m3u 结尾、或查询串里带 m3u8（如 ?type=m3u8）。
+     * 不按"没有扩展名"一律当 HLS：不少无扩展名的网关返回的是 FLV/TS，强制 HLS 反而播不了。
+     */
+    private boolean shouldPlayAsHls(String rawUrl, Uri uri) {
+        String scheme = uri.getScheme();
+        if (scheme == null) return false;
+        scheme = scheme.toLowerCase(java.util.Locale.ROOT);
+        // 只对 HTTP(S) 生效：rtsp/rtmp 设了 HLS mime 会被错误地交给 HLS 解析
+        if (!scheme.equals("http") && !scheme.equals("https")) return false;
+        String path = uri.getPath();
+        String p = path != null ? path.toLowerCase(java.util.Locale.ROOT) : "";
+        if (p.endsWith(".m3u8") || p.endsWith(".m3u")) return true;
+        // 查询串带 m3u8 只对"路径没写明普通文件扩展名"的地址生效：
+        // live.flv?src=cctv1.m3u8、a.ts?from=m3u8 这类代理地址按 1.2.4 的行为走普通流，
+        // 否则会被当成 HLS 报"清单格式错误"，而重试只覆盖"普通流→HLS"一个方向
+        String query = uri.getEncodedQuery();
+        if (query != null && query.toLowerCase(java.util.Locale.ROOT).contains("m3u8")
+                && !hasProgressiveExtension(p)) return true;
+        try {
+            SpeedTestResult r = speedTestEngine != null ? speedTestEngine.getCachedResult(rawUrl) : null;
+            if (r != null && r.isHls()) return true;
+        } catch (Throwable ignore) {
+        }
+        return false;
+    }
+
+    /** 路径末段带明确的普通文件流扩展名（.flv/.ts/.mp4 等） */
+    private static boolean hasProgressiveExtension(String lowerPath) {
+        int slash = lowerPath.lastIndexOf('/');
+        String seg = slash >= 0 ? lowerPath.substring(slash + 1) : lowerPath;
+        return seg.endsWith(".flv") || seg.endsWith(".ts") || seg.endsWith(".mp4")
+                || seg.endsWith(".mkv") || seg.endsWith(".mp3") || seg.endsWith(".aac")
+                || seg.endsWith(".m4a") || seg.endsWith(".mov") || seg.endsWith(".webm");
+    }
+
+    /** 实际请求地址是否为 HTTP(S)（HLS 只能走 HTTP，rtmp/file/content 按 HLS 重试必然失败） */
+    private static boolean isHttpPlayUrl(String rawUrl) {
+        String u = StreamUrl.playUrl(rawUrl);
+        if (u == null) return false;
+        String l = u.toLowerCase(java.util.Locale.ROOT);
+        return l.startsWith("http://") || l.startsWith("https://");
     }
 
     /**
@@ -1289,6 +1353,13 @@ public class LivePlayActivity extends AppCompatActivity {
     }
 
     private void initPlayer(String url) {
+        initPlayer(url, false);
+    }
+
+    /**
+     * @param forceHls true＝按普通流加载时容器无法识别，同一地址按 HLS 再试一次
+     */
+    private void initPlayer(String url, boolean forceHls) {
         if (playerView == null || !isAlive()) return;
         // 新一次起播：上一条线路的"稳定播放"计时作废
         if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
@@ -1308,24 +1379,10 @@ public class LivePlayActivity extends AppCompatActivity {
         LiveChannel.setPlayingHint(channelManager.getCurrentChannel(), url);
         if (exoPlayer == null) {
             try {
-                // 自定义 HTTP 数据源：允许跨协议重定向（http<->https）、放宽超时、
-                // 使用通用浏览器 UA（部分 IPTV 源会拒绝 ExoPlayer 默认 UA），
-                // 这些差异是导致"其他播放器能播、ExoPlayer 播不了"的常见原因。
-                DefaultHttpDataSource.Factory httpDataSourceFactory = new DefaultHttpDataSource.Factory()
-                        .setUserAgent("Mozilla/5.0 (Linux; Android 10) ExoPlayerLib/2.19.1")
-                        .setConnectTimeoutMs(15000)
-                        .setReadTimeoutMs(15000)
-                        .setAllowCrossProtocolRedirects(true)
-                        .setKeepPostFor302Redirects(true);
-                DefaultMediaSourceFactory mediaSourceFactory = new DefaultMediaSourceFactory(this)
-                        // 按协议分发：rtmp:// 走 RtmpDataSource，其余走 HTTP 数据源。
-                        // rtsp:// 由 DefaultMediaSourceFactory 直接创建 RtspMediaSource，无需数据源支持。
-                        .setDataSourceFactory(
-                                new com.github.tvbox.osc.player.SchemeDataSourceFactory(httpDataSourceFactory))
-                        // 单次读取失败后在放弃前多重试几次，抵抗瞬时网络抖动
-                        .setLoadErrorHandlingPolicy(
-                                new com.google.android.exoplayer2.upstream.DefaultLoadErrorHandlingPolicy(
-                                        LOAD_ERROR_RETRY_COUNT));
+                // 播放器级的默认工厂（无线路请求头）。实际每次起播都按线路自带的
+                // UA/Referer 另建媒体源，见下方 setMediaSource。
+                DefaultMediaSourceFactory mediaSourceFactory =
+                        createMediaSourceFactory(StreamUrl.DEFAULT_USER_AGENT, null);
 
                 // 大缓冲策略：以牺牲直播时延为代价换取抗抖动能力。
                 // 同时用字节上限兜住内存：低码率流由时长目标决定缓冲量，
@@ -1389,6 +1446,22 @@ public class LivePlayActivity extends AppCompatActivity {
                         Timber.w("播放出错: %s", error.getMessage());
                         cancelPlayTimeout();
                         if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
+                        // 未测速的无扩展名 HLS（如 tv.php?id=1）按普通流加载会报"容器无法识别"：
+                        // 先按 HLS 重试同一地址一次，再失败才换源。同样异步执行，不在回调里同步重建。
+                        if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED
+                                && !currentItemAsHls && handler != null && currentPlayUrl != null
+                                // 非 HTTP(S)（rtmp/file/content）按 HLS 重试不可能成功，直接换源，免得低端盒子多等一轮
+                                && isHttpPlayUrl(currentPlayUrl)) {
+                            final String retryUrl = currentPlayUrl;
+                            Timber.i("容器无法识别，按 HLS 重试: %s", retryUrl);
+                            handler.post(() -> {
+                                if (!isAlive()) return;
+                                // 期间已换台/换源：交给新的播放流程，不再重试旧地址
+                                if (!retryUrl.equals(currentPlayUrl)) return;
+                                initPlayer(retryUrl, true);
+                            });
+                            return;
+                        }
                         // 异步换源，避免同步递归调用 setMediaItem 引发 IllegalStateException
                         postSourceFailure(false);
                     }
@@ -1405,17 +1478,35 @@ public class LivePlayActivity extends AppCompatActivity {
             try { exoPlayer.stop(); } catch (Exception ignore) {}
             try { exoPlayer.clearMediaItems(); } catch (Exception ignore) {}
 
-            // 去掉 TVBox 风格的 "$标签" 后缀再交给播放器（仅影响本次播放，不改存储的 URL）
-            Uri uri = Uri.parse(stripSourceLabel(url));
+            // 去掉 TVBox 风格的 "$标签" 与 "|请求头" 后缀再交给播放器（仅影响本次请求，不改存储的 URL）。
+            // 规则与测速共用 StreamUrl，保证两边请求的是同一个地址。
+            Uri uri = Uri.parse(StreamUrl.playUrl(url));
+            // forceHls 同样只对 HTTP(S) 生效，与 shouldPlayAsHls 的协议限制一致
+            boolean asHls = (forceHls && isHttpPlayUrl(url)) || shouldPlayAsHls(url, uri);
+            currentItemAsHls = asHls;
             // 直播流设置目标偏移：播放点离直播边缘更远，可容忍更大的网络波动而不卡顿
-            MediaItem item = new MediaItem.Builder()
+            MediaItem.Builder itemBuilder = new MediaItem.Builder()
                     .setUri(uri)
                     .setLiveConfiguration(
                             new MediaItem.LiveConfiguration.Builder()
                                     .setTargetOffsetMs(LIVE_TARGET_OFFSET_MS)
-                                    .build())
-                    .build();
-            exoPlayer.setMediaItem(item);
+                                    .build());
+            if (asHls) itemBuilder.setMimeType(MimeTypes.APPLICATION_M3U8);
+            MediaItem item = itemBuilder.build();
+            // 线路自带的 UA/Referer（#EXTVLCOPT 或 url|User-Agent=..）逐条生效：
+            // 服务器常按它们放行，测速带了而播放不带会出现"测速通过但播不了"。
+            // 每条线路单独建工厂，不改共享工厂的默认属性，避免上一条线路的请求头串到下一条。
+            java.util.Map<String, String> headers = new java.util.LinkedHashMap<>(StreamUrl.headers(url));
+            String ua = StreamUrl.DEFAULT_USER_AGENT;
+            for (java.util.Iterator<java.util.Map.Entry<String, String>> it = headers.entrySet().iterator(); it.hasNext(); ) {
+                java.util.Map.Entry<String, String> e = it.next();
+                if ("User-Agent".equalsIgnoreCase(e.getKey())) {
+                    // UA 必须走 setUserAgent：DefaultHttpDataSource 会用它覆盖请求属性里的 User-Agent
+                    if (e.getValue() != null && !e.getValue().isEmpty()) ua = e.getValue();
+                    it.remove();
+                }
+            }
+            exoPlayer.setMediaSource(createMediaSourceFactory(ua, headers).createMediaSource(item));
             exoPlayer.prepare();
             exoPlayer.setPlayWhenReady(true);
             startPlayTimeout();
@@ -2011,8 +2102,13 @@ public class LivePlayActivity extends AppCompatActivity {
             if (url != null && speedTestEngine != null) {
                 SpeedTestResult r = speedTestEngine.getCachedResult(url);
                 // 缓存命中即直接采用：0 也是结论（测过但不可用），
-                // 不能因为 <=0 就往下走，否则会被误判成"未测速"
-                if (r != null) return r.getSpeed();
+                // 不能因为 <=0 就往下走，否则会被误判成"未测速"。
+                // 低于最低速度阈值的线路 available=false 但仍保留测得的速度（排序要用），
+                // 显示时必须按"不可用"处理，不能显示成 "30 KB/s" 让人以为能用。
+                if (r != null) {
+                    if (!r.isAvailable() && !SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) return 0.0;
+                    return r.getSpeed();
+                }
             }
             // 2) 按线路下标取该线路自身的测速值。
             //    speeds 与 sourceUrls 严格一一对应（测速时按 sourceIndex 写入，
@@ -2499,6 +2595,19 @@ public class LivePlayActivity extends AppCompatActivity {
     /** 截短 URL 用于展示 */
     private String shortUrl(String url) {
         if (url == null) return "";
+        // 按实际地址展示（保留 '$标签'）：带 '|User-Agent=..&Referer=..' 的线路结尾都是同一串编码请求头，
+        // 直接截原始串会让同频道的几条线路看起来一模一样
+        String play = StreamUrl.playUrl(url);
+        if (play != null && !play.isEmpty()) {
+            String noHeader = url;
+            int bar = noHeader.indexOf('|');
+            int dollar = noHeader.indexOf('$');
+            String label = null;
+            if (dollar > 0 && (bar < 0 || dollar < bar)) {
+                label = noHeader.substring(dollar + 1, bar > dollar ? bar : noHeader.length()).trim();
+            }
+            url = (label != null && !label.isEmpty()) ? play + "$" + label : play;
+        }
         if (url.length() <= 42) return url;
         return url.substring(0, 20) + "..." + url.substring(url.length() - 18);
     }

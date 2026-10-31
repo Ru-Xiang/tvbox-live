@@ -3,6 +3,9 @@ package com.github.tvbox.osc.bean;
 import androidx.room.Entity;
 import androidx.room.PrimaryKey;
 import androidx.room.Ignore;
+
+import com.github.tvbox.osc.util.ChannelDeduper;
+import com.github.tvbox.osc.util.StreamUrl;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.List;
@@ -81,12 +84,19 @@ public class LiveChannel implements Serializable {
     private volatile List<Double> speeds;
 
     /**
-     * 线路 URL 去重索引（与 sourceUrls 同步维护）。
+     * 线路去重索引（与 sourceUrls 同步维护）：存 {@link ChannelDeduper#lineKey} 去重键。
      * 热门频道跨数十个源可累积上万条线路，用 List#contains 去重会退化为 O(n²)，
      * 这里用 HashSet 做 O(1) 判断。仅作索引用途，不参与序列化。
      */
     @Ignore
     private transient java.util.HashSet<String> urlSet;
+
+    /**
+     * playUrl（去掉 '$标签' 与 '|请求头' 后真正请求的地址）→ 列表里首条该地址的原始串。
+     * 与 urlSet 一起懒建、一起失效；只存原始串不存下标，重排（置顶/测速排序）后无需重建。
+     */
+    @Ignore
+    private transient java.util.HashMap<String, String> playIndex;
 
     @Ignore
     private String currentEpgInfo;
@@ -145,23 +155,81 @@ public class LiveChannel implements Serializable {
      */
     public static final int MAX_SOURCE_URLS = 200;
 
-    /** 添加播放源（O(1) 去重，超过硬上限后忽略） */
+    /**
+     * 添加播放源（O(1) 去重，超过硬上限后忽略）。
+     *
+     * <p>去重口径与 {@link ChannelDeduper#lineKey} 一致：按实际请求的地址比较，
+     * 只是 '$标签' 不同的同一路流（跨源合并时 "url$电信" / "url$联通" / "url"）视为同一条线路，保留先到的原始串。
+     * 原先按原始串去重，标签不同就各占一条，跨源合并后同一路流被测多次、多占 200 条硬上限。
+     *
+     * <p>先到的那条不带请求头、后到的带 '|User-Agent=..&Referer=..' 时，原位换成带请求头的那条：
+     * 不带请求头时测速/播放用的是默认 UA，带请求头的那条在不需要请求头的服务器上同样能播，
+     * 而反过来，需要 UA/Referer 的服务器只认带头的那条——保留带头的严格更安全（只多发两个请求头）。
+     * 换的是同一个下标，speeds 不动（解析/合并阶段速度均为 0）。
+     * 两条都带请求头但内容不同则并存（同 lineKey：服务器可能只放行其中一种，不能随手合并）。
+     */
     public void addSourceUrl(String url) {
         if (url == null || url.isEmpty()) return;
         if (sourceUrls == null) {
             sourceUrls = new ArrayList<>();
         }
+        if (urlSet == null || playIndex == null) {
+            // 懒初始化并与现有列表对齐（反序列化/setSourceUrls/removeSource 后索引可能为空）
+            rebuildUrlIndex();
+        }
+        String key = ChannelDeduper.lineKey(url);
+        if (urlSet.contains(key)) return;
+        String play = StreamUrl.playUrl(url);
+        boolean hasHeaders = !StreamUrl.headers(url).isEmpty();
+        String first = playIndex.get(play);
+        if (first != null) {
+            boolean firstHasHeaders = !StreamUrl.headers(first).isEmpty();
+            if (!firstHasHeaders) {
+                // 走到这里 url 必然带请求头（不带的话 lineKey 与 first 相同，上面已返回）
+                int idx = sourceUrls.indexOf(first);
+                if (idx >= 0) {
+                    sourceUrls.set(idx, url);
+                    urlSet.remove(ChannelDeduper.lineKey(first));
+                    urlSet.add(key);
+                    playIndex.put(play, url);
+                    return;
+                }
+                // 索引里的那条已不在列表（理论上不会发生）：按新线路正常追加
+                first = null;
+            }
+            // 已有带请求头的同地址线路：不带请求头的这条是它的子集，丢弃
+            else if (!hasHeaders) return;
+            // 两条请求头不同：并存（见上）
+        }
         if (sourceUrls.size() >= MAX_SOURCE_URLS) return;
-        if (urlSet == null) {
-            // 懒初始化并与现有列表对齐（反序列化/setSourceUrls 后 urlSet 可能为空）
-            urlSet = new java.util.HashSet<>(Math.max(16, sourceUrls.size() * 2));
-            urlSet.addAll(sourceUrls);
+        urlSet.add(key);
+        if (first == null) playIndex.put(play, url);
+        sourceUrls.add(url);
+        if (speeds == null) speeds = new ArrayList<>();
+        speeds.add(0.0);
+    }
+
+    /** 按当前 sourceUrls 重建去重索引（首次出现者为准，与 addSourceUrl 的"保留先到"一致） */
+    private void rebuildUrlIndex() {
+        List<String> urls = sourceUrls;
+        int n = urls == null ? 0 : urls.size();
+        java.util.HashSet<String> set = new java.util.HashSet<>(Math.max(16, n * 2));
+        java.util.HashMap<String, String> plays = new java.util.HashMap<>(Math.max(16, n * 2));
+        if (urls != null) {
+            for (String u : urls) {
+                if (u == null) continue;
+                set.add(ChannelDeduper.lineKey(u));
+                String p = StreamUrl.playUrl(u);
+                String prev = plays.get(p);
+                // 同地址既有不带头又有带头的（旧数据/外部 setSourceUrls）：索引指向带头的那条，
+                // 之后再来不带头的同地址线路会被当作子集丢弃，而不是去替换列表里的某一条
+                if (prev == null || (StreamUrl.headers(prev).isEmpty() && !StreamUrl.headers(u).isEmpty())) {
+                    plays.put(p, u);
+                }
+            }
         }
-        if (urlSet.add(url)) {
-            sourceUrls.add(url);
-            if (speeds == null) speeds = new ArrayList<>();
-            speeds.add(0.0);
-        }
+        urlSet = set;
+        playIndex = plays;
     }
 
     /** 获取源数量 */
@@ -217,6 +285,7 @@ public class LiveChannel implements Serializable {
         sourceUrls = newUrls;
         // 去重索引失效，下次 addSourceUrl 时按新列表懒重建（HashSet 非线程安全，不在此原地修改）
         urlSet = null;
+        playIndex = null;
         // 修正当前索引，保持指向有效范围
         if (sourceIndex >= newUrls.size()) {
             sourceIndex = Math.max(0, newUrls.size() - 1);
@@ -270,12 +339,12 @@ public class LiveChannel implements Serializable {
         }
         // 顺序未变（每次重建展示列表都会重新应用置顶顺序）：保持当前索引，不打断正在播的线路
         if (newUrls.equals(sourceUrls)) {
-            if (this.urlSet == null) this.urlSet = added;
             return;
         }
         int newIndex = remapIndex(sourceUrls, newUrls);
         this.sourceUrls = newUrls;
-        this.urlSet = added;
+        // added 是原始串集合，不是 lineKey 去重键，不能当 urlSet 用；集合未变，原索引仍有效
+        // （playIndex 只存原始串不存下标，重排不影响）
         if (hasSpeeds) this.speeds = newSpeeds;
         sourceIndex = newIndex;
     }
@@ -485,6 +554,7 @@ public class LiveChannel implements Serializable {
     public void setSourceUrls(List<String> sourceUrls) {
         this.sourceUrls = sourceUrls;
         this.urlSet = null;
+        this.playIndex = null;
     }
 
     public List<Double> getSpeeds() { return speeds; }

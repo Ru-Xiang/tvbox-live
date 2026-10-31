@@ -145,8 +145,19 @@ public class HawkConfig {
     /** 测速结果持久化 JSON（url -> 序列化后的结果） */
     public static final String SPEED_TEST_RESULT_CACHE = "speed_test_result_cache";
 
-    /** 测速结果缓存最大条数（LRU 上限） */
-    public static final int SPEED_TEST_RESULT_CACHE_MAX = 500;
+    /**
+     * 测速结果持久化最大条数（按测试时间保留最新）。
+     * 必须不小于单轮测速线路上限（SpeedTestEngine.MAX_TEST_LINES = 2000），
+     * 否则一轮的结果重启后只剩一部分：好线路的结果被挤掉、失败线路的结果留下，
+     * 冷启动时频道会被误隐藏或误显示。多留一些余量给上一轮未被覆盖的结果。
+     */
+    public static final int SPEED_TEST_RESULT_CACHE_MAX = 3000;
+
+    /**
+     * 最近一轮"完整跑完"的测速开始时间（epoch ms）。
+     * testTime 早于它的缓存结果不是这一轮测出来的，只能视为"未测"，不能当成本轮的失败/评分。
+     */
+    public static final String SPEED_TEST_LAST_ROUND_START = "speed_test_last_round_start";
 
     /**
      * 测速后生成的"最佳线路本地播放列表"内容（TXT 格式：分组,#genre# + 频道名,最佳URL）。
