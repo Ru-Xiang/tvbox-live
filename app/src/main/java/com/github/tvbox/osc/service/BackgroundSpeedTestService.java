@@ -59,6 +59,15 @@ public class BackgroundSpeedTestService extends Service {
     public static final String EXTRA_RELOAD = "extra_reload_sources";
 
     /**
+     * 单频道测速：频道 key（{@link LiveChannel#getKey()}）。
+     * 先只为该频道联网查找更多线路，再只测这一个频道（不算一整轮，不更新全局测速时间）
+     */
+    public static final String EXTRA_CHANNEL_KEY = "extra_channel_key";
+
+    /** 单频道测速的目标对象（按引用优先定位到列表里的同一对象；Intent 只带 key） */
+    private static volatile LiveChannel pendingSingleChannel;
+
+    /**
      * 待测速频道列表的静态持有。
      * 避免通过 Intent 序列化大列表导致 TransactionTooLargeException（Binder 1MB 限制）。
      */
@@ -180,11 +189,38 @@ public class BackgroundSpeedTestService extends Service {
         public final List<SpeedTestResult> results;
         public final long totalTime;
         public final boolean cancelled;
+        /** 单频道测速时为该频道的 key；整轮测速为 null */
+        public final String channelKey;
+        /** 单频道测速疑似网络异常、结果已回滚未应用（见 SpeedTestEngine.PartialRoundSnapshot#networkAborted） */
+        public final boolean networkAborted;
 
         public SpeedTestCompleteEvent(List<SpeedTestResult> results, long totalTime, boolean cancelled) {
+            this(results, totalTime, cancelled, null);
+        }
+
+        public SpeedTestCompleteEvent(List<SpeedTestResult> results, long totalTime, boolean cancelled,
+                                      String channelKey) {
+            this(results, totalTime, cancelled, channelKey, false);
+        }
+
+        public SpeedTestCompleteEvent(List<SpeedTestResult> results, long totalTime, boolean cancelled,
+                                      String channelKey, boolean networkAborted) {
             this.results = results;
             this.totalTime = totalTime;
             this.cancelled = cancelled;
+            this.channelKey = channelKey;
+            this.networkAborted = networkAborted;
+        }
+    }
+
+    /** 本轮（单频道测速）是否因疑似网络异常被回滚；须在该轮 onAllComplete 回调线程上调用 */
+    private static boolean partialRoundAborted(@Nullable String channelKey) {
+        if (channelKey == null) return false;
+        try {
+            SpeedTestEngine.PartialRoundSnapshot s = SpeedTestEngine.getInstance().getLastPartialRound();
+            return s != null && s.networkAborted && s.channelKeys.contains(channelKey);
+        } catch (Throwable t) {
+            return false;
         }
     }
 
@@ -283,6 +319,12 @@ public class BackgroundSpeedTestService extends Service {
                 Timber.w(t, "startForeground 失败，继续在后台执行测速");
             }
 
+            String channelKey = intent.getStringExtra(EXTRA_CHANNEL_KEY);
+            if (channelKey != null) {
+                startChannelTestInService(channelKey);
+                return START_NOT_STICKY;
+            }
+
             boolean reload = intent.getBooleanExtra(EXTRA_RELOAD, false);
             com.github.tvbox.osc.util.RunLog.i("收到测速指令 reload=" + reload);
             if (reload) {
@@ -372,6 +414,111 @@ public class BackgroundSpeedTestService extends Service {
         }
 
         return START_NOT_STICKY;
+    }
+
+    /**
+     * 单频道测速（服务内）：先为该频道查找更多线路，再只测这一个频道。
+     * 查找线路阶段与整轮的"拉源"一样登记为在途请求，旧一轮在此期间结束不会停掉服务。
+     */
+    private void startChannelTestInService(final String channelKey) {
+        final LiveChannel target = resolveChannel(getApplicationContext(), channelKey);
+        pendingSingleChannel = null;
+        com.github.tvbox.osc.util.RunLog.i("收到单频道测速指令: " + channelKey);
+        if (target == null) {
+            postSpeedTestEvent(new SpeedTestErrorEvent("未找到该频道"));
+            stopSelfIfIdle();
+            return;
+        }
+        final String startMsg = "正在为「" + target.getChannelName() + "」查找更多线路...";
+        updateNotification(startMsg, 0, 0);
+        postSpeedTestEvent(new SpeedTestPrepareEvent(startMsg, 0, 0));
+        final int reloadGen = beginReload();
+        final java.util.concurrent.atomic.AtomicBoolean reloadReleased =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        final Runnable releaseReload = () -> {
+            if (reloadReleased.compareAndSet(false, true)) endReload(reloadGen);
+        };
+        try {
+            com.github.tvbox.osc.api.ChannelManager
+                    .getInstance(getApplicationContext())
+                    .discoverLinesForChannel(target, new com.github.tvbox.osc.api.ChannelManager.SpeedTestReloadCallback() {
+                        @Override
+                        public void onReady(ArrayList<LiveChannel> channels) {
+                            try {
+                                if (stopped) {
+                                    com.github.tvbox.osc.util.RunLog.i("测速已取消，跳过单频道测速");
+                                    return;
+                                }
+                                if (channels == null || channels.isEmpty()) {
+                                    releaseReload.run();
+                                    postSpeedTestEvent(new SpeedTestErrorEvent("未找到该频道"));
+                                    stopSelfIfIdle();
+                                } else {
+                                    // 用实际被测对象的 key：管理器可能按频道名兜底解析到另一分组里的同名频道，
+                                    // 持久化按 key 校验本轮快照，用点击时的 key 会对不上而跳过持久化
+                                    performSpeedTest(channels, releaseReload, true, keyOf(channels, channelKey));
+                                }
+                            } catch (Throwable t) {
+                                Timber.e(t, "单频道测速准备完成回调异常");
+                                releaseReload.run();
+                                postSpeedTestEvent(new SpeedTestErrorEvent("准备测速失败: " + t.getMessage()));
+                                stopSelfIfIdle();
+                            } finally {
+                                releaseReload.run();
+                            }
+                        }
+
+                        @Override
+                        public void onProgress(int current, int total, String message) {
+                            if (stopped) return;
+                            updateNotification(message, current, total);
+                            postSpeedTestEvent(new SpeedTestPrepareEvent(message, current, total));
+                        }
+                    });
+        } catch (Throwable t) {
+            Timber.e(t, "发起单频道查找线路失败");
+            com.github.tvbox.osc.util.RunLog.i("发起单频道查找线路失败: " + t);
+            releaseReload.run();
+            postSpeedTestEvent(new SpeedTestErrorEvent("获取线路失败: " + t.getMessage()));
+            stopSelfIfIdle();
+        }
+    }
+
+    /**
+     * 按 key 定位单频道测速的目标：优先用发起方传入的同一对象，其次原始列表里的频道，最后当前频道。
+     * 管理器在查找线路时会再把它解析到列表里的那份对象。
+     */
+    @Nullable
+    private static LiveChannel resolveChannel(Context ctx, String key) {
+        if (key == null) return null;
+        LiveChannel hint = pendingSingleChannel;
+        if (hint != null && key.equals(hint.getKey())) return hint;
+        try {
+            com.github.tvbox.osc.api.ChannelManager cm = com.github.tvbox.osc.api.ChannelManager.getInstance(ctx);
+            LiveChannel raw = cm.findRawChannelByKey(key);
+            if (raw != null) return raw;
+            LiveChannel cur = cm.getCurrentChannel();
+            if (cur != null && key.equals(cur.getKey())) return cur;
+        } catch (Throwable t) {
+            Timber.w(t, "定位单频道测速目标失败");
+        }
+        return null;
+    }
+
+    /** 单频道测速实际被测频道的 key；取不到时退回发起时的 key */
+    private static String keyOf(@Nullable List<LiveChannel> channels, String fallback) {
+        if (channels != null && !channels.isEmpty() && channels.get(0) != null) {
+            String k = channels.get(0).getKey();
+            if (k != null) return k;
+        }
+        return fallback;
+    }
+
+    /** 完成通知/提示用的范围前缀：单频道为"「频道名」"，整轮为空 */
+    private static String scopeLabel(@Nullable String channelKey) {
+        if (channelKey == null) return "";
+        int sep = channelKey.indexOf('\u0001');
+        return "「" + (sep >= 0 ? channelKey.substring(sep + 1) : channelKey) + "」";
     }
 
     @Nullable
@@ -476,15 +623,22 @@ public class BackgroundSpeedTestService extends Service {
     // ============ 测速逻辑 ============
 
     private void performSpeedTest(List<LiveChannel> channels) {
-        performSpeedTest(channels, null);
+        performSpeedTest(channels, null, false, null);
+    }
+
+    private void performSpeedTest(List<LiveChannel> channels, @Nullable Runnable onRegistered) {
+        performSpeedTest(channels, onRegistered, false, null);
     }
 
     /**
      * @param onRegistered 新一轮登记为 activeCallback 之后、真正启动之前执行（用于拉源请求出队）。
      *                     必须在启动前：引擎可能同步回调 onError，若此时仍算"在途拉源"，
      *                     本轮收尾会误以为还有新请求而保持服务，导致服务永远不停
+     * @param partial      true＝单频道测速（不更新全局测速轮次 / 上次测速时间）
+     * @param channelKey   单频道测速的频道 key，随完成事件广播；整轮为 null
      */
-    private void performSpeedTest(List<LiveChannel> channels, @Nullable Runnable onRegistered) {
+    private void performSpeedTest(List<LiveChannel> channels, @Nullable Runnable onRegistered,
+                                  final boolean partial, @Nullable final String channelKey) {
         SpeedTestEngine.SpeedTestCallback callback = new SpeedTestEngine.SpeedTestCallback() {
             @Override
             public void onItemComplete(SpeedTestResult result, int current, int total) {
@@ -500,14 +654,14 @@ public class BackgroundSpeedTestService extends Service {
             public void onAllComplete(List<SpeedTestResult> results, long totalTime) {
                 boolean mine = finishActive(this);
                 // 更新通知（仅本服务当前驱动的一轮；否则通知已不归这一轮所有）
-                if (mine) updateNotification("测速完成", results.size(), results.size());
+                if (mine) updateNotification(scopeLabel(channelKey) + "测速完成", results.size(), results.size());
 
                 // 测速完成后：为整体订阅源每个频道选出最佳线路，
                 // 生成本地播放列表并持久化（数据库 + 本地文件）
                 try {
                     com.github.tvbox.osc.api.ChannelManager
                             .getInstance(getApplicationContext())
-                            .persistAfterSpeedTest();
+                            .persistAfterSpeedTest(channelKey);
                 } catch (Throwable e) {
                     // 低内存设备上生成本地列表可能 OOM；必须兜住，
                     // 否则完成事件无法广播、UI 进度条会一直卡住
@@ -519,7 +673,8 @@ public class BackgroundSpeedTestService extends Service {
                 // 仍有新请求在拉源时也不发：否则 UI 只看到旧一轮"完成"，新请求像被吞掉
                 boolean reloadPending = hasPendingReload();
                 if ((mine || activeCallback == null) && !reloadPending) {
-                    postSpeedTestEvent(new SpeedTestCompleteEvent(results, totalTime, false));
+                    postSpeedTestEvent(new SpeedTestCompleteEvent(results, totalTime, false, channelKey,
+                            partialRoundAborted(channelKey)));
                 }
 
                 // 统计结果
@@ -548,7 +703,8 @@ public class BackgroundSpeedTestService extends Service {
                     } catch (Throwable t) {
                         Timber.w(t, "stopForeground 失败");
                     }
-                    postFinishedNotification("测速完成: " + available + "/" + results.size() + " 可用");
+                    postFinishedNotification(scopeLabel(channelKey) + "测速完成: "
+                            + available + "/" + results.size() + " 可用");
                     safeStopSelf(false, true);
                 }
             }
@@ -597,14 +753,14 @@ public class BackgroundSpeedTestService extends Service {
                     keepAliveForPendingReload();
                     return;
                 }
-                postSpeedTestEvent(new SpeedTestCompleteEvent(new ArrayList<>(), 0, true));
+                postSpeedTestEvent(new SpeedTestCompleteEvent(new ArrayList<>(), 0, true, channelKey));
                 if (mine) safeStopSelf(true, true);
             }
         };
         // 先登记再启动：引擎可能同步回调 onError（如无可测线路）
         activeCallback = callback;
         if (onRegistered != null) onRegistered.run();
-        speedTestEngine.testChannels(channels, callback);
+        speedTestEngine.testChannels(channels, callback, partial);
         // onReady 在拉源线程上调用，与主线程的 ACTION_STOP_TEST / onDestroy 存在竞态：
         // 若在上面登记之前已被取消/销毁，cancel() 当时拦不住这一轮。此时本轮已登记，
         // 补一次按回调取消，本轮会以 onCancelled 收尾并结束服务
@@ -759,6 +915,62 @@ public class BackgroundSpeedTestService extends Service {
     }
 
     /**
+     * 单频道测速：先只为该频道联网查找更多线路（不替换整个列表），再只测这一个频道。
+     * 用于"频道无可用线路"时快速补线路；不算一整轮，不更新"上次测速时间"。
+     * 应在前台（用户点击时）调用；前台服务启动失败时回退到进程内执行。
+     */
+    public static void startChannelSpeedTest(Context context, LiveChannel channel) {
+        if (context == null || channel == null) {
+            postSpeedTestEvent(new SpeedTestErrorEvent("未找到该频道"));
+            return;
+        }
+        final String key = channel.getKey();
+        pendingSingleChannel = channel;
+        Intent intent = new Intent(context, BackgroundSpeedTestService.class);
+        intent.setAction(ACTION_START_TEST);
+        intent.putExtra(EXTRA_CHANNEL_KEY, key);
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent);
+            } else {
+                context.startService(intent);
+            }
+        } catch (Throwable t) {
+            Timber.w(t, "启动前台测速服务失败，改为进程内单频道测速");
+            pendingSingleChannel = null;
+            final Context appCtx = context.getApplicationContext();
+            postSpeedTestEvent(new SpeedTestPrepareEvent(
+                    "正在为「" + channel.getChannelName() + "」查找更多线路...", 0, 0));
+            try {
+                com.github.tvbox.osc.api.ChannelManager.getInstance(appCtx)
+                        .discoverLinesForChannel(channel, new com.github.tvbox.osc.api.ChannelManager.SpeedTestReloadCallback() {
+                            @Override
+                            public void onReady(ArrayList<LiveChannel> channels) {
+                                try {
+                                    if (channels == null || channels.isEmpty()) {
+                                        postSpeedTestEvent(new SpeedTestErrorEvent("未找到该频道"));
+                                        return;
+                                    }
+                                    runInProcess(appCtx, channels, true, keyOf(channels, key));
+                                } catch (Throwable e) {
+                                    Timber.e(e, "进程内单频道测速启动异常");
+                                    postSpeedTestEvent(new SpeedTestErrorEvent("准备测速失败: " + e.getMessage()));
+                                }
+                            }
+
+                            @Override
+                            public void onProgress(int current, int total, String message) {
+                                postSpeedTestEvent(new SpeedTestPrepareEvent(message, current, total));
+                            }
+                        });
+            } catch (Throwable e) {
+                Timber.e(e, "进程内单频道查找线路失败");
+                postSpeedTestEvent(new SpeedTestErrorEvent("获取线路失败: " + e.getMessage()));
+            }
+        }
+    }
+
+    /**
      * 启动后台测速服务（使用已准备好的频道列表）
      */
     public static void startSpeedTest(Context context, ArrayList<LiveChannel> channels) {
@@ -786,6 +998,11 @@ public class BackgroundSpeedTestService extends Service {
      * 不依赖 Service 生命周期，仍通过 EventBus 广播进度/结果并持久化最佳线路本地列表。
      */
     private static void runInProcess(Context appCtx, List<LiveChannel> channels) {
+        runInProcess(appCtx, channels, false, null);
+    }
+
+    private static void runInProcess(Context appCtx, List<LiveChannel> channels,
+                                     final boolean partial, @Nullable final String channelKey) {
         if (channels == null || channels.isEmpty()) {
             postSpeedTestEvent(new SpeedTestErrorEvent("没有可测速的线路"));
             return;
@@ -800,11 +1017,12 @@ public class BackgroundSpeedTestService extends Service {
             @Override
             public void onAllComplete(List<SpeedTestResult> results, long totalTime) {
                 try {
-                    com.github.tvbox.osc.api.ChannelManager.getInstance(appCtx).persistAfterSpeedTest();
+                    com.github.tvbox.osc.api.ChannelManager.getInstance(appCtx).persistAfterSpeedTest(channelKey);
                 } catch (Throwable e) {
                     Timber.w(e, "进程内测速完成后持久化失败");
                 }
-                postSpeedTestEvent(new SpeedTestCompleteEvent(results, totalTime, false));
+                postSpeedTestEvent(new SpeedTestCompleteEvent(results, totalTime, false, channelKey,
+                            partialRoundAborted(channelKey)));
             }
 
             @Override
@@ -832,12 +1050,12 @@ public class BackgroundSpeedTestService extends Service {
                 }
                 // 取消前已完成的部分同样会重排/过滤线路，一并保存
                 persistChannelsQuietly(appCtx);
-                postSpeedTestEvent(new SpeedTestCompleteEvent(new ArrayList<>(), 0, true));
+                postSpeedTestEvent(new SpeedTestCompleteEvent(new ArrayList<>(), 0, true, channelKey));
             }
         };
         // 先登记再启动：引擎可能同步回调（如无可测线路）
         inProcessCallback = callback;
-        SpeedTestEngine.getInstance().testChannels(channels, callback);
+        SpeedTestEngine.getInstance().testChannels(channels, callback, partial);
     }
 
     /**

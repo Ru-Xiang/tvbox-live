@@ -62,7 +62,7 @@
     <string name="speed_test_periodic_prompt">周期性：打开应用时提示测速</string>
     <string name="speed_test_interval">测速周期</string>
     <string name="speed_test_timeout">测速超时</string>
-    <string name="speed_test_concurrency">并发线程</string>
+    <string name="speed_test_concurrency">验证并发（实测固定 1 条）</string>
     <string name="speed_test_sort">按速度排序播放源</string>
     <string name="speed_test_min_speed">最低可接受速度</string>
     <string name="speed_test_start">立即测速</string>

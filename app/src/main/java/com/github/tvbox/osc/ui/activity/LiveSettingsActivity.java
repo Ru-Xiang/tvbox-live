@@ -1213,6 +1213,19 @@ public class LiveSettingsActivity extends AppCompatActivity {
                 if (r != null && r.isAvailable()) available++;
             }
         }
+        if (event.channelKey != null) {
+            // 单频道测速：不是一整轮，"上次测速时间"不变，提示里注明频道
+            String key = event.channelKey;
+            int sep = key.indexOf('\u0001');
+            String name = sep >= 0 ? key.substring(sep + 1) : key;
+            if (event.networkAborted) {
+                ToastUtil.show(this, "「" + name + "」测速时网络异常，结果未应用");
+                return;
+            }
+            ToastUtil.show(this, String.format(java.util.Locale.CHINA,
+                    "「%s」测速完成: %d/%d 条线路可用", name, available, total));
+            return;
+        }
         ToastUtil.show(this, String.format(java.util.Locale.CHINA,
                 "测速完成: %d/%d 个源可用", available, total));
         // 刷新"上次测速时间"显示

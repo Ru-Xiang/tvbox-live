@@ -293,7 +293,7 @@ public class ConfigHttpServer extends NanoHTTPD {
                         speedMode == HawkConfig.SPEED_MODE_PERIODIC_PROMPT ? "periodic_prompt" : "manual"))
                 + field("测速周期（小时）", numberInput("speed_interval", speedInterval, "24", 1, 168))
                 + field("测速超时（秒）", numberInput("speed_timeout", speedTimeout, "5", 1, 30))
-                + field("并发线程", numberInput("speed_concurrency", speedConcurrency, "5", 1, 20))
+                + field("验证并发（实测固定 1 条）", numberInput("speed_concurrency", speedConcurrency, "5", 1, 20))
                 + field("最低速度（KB/s，0=不限制）", numberInput("min_speed", minSpeed, "50", 0, MAX_SPEED_MIN_THRESHOLD))
                 + checkbox("sort_by_speed", "按速度/质量对线路排序", sortBySpeed)
                 + checkbox("filter_unavailable", "测速后移除不可用线路", filterUnavailable)
@@ -311,7 +311,7 @@ public class ConfigHttpServer extends NanoHTTPD {
                 + checkbox("show_channel_info", "显示频道信息栏", showChannelInfo)
                 + field("信息栏显示时长（秒）", numberInput("info_duration", infoDuration, "5", 1, 15))
                 + checkbox("show_speed_info", "显示测速信息", showSpeedInfo)
-                + field("播放超时换源（秒，0=关闭）", numberInput("play_timeout", playTimeout, "10", 0, 60))
+                + field("播放超时换源（秒，0=关闭，默认 5）", numberInput("play_timeout", playTimeout, String.valueOf(HawkConfig.DEFAULT_LIVE_PLAY_TIMEOUT), 0, 60))
 
                 + section("系统")
                 + checkbox("boot_startup", "开机自动启动（部分系统还需在自启动管理中允许本应用；Android 10+ 还需在电视上授予「显示在其他应用上层」权限）", bootStartup)

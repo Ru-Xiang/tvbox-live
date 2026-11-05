@@ -369,6 +369,18 @@ public class LiveChannel implements Serializable {
     }
 
     /**
+     * 给定线路是否为该频道当前正在播放的线路（按播放提示判断，频道按稳定键匹配，不要求同一对象）。
+     * 测速剔除/裁剪线路时应跳过它：播放器正在用这条线路，删掉后"原线路重连"会连到别的线路。
+     */
+    public static boolean isPlayingUrl(LiveChannel ch, String url) {
+        if (url == null || ch == null) return false;
+        // 与 setPlayingHint 的写入顺序相反：先读 key 再读 URL
+        String key = sPlayingKey;
+        if (key == null || !key.equals(ch.getKey())) return false;
+        return url.equals(sPlayingUrl);
+    }
+
+    /**
      * 让当前索引指向给定 URL（用于播放界面按播放器实际加载的 URL 重新同步，例如测速完成或换源前）。
      *
      * @return URL 存在于当前线路列表并已同步时返回 true

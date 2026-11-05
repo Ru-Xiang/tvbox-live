@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import timber.log.Timber;
@@ -61,6 +62,8 @@ public class SpeedTestWorker extends Worker {
             AtomicBoolean success = new AtomicBoolean(false);
             // 记下本 Worker 发起的测速回调：超时取消时只取消自己这一轮
             final AtomicReference<SpeedTestEngine.SpeedTestCallback> myCallback = new AtomicReference<>();
+            // 最近一次测速推进（有线路测完/进度回调）的时间，用于判断长轮次是否仍在推进
+            final AtomicLong lastProgressAt = new AtomicLong(System.currentTimeMillis());
 
             // reloadForSpeedTest 会联网重新拉取并合并/过滤，回调返回待测的全量频道
             channelManager.reloadForSpeedTest(channels -> {
@@ -80,7 +83,8 @@ public class SpeedTestWorker extends Worker {
                         new SpeedTestEngine.SpeedTestCallback() {
                             @Override
                             public void onItemComplete(SpeedTestResult result, int current, int total) {
-                                // 后台运行，不需要 UI 更新
+                                // 后台运行，不需要 UI 更新；只记录推进时间
+                                lastProgressAt.set(System.currentTimeMillis());
                             }
 
                             @Override
@@ -109,7 +113,8 @@ public class SpeedTestWorker extends Worker {
 
                             @Override
                             public void onProgress(int current, int total, String currentChannel) {
-                                // 后台运行，不需要 UI 更新
+                                // 后台运行，不需要 UI 更新；只记录推进时间
+                                lastProgressAt.set(System.currentTimeMillis());
                             }
 
                             @Override
@@ -122,8 +127,22 @@ public class SpeedTestWorker extends Worker {
                 SpeedTestEngine.getInstance().testChannels(new ArrayList<>(channels), callback);
             });
 
-            // 等待完成，最多30分钟
-            boolean finished = latch.await(30, TimeUnit.MINUTES);
+            // 基础等待 30 分钟；播放期间测速会限并发让带宽，整轮耗时变长，
+            // 只要仍在推进（最近 2 分钟内有线路测完）就继续等，最多 90 分钟
+            long start = System.currentTimeMillis();
+            long baseDeadline = start + TimeUnit.MINUTES.toMillis(30);
+            long hardDeadline = start + TimeUnit.MINUTES.toMillis(90);
+            boolean finished = false;
+            while (true) {
+                if (latch.await(30, TimeUnit.SECONDS)) {
+                    finished = true;
+                    break;
+                }
+                long now = System.currentTimeMillis();
+                if (now >= hardDeadline) break;
+                if (now >= baseDeadline
+                        && now - lastProgressAt.get() > TimeUnit.MINUTES.toMillis(2)) break;
+            }
 
             if (!finished) {
                 Timber.w("定时测速超时");

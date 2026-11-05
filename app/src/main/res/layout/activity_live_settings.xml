@@ -396,7 +396,7 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="并发线程"
+                android:text="验证并发（实测固定 1 条）"
                 android:textColor="@color/text_tertiary"
                 android:textSize="14sp" />
 
@@ -774,7 +774,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="单条线路在该时长内未起播则自动切换下一条；0 表示关闭"
+            android:text="单条线路在该时长内未起播则自动切换下一条；默认 5 秒，0 表示关闭"
             android:textColor="@color/text_tertiary"
             android:textSize="12sp" />
 

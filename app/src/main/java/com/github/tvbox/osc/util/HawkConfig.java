@@ -64,6 +64,13 @@ public class HawkConfig {
      */
     public static final String IPTV_MULTI_REPO_URLS = "iptv_multi_repo_urls";
 
+    /**
+     * 默认多仓链接是否已写入过（boolean，一次性迁移标记）。
+     * 老用户升级后列表为空时补上 {@link #DEFAULT_MULTI_REPO_URLS}；
+     * 之后用户清空列表则尊重用户选择，不再补写。
+     */
+    public static final String IPTV_MULTI_REPO_DEFAULTS_SEEDED = "iptv_multi_repo_defaults_seeded";
+
     /** 自定义/订阅源连续未入选次数统计（JSON: {url:count}） */
     public static final String IPTV_SOURCE_FAIL_COUNT = "iptv_source_fail_count";
 
@@ -218,7 +225,7 @@ public class HawkConfig {
     /** 上次播放的分组名称 */
     public static final String LIVE_LAST_GROUP = "live_last_group";
 
-    /** 播放超时换源时间（秒）：单个源在该时长内未成功起播则自动切换下一个源 */
+    /** 播放超时换源时间（秒）：单个源在该时长内未成功起播则自动切换下一个源（0=关闭，1-60，默认 5） */
     public static final String LIVE_PLAY_TIMEOUT = "live_play_timeout";
 
     /** 是否开机自动启动（默认关闭） */
@@ -263,6 +270,14 @@ public class HawkConfig {
     public static final String DEFAULT_ALIAS_URL =
             "https://raw.githubusercontent.com/Ru-Xiang/m3u/refs/heads/main/alias.txt";
 
+    /**
+     * 默认多仓链接（JSON 数组字符串，格式与 {@link #IPTV_MULTI_REPO_URLS} 一致）。
+     * 新安装直接生效；老用户若从未配置过多仓链接，升级后由一次性迁移补上（见 App#migrateConfig）。
+     */
+    public static final String DEFAULT_MULTI_REPO_URLS =
+            "[\"https://gitlab.com/noimank/tvbox/-/raw/main/tvboxmuti.json\","
+            + "\"https://gh-proxy.com/https://raw.githubusercontent.com/wxrjck/-YSC-/refs/heads/main/wx.json\"]";
+
     /** 默认单频道最多线路数 */
     public static final int DEFAULT_URLS_LIMIT = 5;
 
@@ -278,8 +293,8 @@ public class HawkConfig {
     /** 默认最低速度阈值 */
     public static final int DEFAULT_SPEED_MIN_THRESHOLD = 50;
 
-    /** 默认播放超时换源时间（秒） */
-    public static final int DEFAULT_LIVE_PLAY_TIMEOUT = 10;
+    /** 默认播放超时换源时间（秒）。已出过画面的线路重连另有更长的宽限，不受此值限制 */
+    public static final int DEFAULT_LIVE_PLAY_TIMEOUT = 5;
 
     /** 默认更新间隔（小时） */
     public static final int DEFAULT_UPDATE_INTERVAL = 12;

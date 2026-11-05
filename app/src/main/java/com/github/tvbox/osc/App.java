@@ -255,8 +255,8 @@ public class App extends Application {
         putDefault(HawkConfig.IPTV_URLS_LIMIT, HawkConfig.DEFAULT_URLS_LIMIT);
         putDefault(HawkConfig.IPTV_SUBSCRIBE_LIST_URL, HawkConfig.DEFAULT_SUBSCRIBE_LIST_URL);
         putDefault(HawkConfig.IPTV_ALIAS_URL, HawkConfig.DEFAULT_ALIAS_URL);
-        // 多仓链接默认空（JSON 数组字符串，与自定义源同一格式）
-        putDefault(HawkConfig.IPTV_MULTI_REPO_URLS, "[]");
+        // 默认多仓链接（JSON 数组字符串，与自定义源同一格式）
+        putDefault(HawkConfig.IPTV_MULTI_REPO_URLS, HawkConfig.DEFAULT_MULTI_REPO_URLS);
 
         // 测速默认值
         putDefault(HawkConfig.SPEED_TEST_ENABLED, true);
@@ -308,6 +308,17 @@ public class App extends Application {
             if ("https://live.fanmingming.com".equals(epg)) {
                 Hawk.put(HawkConfig.IPTV_EPG_URL, HawkConfig.DEFAULT_IPTV_EPG_URL);
                 Timber.i("EPG 地址已迁移至默认订阅源: %s", HawkConfig.DEFAULT_IPTV_EPG_URL);
+            }
+            // 一次性补写默认多仓链接：老用户升级前多仓默认为空，列表仍为空说明从未配置过，
+            // 补上新默认值；之后用户清空列表则尊重用户选择，不再补写
+            if (!Hawk.get(HawkConfig.IPTV_MULTI_REPO_DEFAULTS_SEEDED, false)) {
+                String repos = Hawk.get(HawkConfig.IPTV_MULTI_REPO_URLS, "");
+                String trimmed = repos == null ? "" : repos.trim();
+                if (trimmed.isEmpty() || "[]".equals(trimmed)) {
+                    Hawk.put(HawkConfig.IPTV_MULTI_REPO_URLS, HawkConfig.DEFAULT_MULTI_REPO_URLS);
+                    Timber.i("已写入默认多仓链接");
+                }
+                Hawk.put(HawkConfig.IPTV_MULTI_REPO_DEFAULTS_SEEDED, true);
             }
         } catch (Exception e) {
             Timber.w(e, "配置迁移失败");
