@@ -745,6 +745,7 @@ public class SpeedTestEngine {
                         trackers.put(channel, tracker);
                     }
                     tracker.remaining.incrementAndGet();
+                    tracker.verifyPending++;
                     tasks.add(new SpeedTestTask(channel, url, i, tracker));
                 }
             }
@@ -892,6 +893,39 @@ public class SpeedTestEngine {
                             channelsDone, channelTotal);
                 }
 
+                /**
+                 * 验证通过、但本频道已凑够 MEASURE_TOP_K 条实测可用线路而不再实测：不写缓存与频道测速值，
+                 * 按"本轮未测"保留（不算失败，排序居中，最终由单频道线路上限裁剪），只推进进度与频道完成计数
+                 */
+                void finishUnmeasured(SpeedTestTask task, SpeedTestResult verified) {
+                    if (cancelled.get()) return;
+                    // 频道上该线路的测速值清零（未知）：按速度排序时不能拿上一轮的旧速度和本轮实测值比
+                    try {
+                        synchronized (task.channel) {
+                            List<String> urls = task.channel.getSourceUrls();
+                            List<Double> sp = task.channel.getSpeeds();
+                            if (urls != null && sp != null) {
+                                int idx = task.sourceIndex;
+                                if (idx < 0 || idx >= urls.size() || !task.url.equals(urls.get(idx))) {
+                                    idx = urls.indexOf(task.url);
+                                }
+                                if (idx >= 0 && idx < sp.size()) sp.set(idx, 0d);
+                            }
+                        }
+                    } catch (Exception ignore) {}
+                    int completed = completedCount.incrementAndGet();
+                    if (callback != null && !cancelled.get() && !isFinished(round)) {
+                        try {
+                            callback.onItemComplete(verified, completed, totalCount);
+                            callback.onProgress(completed, totalCount, task.channel.getChannelName());
+                        } catch (Exception ex) {
+                            Timber.w(ex, "测速回调异常");
+                        }
+                    }
+                    onChannelTaskDone(task, round, startTime, sortSources, sortMode,
+                            channelsDone, channelTotal);
+                }
+
                 void fail(SpeedTestTask task, Throwable t) {
                     // 兜底：包含 OOM / VirtualMachineError 也不让线程池挂掉
                     Timber.e(t, "测速任务未捕获异常: %s", task.url);
@@ -913,15 +947,209 @@ public class SpeedTestEngine {
                 }
             }
             final Finisher fin = new Finisher();
+            final HostBook hosts = new HostBook();
+            final List<Deferred> deferred = Collections.synchronizedList(new ArrayList<Deferred>());
+            final List<Future<?>> recheckFollowups = Collections.synchronizedList(new ArrayList<Future<?>>());
+            ChannelManager cmTmp = null;
+            try {
+                cmTmp = ChannelManager.getInstance(App.getInstance());
+            } catch (Throwable ignore) {
+            }
+            final ChannelManager cm = cmTmp;
+
+            /**
+             * 验证 → 挑候选 → 串行实测 的调度。
+             * 每个频道的线路全部验证完（延后复核的除外）后，验证通过的按 CANDIDATE_ORDER 排序，
+             * 只把前 MEASURE_TOP_K 条交给实测；实测不合格的按序补测，凑够 K 条可用后其余记为本轮未测
+             */
+            final class Scheduler {
+                /** @param countsPending 是否计入频道的 verifyPending（末尾复核的线路已在延后时扣除） */
+                void onVerified(SpeedTestTask task, SpeedTestResult checked, boolean countsPending) {
+                    if (cancelled.get()) return;
+                    ChannelTracker tr = task.tracker;
+                    if (checked.isAvailable()) {
+                        boolean forced = isPinnedQuietly(cm, task.channel, task.url)
+                                || LiveChannel.isPlayingUrl(task.channel, task.url);
+                        SpeedTestResult prev = resultCache.get(task.url);
+                        int prevScore = prev != null && prev.isAvailable() ? prev.getQualityScore() : -1;
+                        synchronized (tr) {
+                            tr.pending.add(new Candidate(task, checked, forced, prevScore));
+                        }
+                    } else {
+                        // 验证未通过（含不可测速的流式协议）：直接记为结果，不进实测
+                        fin.finish(task, checked);
+                    }
+                    if (countsPending) {
+                        verifyDone(tr);
+                    } else {
+                        pump(tr);
+                    }
+                }
+
+                /** 延后到末尾按主机复核（死主机上的线路、建连超时的线路） */
+                void defer(SpeedTestTask task, String host) {
+                    deferred.add(new Deferred(task, host));
+                    verifyDone(task.tracker);
+                }
+
+                void verifyDone(ChannelTracker tr) {
+                    synchronized (tr) {
+                        tr.verifyPending--;
+                        if (tr.verifyPending <= 0) tr.ranked = true;
+                    }
+                    pump(tr);
+                }
+
+                /** 按名额把候选交给实测；已凑够 K 条可用时其余候选记为本轮未测 */
+                void pump(ChannelTracker tr) {
+                    if (cancelled.get()) return;
+                    List<Candidate> submit = new ArrayList<>();
+                    List<Candidate> skip = new ArrayList<>();
+                    synchronized (tr) {
+                        if (!tr.ranked || tr.pending.isEmpty()) return;
+                        Collections.sort(tr.pending, CANDIDATE_ORDER);
+                        java.util.Iterator<Candidate> it = tr.pending.iterator();
+                        while (it.hasNext()) {
+                            Candidate c = it.next();
+                            if (c.forced || tr.measuredOk + tr.inflight < MEASURE_TOP_K) {
+                                it.remove();
+                                tr.inflight++;
+                                submit.add(c);
+                            } else if (tr.measuredOk >= MEASURE_TOP_K) {
+                                it.remove();
+                                skip.add(c);
+                            }
+                            // 其余：名额被在测的占着、还没凑够 K 条可用，等实测结果出来再决定
+                        }
+                    }
+                    for (Candidate c : skip) fin.finishUnmeasured(c.task, c.verified);
+                    for (Candidate c : submit) submitMeasure(c);
+                }
+
+                void submitMeasure(Candidate c) {
+                    final SpeedTestTask task = c.task;
+                    final String name = task.channel.getChannelName();
+                    try {
+                        measureFutures.add(measurePool.submit(() -> {
+                            boolean ok = false;
+                            try {
+                                if (cancelled.get()) return;
+                                if (!waitWhilePlaybackBuffering(cancelled)) return;
+                                SpeedTestResult result = withTimeoutRetry(
+                                        () -> performSpeedTest(task.url, name, timeout),
+                                        cancelled, task.url);
+                                ok = result.isAvailable();
+                                fin.finish(task, result);
+                            } catch (Throwable t) {
+                                fin.fail(task, t);
+                            } finally {
+                                measureDone(task.tracker, ok);
+                            }
+                        }));
+                    } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                        // 本轮已收尾/取消，实测池已关闭
+                        if (!cancelled.get()) fin.fail(task, rejected);
+                        measureDone(task.tracker, false);
+                    }
+                }
+
+                void measureDone(ChannelTracker tr, boolean ok) {
+                    synchronized (tr) {
+                        tr.inflight--;
+                        if (ok) tr.measuredOk++;
+                    }
+                    pump(tr);
+                }
+
+                /**
+                 * 末尾复核一个主机：先用较宽的建连超时验证一条代表线路。
+                 * 代表线路仍在<b>这个主机</b>上建连失败（主机确实连不上）：同主机线路全部记为同类失败，不再逐条等超时；
+                 * 否则（连上了，或失败在别的主机上，如重定向后的边缘节点）：其余线路重新交回验证池并发正常验证，
+                 * 同样用较宽的建连超时（慢连接主机正是在验证阶段被 3 秒上限截掉的）
+                 */
+                void recheckHost(String hostKey, List<SpeedTestTask> lines) {
+                    if (cancelled.get() || lines.isEmpty()) return;
+                    if (!waitWhilePlaybackBuffering(cancelled)) return;
+                    boolean permit = acquirePlaybackPermit(cancelled, measureBudgetMs);
+                    SpeedTestTask rep = lines.get(0);
+                    SpeedTestResult r;
+                    ConnectInfo ci = new ConnectInfo();
+                    try {
+                        if (cancelled.get() || Thread.currentThread().isInterrupted()) return;
+                        r = verifyLine(rep.url, rep.channel.getChannelName(), timeout, RECHECK_CONNECT_CAP_MS, ci);
+                    } catch (Throwable t) {
+                        for (SpeedTestTask x : lines) fin.fail(x, t);
+                        return;
+                    } finally {
+                        if (permit) PLAYBACK_PERMITS.release();
+                    }
+                    if (cancelled.get()) return;
+                    boolean hostDown = !r.isAvailable() && ci.failKind != null
+                            && hostKey != null && hostKey.equals(ci.failHost);
+                    decided(rep, r);
+                    for (int i = 1; i < lines.size(); i++) {
+                        if (cancelled.get()) return;
+                        final SpeedTestTask t = lines.get(i);
+                        if (hostDown) {
+                            decided(t, hostDownResult(t, r));
+                            continue;
+                        }
+                        try {
+                            recheckFollowups.add(pool.submit(() -> {
+                                boolean done = false;
+                                try {
+                                    if (cancelled.get()) return;
+                                    if (!waitWhilePlaybackBuffering(cancelled)) return;
+                                    boolean p2 = acquirePlaybackPermit(cancelled, measureBudgetMs);
+                                    SpeedTestResult x;
+                                    try {
+                                        if (cancelled.get() || Thread.currentThread().isInterrupted()) return;
+                                        x = withTimeoutRetry(() -> verifyLine(t.url, t.channel.getChannelName(), timeout,
+                                                RECHECK_CONNECT_CAP_MS, null), cancelled, t.url);
+                                    } finally {
+                                        if (p2) PLAYBACK_PERMITS.release();
+                                    }
+                                    if (cancelled.get()) return;
+                                    done = true;
+                                    onVerified(t, x, false);
+                                } catch (Throwable e) {
+                                    if (!done) fin.fail(t, e);
+                                    else Timber.w(e, "复核线路收尾异常: %s", t.url);
+                                }
+                            }));
+                        } catch (java.util.concurrent.RejectedExecutionException rejected) {
+                            if (!cancelled.get()) fin.fail(t, rejected);
+                        }
+                    }
+                }
+
+                /** 复核得出结论：交给 onVerified；收尾中途异常不再重复收尾 */
+                private void decided(SpeedTestTask t, SpeedTestResult x) {
+                    try {
+                        onVerified(t, x, false);
+                    } catch (Throwable e) {
+                        Timber.w(e, "复核线路收尾异常: %s", t.url);
+                    }
+                }
+            }
+            final Scheduler sched = new Scheduler();
 
             try {
                 for (SpeedTestTask task : tasks) {
                     if (cancelled.get()) break;
 
                     Future<?> future = pool.submit(() -> {
+                        boolean decided = false;
                         // 单个任务完全隔离：任何异常都不允许扩散到线程池，避免"一个源坏了拖垮整轮测速"
                         try {
                             if (cancelled.get()) return;
+                            // 已判死的主机：不再逐条等建连超时，延后到末尾按主机复核
+                            final String host = hostKeyOf(task.url);
+                            if (hosts.isDead(host)) {
+                                decided = true;
+                                sched.defer(task, host);
+                                return;
+                            }
 
                             // 给正在观看的直播让带宽：卡顿缓冲时先暂缓，播放中限制同时验证的线路数
                             if (!waitWhilePlaybackBuffering(cancelled)) return;
@@ -931,48 +1159,49 @@ public class SpeedTestEngine {
                                 return;
                             }
                             final String name = task.channel.getChannelName();
-                            SpeedTestResult checked;
+                            SpeedTestResult checked = null;
+                            String deferHost = null;
                             try {
-                                // 第一阶段：验证线路可用性（仅超时失败自动重试）
-                                checked = withTimeoutRetry(() -> verifyLine(task.url, name, timeout),
-                                        cancelled, task.url);
+                                // 第一阶段：验证线路可用性。建连超时不立即重试（实测立即重试几乎从不恢复），
+                                // 延后到末尾按主机复核；连上之后的超时（读取慢）仍按配置立即重试
+                                int maxRetry = Hawk.get(HawkConfig.SPEED_TEST_RETRY, HawkConfig.DEFAULT_SPEED_TEST_RETRY);
+                                for (int attempt = 0; ; attempt++) {
+                                    ConnectInfo ci = new ConnectInfo();
+                                    checked = verifyLine(task.url, name, timeout, VERIFY_CONNECT_CAP_MS, ci);
+                                    hosts.record(ci);
+                                    if (attempt > 0) checked.setRetried(true);
+                                    if (!checked.isAvailable() && "TIMEOUT".equals(ci.failKind)) {
+                                        // 按实际连不上的主机分组复核（可能是重定向后的边缘节点，而非线路本身的主机）
+                                        deferHost = ci.failHost;
+                                        break;
+                                    }
+                                    if (attempt >= maxRetry || cancelled.get() || !checked.isTimeoutFailure()) break;
+                                    Timber.d("超时重试 %d/%d: %s", attempt + 1, maxRetry, task.url);
+                                }
                             } finally {
                                 if (permit) PLAYBACK_PERMITS.release();
                             }
                             if (cancelled.get()) return;
-                            if (!checked.isAvailable()) {
-                                // 验证未通过（含不可测速的流式协议）：直接记为结果，不进实测
-                                fin.finish(task, checked);
+                            // 此后已交出结论：收尾中途的异常不能再把这条线路收尾一次、或重复扣减待验证计数
+                            decided = true;
+                            if (deferHost != null) {
+                                sched.defer(task, deferHost);
                                 return;
                             }
-                            // 第二阶段：排进实测队列，单线程按验证通过的先后依次实测
-                            try {
-                                measureFutures.add(measurePool.submit(() -> {
-                                    try {
-                                        if (cancelled.get()) return;
-                                        if (!waitWhilePlaybackBuffering(cancelled)) return;
-                                        SpeedTestResult result = withTimeoutRetry(
-                                                () -> performSpeedTest(task.url, name, timeout),
-                                                cancelled, task.url);
-                                        fin.finish(task, result);
-                                    } catch (Throwable t) {
-                                        fin.fail(task, t);
-                                    }
-                                }));
-                            } catch (java.util.concurrent.RejectedExecutionException rejected) {
-                                // 本轮已收尾/取消，实测池已关闭
-                                if (!cancelled.get()) fin.fail(task, rejected);
-                            }
+                            sched.onVerified(task, checked, true);
                         } catch (Throwable t) {
-                            fin.fail(task, t);
+                            if (!decided) {
+                                fin.fail(task, t);
+                                sched.verifyDone(task.tracker);
+                            } else {
+                                Timber.w(t, "验证收尾异常: %s", task.url);
+                            }
                         }
                     });
                     futures.add(future);
                 }
 
                 // 等待所有任务完成
-                // HLS 单源会嗅探播放列表并采样下载多个分片，整体最长约 timeout*(分片采样+1)，
-                // 这里给出充足的等待上限，避免误判超时。
                 // 本轮被取消后立即停止等待：排队中的任务会在开头检查取消标志直接返回，
                 // 在途任务的结果也不再写入（见任务内检查），无需逐个等满超时
                 boolean keepWaiting = true;
@@ -982,14 +1211,62 @@ public class SpeedTestEngine {
                         break;
                     }
                 }
-                // 验证阶段全部结束后实测队列已定型；实测串行执行，按提交顺序逐个等待
-                if (keepWaiting) {
-                    List<Future<?>> measured;
-                    synchronized (measureFutures) {
-                        measured = new ArrayList<>(measureFutures);
+                // 末尾复核延后的线路：按主机分组，每个主机一个任务（主机之间并发）
+                if (keepWaiting && !cancelled.get()) {
+                    java.util.LinkedHashMap<String, List<SpeedTestTask>> groups = new java.util.LinkedHashMap<>();
+                    synchronized (deferred) {
+                        for (Deferred d : deferred) {
+                            String k = d.host != null ? d.host : d.task.url;
+                            List<SpeedTestTask> g = groups.get(k);
+                            if (g == null) {
+                                g = new ArrayList<>();
+                                groups.put(k, g);
+                            }
+                            g.add(d.task);
+                        }
                     }
-                    for (Future<?> future : measured) {
-                        if (!awaitTask(future, awaitMs, cancelled)) break;
+                    if (!groups.isEmpty()) {
+                        Timber.i("末尾复核 %d 个主机上的 %d 条延后线路", groups.size(), deferred.size());
+                    }
+                    List<Future<?>> rechecks = new ArrayList<>();
+                    for (final Map.Entry<String, List<SpeedTestTask>> g : groups.entrySet()) {
+                        if (cancelled.get()) break;
+                        try {
+                            rechecks.add(pool.submit(() -> sched.recheckHost(g.getKey(), g.getValue())));
+                        } catch (java.util.concurrent.RejectedExecutionException ignore) {
+                            break;
+                        }
+                    }
+                    for (Future<?> f : rechecks) {
+                        if (!awaitTask(f, awaitMs, cancelled)) {
+                            keepWaiting = false;
+                            break;
+                        }
+                    }
+                    // 代表线路连上的主机：其余线路已交回验证池并发验证，等它们出结论
+                    if (keepWaiting) {
+                        List<Future<?>> follow;
+                        synchronized (recheckFollowups) {
+                            follow = new ArrayList<>(recheckFollowups);
+                        }
+                        for (Future<?> f : follow) {
+                            if (!awaitTask(f, awaitMs, cancelled)) {
+                                keepWaiting = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // 实测串行执行，按提交顺序逐个等待；实测不合格会补交候选，列表可能在等待中继续增长
+                if (keepWaiting) {
+                    int idx = 0;
+                    while (!cancelled.get()) {
+                        Future<?> f;
+                        synchronized (measureFutures) {
+                            if (idx >= measureFutures.size()) break;
+                            f = measureFutures.get(idx++);
+                        }
+                        if (!awaitTask(f, awaitMs, cancelled)) break;
                     }
                 }
                 // 进入收尾：此后结束的任务不再写入（见任务内检查）
@@ -1281,6 +1558,18 @@ public class SpeedTestEngine {
     private static final double LIVE_AUDIO_FLOOR_KBPS = 8;
     /** HLS 分片正文总耗时短于此值时（几个包就读完）不足以算吞吐，改用含首包等待的总耗时 */
     private static final long MIN_SEGMENT_BODY_MS = 50;
+    /**
+     * HLS 实测读够这么多正文即停止。实测是单线程串行的，以前每条都把分片读到预算用完（约 5 秒），
+     * 整轮时间几乎全花在这里；读 1MB 已足够区分快慢与是否达到可用阈值
+     */
+    private static final long HLS_MEASURE_BYTES = 1024 * 1024;
+    /** 读满 HLS_MEASURE_BYTES 只用了不到 HLS_FAST_BODY_MS（极快线路）：继续读到这么多再停，避免停在 TCP 慢启动阶段而低估 */
+    private static final long HLS_MEASURE_BYTES_FAST = 2 * 1024 * 1024;
+    private static final long HLS_FAST_BODY_MS = 300;
+    /** HLS 实测正文最多读这么久（慢线路读不满字节上限时） */
+    private static final long HLS_MEASURE_BODY_MS = 1500;
+    /** 已读正文不足这么多字节时才去读下一个分片（上一个失败或太短） */
+    private static final long HLS_MIN_USEFUL_BYTES = 256 * 1024;
 
     /** 测速失败分类：无异常但没测到数据 / 低于速度阈值（都不触发超时重试） */
     private static final String ZERO_SPEED = "ZERO_SPEED";
@@ -1304,16 +1593,46 @@ public class SpeedTestEngine {
         return ex;
     }
 
+    /** 实测阶段单次建连的超时上限 */
+    private static final int MEASURE_CONNECT_CAP_MS = 8000;
+    /**
+     * 验证阶段单次建连的超时上限。实测抽样：能连上的线路建连 p99 约 1.2 秒、没有超过 2 秒的；
+     * 连不上的基本是死主机，等满 5 秒纯属浪费。被误判的慢连接在末尾复核时还有一次 5 秒的机会
+     */
+    private static final int VERIFY_CONNECT_CAP_MS = 3000;
+    /** 末尾复核死主机时的建连超时上限 */
+    private static final int RECHECK_CONNECT_CAP_MS = 5000;
+
+    /** 一次验证中各请求的建连结果：哪些 host:port 连上了、哪个在建连阶段失败及失败类型 */
+    private static final class ConnectInfo {
+        final List<String> okHosts = Collections.synchronizedList(new ArrayList<String>());
+        volatile String failHost;
+        /** TIMEOUT / DNS / REFUSED */
+        volatile String failKind;
+    }
+
     /** 单次测速尝试的请求上下文：线路自带请求头、预算截止时间、当前连接（供看门狗断开） */
     private static final class Probe {
         final Map<String, String> headers;
         final long deadline;
+        final int connectCapMs;
+        /** 可为 null：需要按主机统计建连结果时才传入 */
+        final ConnectInfo connectInfo;
         volatile HttpURLConnection active;
         volatile boolean expired;
 
         Probe(Map<String, String> headers, long deadline) {
+            this(headers, deadline, MEASURE_CONNECT_CAP_MS, null);
+        }
+
+        /** 创建时刻：判断某次建连超时是否被本条线路之前的请求耗掉的预算截短 */
+        final long createdAt = System.currentTimeMillis();
+
+        Probe(Map<String, String> headers, long deadline, int connectCapMs, ConnectInfo connectInfo) {
             this.headers = headers != null ? headers : Collections.<String, String>emptyMap();
             this.deadline = deadline;
+            this.connectCapMs = connectCapMs;
+            this.connectInfo = connectInfo;
         }
 
         void expire() {
@@ -1437,6 +1756,15 @@ public class SpeedTestEngine {
      * 非 HTTP(S) 的流式协议直接记为"不可测速"，也不进实测。
      */
     private SpeedTestResult verifyLine(String urlStr, String channelName, int timeoutSeconds) {
+        return verifyLine(urlStr, channelName, timeoutSeconds, VERIFY_CONNECT_CAP_MS, null);
+    }
+
+    /**
+     * @param connectCapMs 单次建连超时上限
+     * @param connectInfo  可为 null；不为 null 时记录各请求的建连结果（按主机熔断用）
+     */
+    private SpeedTestResult verifyLine(String urlStr, String channelName, int timeoutSeconds,
+                                       int connectCapMs, ConnectInfo connectInfo) {
         SpeedTestResult result = new SpeedTestResult(urlStr, channelName);
         result.setStatus(1);
         String url = cleanUrl(urlStr);
@@ -1449,7 +1777,8 @@ public class SpeedTestEngine {
             return result;
         }
         int budget = Math.max(2, timeoutSeconds);
-        Probe probe = new Probe(StreamUrl.headers(urlStr), System.currentTimeMillis() + budget * 1000L);
+        Probe probe = new Probe(StreamUrl.headers(urlStr), System.currentTimeMillis() + budget * 1000L,
+                connectCapMs, connectInfo);
         ScheduledFuture<?> watchdog = scheduleWatchdog(probe);
         Response resp = null;
         InputStream in = null;
@@ -1830,7 +2159,12 @@ public class SpeedTestEngine {
             throw new Exception("m3u8 无可用分片");
         }
 
-        List<String> sampled = sampleSegments(segments, MAX_SEGMENT_SAMPLE);
+        // 最新分片优先：最接近播放器实际请求的位置，也最不容易已从 CDN 过期；其余按采样顺序兜底
+        List<String> sampled = new ArrayList<>();
+        sampled.add(segments.get(segments.size() - 1));
+        for (String sg : sampleSegments(segments, MAX_SEGMENT_SAMPLE)) {
+            if (!sampled.contains(sg)) sampled.add(sg);
+        }
 
         long bodyBytes = 0;
         long bodyMs = 0;
@@ -1841,11 +2175,15 @@ public class SpeedTestEngine {
         // 只保留第一个拿到数据的分片作样本，用于探测有无视频轨与分辨率
         Capture cap = new Capture();
         for (String seg : sampled) {
+            // 已读到足够数据，或正文时长已用满：不再读下一个分片
+            if (bodyBytes >= HLS_MIN_USEFUL_BYTES || bodyMs >= HLS_MEASURE_BODY_MS) break;
             if (remainingMs(probe.deadline) <= 0) {
                 timedOut = true;
                 break;
             }
-            SegmentStat r = downloadSegment(seg, probe, cap.len == 0 ? cap : null);
+            SegmentStat r = downloadSegment(seg, probe, cap.len == 0 ? cap : null,
+                    HLS_MEASURE_BYTES - bodyBytes, HLS_MEASURE_BYTES_FAST - bodyBytes,
+                    HLS_MEASURE_BODY_MS - bodyMs);
             if (r.bytes > 0) {
                 bodyBytes += r.bytes;
                 bodyMs += r.bodyMs;
@@ -1940,13 +2278,18 @@ public class SpeedTestEngine {
         return st;
     }
 
-    /** 下载单个分片（在剩余预算内尽量读完）；cap 不为 null 时顺带保留分片开头作媒体样本 */
-    private SegmentStat downloadSegment(String segUrl, Probe probe, Capture cap) {
+    /**
+     * 下载单个分片的开头部分；cap 不为 null 时顺带保留分片开头作媒体样本。
+     * 读够 maxBytes（读得极快时放宽到 fastMaxBytes）、正文读满 maxBodyMs、或预算用完即停止
+     */
+    private SegmentStat downloadSegment(String segUrl, Probe probe, Capture cap,
+                                        long maxBytes, long fastMaxBytes, long maxBodyMs) {
         SegmentStat st = new SegmentStat();
         Response resp = null;
         InputStream in = null;
         long start = System.currentTimeMillis();
         long bodyStart = -1;
+        long readEnd = -1;
         try {
             resp = open(segUrl, probe);
             if (!isOk(resp.code)) {
@@ -1956,20 +2299,27 @@ public class SpeedTestEngine {
             bodyStart = System.currentTimeMillis();
             in = resp.conn.getInputStream();
             byte[] buffer = new byte[16 * 1024];
-            while (System.currentTimeMillis() < probe.deadline) {
+            while (true) {
+                long now = System.currentTimeMillis();
+                if (now >= probe.deadline) break;
+                long body = now - bodyStart;
+                if (body >= maxBodyMs || st.bytes >= fastMaxBytes) break;
+                if (st.bytes >= maxBytes && body >= HLS_FAST_BODY_MS) break;
                 int n = in.read(buffer);
                 if (n == -1) break;
                 st.bytes += n;
                 if (cap != null) cap.append(buffer, 0, n);
             }
+            // 读完即计时：读到一半停下时关闭连接要丢弃剩余正文（最多约 100ms），不能算进下载耗时
+            readEnd = System.currentTimeMillis();
         } catch (Exception e) {
             // 已读到的部分照常计入；没读到数据时由 measureHls 按超时/其它原因上报
             st.error = e;
             st.timeout = probe.expired || isTimeout(e);
         } finally {
+            long end = readEnd > 0 ? readEnd : System.currentTimeMillis();
             closeQuietly(in);
             if (resp != null) disconnectQuietly(resp.conn);
-            long end = System.currentTimeMillis();
             st.totalMs = end - start;
             st.bodyMs = bodyStart >= 0 ? end - bodyStart : 0;
         }
@@ -1986,6 +2336,39 @@ public class SpeedTestEngine {
         return code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
     }
 
+    /** 线路地址的 host:port（小写，缺省端口按协议补全）；解析失败返回 null */
+    private static String hostKeyOf(String url) {
+        if (url == null) return null;
+        try {
+            URL u = new URL(StreamUrl.playUrl(url));
+            String host = u.getHost();
+            if (host == null || host.isEmpty()) return null;
+            int port = u.getPort() >= 0 ? u.getPort() : u.getDefaultPort();
+            return host.toLowerCase(Locale.ROOT) + ":" + port;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 建连阶段异常的类型：TIMEOUT（连接超时）/ DNS / REFUSED（拒绝、不可达）。
+     * TLS 握手等其它错误返回 null：不能据此判定整个主机连不上
+     */
+    private static String connectFailureKind(java.io.IOException e) {
+        if (e instanceof java.net.UnknownHostException) return "DNS";
+        if (e instanceof SocketTimeoutException) return "TIMEOUT";
+        if (e instanceof java.net.ConnectException || e instanceof java.net.NoRouteToHostException) {
+            return "REFUSED";
+        }
+        if (e instanceof javax.net.ssl.SSLException) return null;
+        String msg = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
+        if (msg.contains("unable to resolve") || msg.contains("unknownhost")) return "DNS";
+        if (msg.contains("failed to connect")) {
+            return (msg.contains("timed out") || msg.contains("timeout") || msg.contains(" after ")) ? "TIMEOUT" : "REFUSED";
+        }
+        return null;
+    }
+
     /**
      * 发起请求并手动跟随重定向（最多 MAX_REDIRECTS 跳）。
      * Android 的 HttpURLConnection 不跟随 http↔https 之间的重定向，而播放器允许跨协议重定向，
@@ -1995,7 +2378,30 @@ public class SpeedTestEngine {
     private Response open(String url, Probe probe) throws Exception {
         String cur = url;
         for (int hop = 0; ; hop++) {
+            long spentBefore = System.currentTimeMillis() - probe.createdAt;
             HttpURLConnection conn = openConnection(cur, probe);
+            if (probe.connectInfo != null) {
+                // 单独建连：区分"连不上主机"（按主机熔断的依据）与连上之后的 HTTP/读取失败
+                try {
+                    conn.connect();
+                } catch (java.io.IOException e) {
+                    String kind = probe.expired ? null : connectFailureKind(e);
+                    // 建连超时被本条线路之前的请求耗掉的预算截短（HLS 后续请求常见）：是预算用完，不能算主机连不上。
+                    // 第一次建连（之前没花什么时间）即使超时值略低于上限，也是这台主机真的连不上
+                    if ("TIMEOUT".equals(kind) && spentBefore > 250
+                            && conn.getConnectTimeout() < probe.connectCapMs) {
+                        kind = null;
+                    }
+                    if (kind != null) {
+                        probe.connectInfo.failHost = hostKeyOf(cur);
+                        probe.connectInfo.failKind = kind;
+                    }
+                    disconnectQuietly(conn);
+                    throw e;
+                }
+                String hk = hostKeyOf(cur);
+                if (hk != null) probe.connectInfo.okHosts.add(hk);
+            }
             int code;
             try {
                 code = conn.getResponseCode();
@@ -2031,7 +2437,7 @@ public class SpeedTestEngine {
             throw new SocketTimeoutException("测速预算耗尽");
         }
         // 超时不再设 2 秒下限：预算快用完时仍给满 2 秒，会让单条线路的耗时远超配置的测速时长
-        int connectTimeout = (int) Math.max(1, Math.min(8000, remainMs));
+        int connectTimeout = (int) Math.max(1, Math.min(probe.connectCapMs, remainMs));
         int readTimeout = (int) Math.max(1, Math.min(15000, remainMs));
         URL u;
         try {
@@ -2697,6 +3103,18 @@ public class SpeedTestEngine {
         }, name));
     }
 
+    /** 同主机代表线路复核仍连不上时，其余线路的失败结果（与代表线路同一失败类型，断网判定口径不变） */
+    private static SpeedTestResult hostDownResult(SpeedTestTask t, SpeedTestResult rep) {
+        SpeedTestResult r = new SpeedTestResult(t.url, t.channel.getChannelName());
+        r.setAvailable(false);
+        r.setStatus(3);
+        r.setLatency(-1);
+        r.setFailureType(rep.getFailureType());
+        r.setErrorMsg("同主机线路连接失败: " + rep.getErrorMsg());
+        r.setTestTime(System.currentTimeMillis());
+        return r;
+    }
+
     /** 执行一次尝试，仅对超时失败按配置次数重试（对齐 ISEP：确定无效的源不浪费资源重试） */
     private static SpeedTestResult withTimeoutRetry(java.util.concurrent.Callable<SpeedTestResult> attempt,
                                                     AtomicBoolean cancelled, String url) throws Exception {
@@ -2754,8 +3172,101 @@ public class SpeedTestEngine {
         }
     }
 
-    /** 单个频道本轮尚未测完的线路数 */
+    /**
+     * 单个频道本轮的进度。remaining：尚未出结论的线路数（为 0 时该频道本轮测完）。
+     * 其余字段是"只实测最有希望的前 K 条"的调度状态，读写都在 synchronized(tracker) 内
+     */
     private static final class ChannelTracker {
         final AtomicInteger remaining = new AtomicInteger(0);
+        /** 尚未得出验证结论的线路数（延后到末尾复核的线路在延后时即扣除） */
+        int verifyPending;
+        /** 全部线路验证完毕（不含延后复核的）后置位，此后才挑选候选去实测 */
+        boolean ranked;
+        /** 验证通过、等待实测的候选 */
+        final List<Candidate> pending = new ArrayList<>();
+        /** 已提交实测、尚未出结果的条数 */
+        int inflight;
+        /** 实测可用的条数 */
+        int measuredOk;
+    }
+
+    /** 验证通过的候选线路及其排序依据 */
+    private static final class Candidate {
+        final SpeedTestTask task;
+        final SpeedTestResult verified;
+        /** 置顶线路与正在播放的线路：通过验证就一定实测 */
+        final boolean forced;
+        /** 上一轮的综合评分（上一轮不可用或没测过为 -1） */
+        final int prevScore;
+
+        Candidate(SpeedTestTask task, SpeedTestResult verified, boolean forced, int prevScore) {
+            this.task = task;
+            this.verified = verified;
+            this.forced = forced;
+            this.prevScore = prevScore;
+        }
+
+        long latencyKey() {
+            long l = verified != null ? verified.getLatency() : -1;
+            return l > 0 ? l : Long.MAX_VALUE;
+        }
+    }
+
+    /** 候选实测顺序：强制项 → 上一轮评分高 → 验证延迟低 → 原线路顺序 */
+    private static final java.util.Comparator<Candidate> CANDIDATE_ORDER = (a, b) -> {
+        if (a.forced != b.forced) return a.forced ? -1 : 1;
+        if (a.prevScore != b.prevScore) return a.prevScore > b.prevScore ? -1 : 1;
+        int c = Long.compare(a.latencyKey(), b.latencyKey());
+        if (c != 0) return c;
+        return Integer.compare(a.task.sourceIndex, b.task.sourceIndex);
+    };
+
+    /**
+     * 每个频道最多实测的线路数（验证通过的按 CANDIDATE_ORDER 取前 K 条；实测不合格的按序补测，
+     * 直到凑够 K 条可用或候选用完）。其余通过验证的线路本轮不实测，按"未测"保留，
+     * 最终仍按"单频道最多线路"裁剪。K 大于该上限，留出余量挑出最好的几条
+     */
+    private static final int MEASURE_TOP_K = 10;
+
+    /**
+     * 本轮的主机健康表（只用于验证阶段）：同一 host:port 连续 HOST_DEAD_AFTER 次在建连阶段失败即判为死主机，
+     * 该主机的其余线路不再逐条等超时，延后到末尾按主机复核一次。任一请求连上即清零
+     */
+    private static final int HOST_DEAD_AFTER = 2;
+
+    private static final class HostBook {
+        private final java.util.Map<String, Integer> fails = new java.util.HashMap<>();
+        private final java.util.Set<String> dead = new java.util.HashSet<>();
+
+        synchronized boolean isDead(String host) {
+            return host != null && dead.contains(host);
+        }
+
+        synchronized void record(ConnectInfo ci) {
+            if (ci == null) return;
+            synchronized (ci.okHosts) {
+                for (String h : ci.okHosts) {
+                    fails.remove(h);
+                    dead.remove(h);
+                }
+            }
+            String h = ci.failHost;
+            if (h == null) return;
+            Integer n = fails.get(h);
+            int c = n == null ? 1 : n + 1;
+            fails.put(h, c);
+            if (c >= HOST_DEAD_AFTER) dead.add(h);
+        }
+    }
+
+    /** 延后到末尾复核的线路 */
+    private static final class Deferred {
+        final SpeedTestTask task;
+        final String host;
+
+        Deferred(SpeedTestTask task, String host) {
+            this.task = task;
+            this.host = host;
+        }
     }
 }
