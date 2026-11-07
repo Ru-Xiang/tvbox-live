@@ -251,7 +251,8 @@ public class LiveSourceParser {
                         // 否则只有第一条被测速/播放，其余备用线路全部丢失
                         for (String part : splitMultiUrl(url)) {
                             if (isValidUrl(part)) {
-                                addChannelToGroup(groupMap, channelIndex, lineKeys, currentGroupName, channelName, part, null, null);
+                                addChannelToGroup(groupMap, channelIndex, lineKeys, currentGroupName,
+                                        fixMissingPlus(channelName, null, null, part), part, null, null);
                             }
                         }
                     }
@@ -341,6 +342,43 @@ public class LiveSourceParser {
     private static final Pattern P_NAME_STD_DEF = Pattern.compile("(?i)\\s*标清\\s*$");
     private static final Pattern P_NAME_SD = Pattern.compile("(?i)\\s*SD\\s*$");
     private static final Pattern P_NAME_SPACES = Pattern.compile("\\s+");
+
+    /** 有"+"频道的 CCTV 台号：只有 CCTV-5 有对应的 CCTV-5+，其它台号不能凭地址里的"p"加号 */
+    private static final Pattern P_CCTV_NUM_KEY = Pattern.compile("^CCTV(5)$");
+
+    /**
+     * 纠正源里漏写"+"的 CCTV-5+ 这类频道：显示名归一化后是 CCTVn，
+     * 但线路地址或 tvg-id / tvg-name 明确指向 CCTVn+ 时，按 CCTVn+ 收录。
+     *
+     * <p>实际源里常见：显示名"CCTV-5"、tvg-id="CCTV-5+"、地址 .../cdrmldcctv5plus_1/index.m3u8。
+     * 不纠正的话这些 5+ 线路会并进 CCTV-5；它们多是 CDN 线路、速度快，测速后还会成为 CCTV-5 的首选，
+     * 看 CCTV-5 实际放的是 5+。
+     *
+     * <p>判定优先级：地址写明是 n+（cctv5plus / cctv5p / cctv5+ / cctv5%2B）→ 纠正；
+     * 否则 tvg-id 或 tvg-name 指向 n+、且地址没有写明是普通 n 台 → 纠正。
+     */
+    static String fixMissingPlus(String channelName, String tvgId, String tvgName, String url) {
+        if (channelName == null) return null;
+        Matcher m = P_CCTV_NUM_KEY.matcher(com.github.tvbox.osc.util.ChannelNameMatcher.normalizeKey(channelName));
+        if (!m.matches()) return channelName;
+        String n = m.group(1);
+        String plusKey = "CCTV" + n + "+";
+
+        String play = url == null ? "" : StreamUrl.playUrl(url).toLowerCase(Locale.ROOT);
+        Pattern numInUrl = Pattern.compile("cctv-?0?" + n + "(?![0-9])(plus|p(?![a-z])|\\+|%2b)?");
+        boolean urlPlus = false, urlPlain = false;
+        Matcher um = numInUrl.matcher(play);
+        while (um.find()) {
+            if (um.group(1) != null) urlPlus = true;
+            else urlPlain = true;
+        }
+        boolean tvgPlus = plusKey.equals(com.github.tvbox.osc.util.ChannelNameMatcher.normalizeKey(tvgId))
+                || plusKey.equals(com.github.tvbox.osc.util.ChannelNameMatcher.normalizeKey(tvgName));
+        if (urlPlus || (tvgPlus && !urlPlain)) {
+            return "CCTV-" + n + "+";
+        }
+        return channelName;
+    }
 
     // ============ 私有方法 ============
 
@@ -481,6 +519,7 @@ public class LiveSourceParser {
 
         // 标准化频道名称
         channelName = normalizeChannelName(channelName);
+        channelName = fixMissingPlus(channelName, epgId, extractAttribute(attributes, TVG_NAME_PATTERN), url);
 
         addChannelToGroup(groupMap, channelIndex, lineKeys, groupName, channelName, url, epgId, logoUrl);
     }

@@ -43,6 +43,8 @@ public class ChannelNameMatcher {
     private static final Pattern P_CCTV_ALIAS = Pattern.compile("(中央电视台|央视|中央)");
     private static final Pattern P_CCTV_NUM = Pattern.compile("CCTV(\\d+)套?");
     private static final Pattern P_CCTV_PLUS = Pattern.compile("CCTV(\\d+)\\+");
+    /** "CCTV5PLUS体育赛事" 这类英文写法：PLUS 后面还有内容时整体别名表匹配不上 */
+    private static final Pattern P_CCTV_PLUS_WORD = Pattern.compile("CCTV(\\d+)PLUS");
 
     /** 归一化结果 LRU 缓存上限：频道名种类有限，足以覆盖全量订阅源 */
     private static final int MAX_CACHE = 4096;
@@ -78,6 +80,9 @@ public class ChannelNameMatcher {
         ALIAS.put("CCTV5体育", "CCTV5");
         ALIAS.put("CCTV5PLUS", "CCTV5+");
         ALIAS.put("CCTV5体育赛事", "CCTV5+");
+        ALIAS.put("CCTV5赛事", "CCTV5+");
+        ALIAS.put("CCTV5+体育赛事", "CCTV5+");
+        ALIAS.put("CCTV5+体育", "CCTV5+");
         ALIAS.put("CCTV6电影", "CCTV6");
         ALIAS.put("CCTV7国防军事", "CCTV7");
         ALIAS.put("CCTV8电视剧", "CCTV8");
@@ -139,6 +144,7 @@ public class ChannelNameMatcher {
         // 央视/中央 系列统一为 CCTV
         s = P_CCTV_ALIAS.matcher(s).replaceAll("CCTV");
         s = P_CCTV_NUM.matcher(s).replaceAll("CCTV$1");
+        s = P_CCTV_PLUS_WORD.matcher(s).replaceAll("CCTV$1+");
         s = P_CCTV_PLUS.matcher(s).replaceAll("CCTV$1+");
 
         // 别名表
