@@ -38,6 +38,7 @@ import timber.log.Timber;
  * - 遥控器：左右键切换日期，上下键浏览节目，返回键关闭
  *
  * 日期范围：今天前后 3 天。首次打开会滚动到当前节目位置。
+ * 线路支持回看时，在已播出（或正在播）的节目上按 OK 回看该节目（见 {@link OnCatchupListener}）。
  */
 public class EpgDialog {
 
@@ -50,6 +51,23 @@ public class EpgDialog {
 
     private final Activity activity;
     private final EpgService epgService;
+
+    /** 选中某个节目回看 */
+    public interface OnCatchupListener {
+        /**
+         * @param channel 节目所属频道
+         * @param program 节目
+         * @param startMs 节目开始时间（毫秒）
+         * @param endMs   节目结束时间（毫秒）
+         */
+        void onCatchup(LiveChannel channel, EpgProgram program, long startMs, long endMs);
+    }
+
+    private OnCatchupListener catchupListener;
+
+    public void setOnCatchupListener(OnCatchupListener l) {
+        this.catchupListener = l;
+    }
 
     private AlertDialog dialog;
     private LiveChannel channel;
@@ -199,6 +217,7 @@ public class EpgDialog {
 
     private void setupList() {
         adapter = new EpgListAdapter();
+        adapter.setOnProgramClickListener((position, program) -> onProgramClicked(program));
         if (rvList != null) {
             rvList.setLayoutManager(new LinearLayoutManager(activity));
             rvList.setAdapter(adapter);
@@ -324,6 +343,41 @@ public class EpgDialog {
                 });
             }
         });
+    }
+
+    /** 节目条目按 OK：已开始的节目交给回看，未开始的提示 */
+    private void onProgramClicked(EpgProgram program) {
+        LiveChannel ch = channel;
+        if (ch == null || program == null) return;
+        long[] range = programRange(program, EpgService.offsetDate(dayOffset));
+        if (range == null) return;
+        if (range[0] > System.currentTimeMillis()) {
+            toast("节目还没开始");
+            return;
+        }
+        OnCatchupListener l = catchupListener;
+        if (l == null) return;
+        l.onCatchup(ch, program, range[0], range[1]);
+        dismiss();
+    }
+
+    /**
+     * 节目在某日的起止时间（毫秒）；结束早于开始视为跨午夜到次日。
+     * 解析失败返回 null。
+     */
+    public static long[] programRange(EpgProgram p, String date) {
+        try {
+            SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.CHINA);
+            Date s = f.parse(date + " " + p.getStart());
+            Date e = f.parse(date + " " + p.getEnd());
+            if (s == null || e == null) return null;
+            long start = s.getTime();
+            long end = e.getTime();
+            if (end <= start) end += 24L * 3600_000L;
+            return new long[]{start, end};
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     private void updateDateLabel() {

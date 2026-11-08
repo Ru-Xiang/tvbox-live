@@ -60,6 +60,16 @@ public class LiveSourceParser {
     private static final Pattern TVG_LOGO_PATTERN = Pattern.compile(
             "tvg-logo\\s*=\\s*\"([^\"]*)\""
     );
+    // 回看属性：前面必须是行首或空白，"catchup" 才不会误配 "catchup-source"
+    private static final Pattern CATCHUP_PATTERN = Pattern.compile(
+            "(?:^|\\s)catchup\\s*=\\s*\"([^\"]*)\""
+    );
+    private static final Pattern CATCHUP_SOURCE_PATTERN = Pattern.compile(
+            "(?:^|\\s)catchup-source\\s*=\\s*\"([^\"]*)\""
+    );
+    private static final Pattern CATCHUP_DAYS_PATTERN = Pattern.compile(
+            "(?:^|\\s)catchup-days\\s*=\\s*\"([^\"]*)\""
+    );
 
     /**
      * TVBox 多线路写法 "url1#url2#url3" 的分隔符：只有 '#' 后面紧跟 "协议://" 才算分隔，
@@ -136,6 +146,8 @@ public class LiveSourceParser {
             // 当前条目的 #EXTVLCOPT / #KODIPROP / #EXTHTTP 请求头，遇到地址行后清空。
             // 不在 #EXTINF 处清空：部分列表把 #EXTVLCOPT 写在 #EXTINF 之前。
             Map<String, String> pendingHeaders = new LinkedHashMap<>();
+            // #EXTM3U 头上写的回看属性：作为每个频道的默认值（频道自己写了的优先）
+            Map<String, String> catchupDefaults = new LinkedHashMap<>();
 
             while ((line = reader.readLine()) != null) {
                 // 畸形源可能把整份内容压成一行（数 MB），正则在其上会产生灾难性回溯导致卡死，
@@ -147,8 +159,13 @@ public class LiveSourceParser {
                 }
                 line = line.trim();
 
-                // 跳过空行和 M3U 头
-                if (line.isEmpty() || line.equals("#EXTM3U")) continue;
+                if (line.isEmpty()) continue;
+                // M3U 头：回看默认值只对这个头之后的条目生效（多份列表拼在一起时，后一份不继承前一份的回看设置）
+                if (line.startsWith("#EXTM3U")) {
+                    catchupDefaults.clear();
+                    collectCatchup(line, catchupDefaults);
+                    continue;
+                }
 
                 // 解析 #EXTINF 行
                 if (line.startsWith("#EXTINF")) {
@@ -170,7 +187,7 @@ public class LiveSourceParser {
                         if (!isValidUrl(part)) continue;
                         // 以 "url|User-Agent=..&Referer=.." 形式附在地址上，测速与播放按 StreamUrl 解析
                         parseM3UEntry(currentExtInf, StreamUrl.withHeaders(part, pendingHeaders),
-                                groupMap, channelIndex, lineKeys);
+                                catchupDefaults, groupMap, channelIndex, lineKeys);
                         added = true;
                     }
                     if (added) currentExtInf = null;
@@ -477,7 +494,21 @@ public class LiveSourceParser {
         }
     }
 
-    private void parseM3UEntry(String extInfLine, String url, Map<String, ChannelGroup> groupMap,
+    /**
+     * 从 #EXTM3U / #EXTINF 的属性里取回看设置（catchup / catchup-source / catchup-days），
+     * 写入 out（键为 StreamUrl 的保留键）。只覆盖本行写了的项。
+     */
+    private void collectCatchup(String attributes, Map<String, String> out) {
+        String type = extractAttribute(attributes, CATCHUP_PATTERN);
+        String source = extractAttribute(attributes, CATCHUP_SOURCE_PATTERN);
+        String days = extractAttribute(attributes, CATCHUP_DAYS_PATTERN);
+        if (type != null && !type.trim().isEmpty()) out.put(StreamUrl.KEY_CATCHUP, type.trim());
+        if (source != null && !source.trim().isEmpty()) out.put(StreamUrl.KEY_CATCHUP_SOURCE, source.trim());
+        if (days != null && !days.trim().isEmpty()) out.put(StreamUrl.KEY_CATCHUP_DAYS, days.trim());
+    }
+
+    private void parseM3UEntry(String extInfLine, String url, Map<String, String> catchupDefaults,
+                               Map<String, ChannelGroup> groupMap,
                                Map<String, LiveChannel> channelIndex,
                                Map<LiveChannel, Set<String>> lineKeys) {
         Matcher prefix = EXTINF_PREFIX_PATTERN.matcher(extInfLine);
@@ -520,6 +551,14 @@ public class LiveSourceParser {
         // 标准化频道名称
         channelName = normalizeChannelName(channelName);
         channelName = fixMissingPlus(channelName, epgId, extractAttribute(attributes, TVG_NAME_PATTERN), url);
+
+        // 回看模板以保留键附在线路地址后（不是请求头，不影响去重）：频道自己的属性优先，其次是 #EXTM3U 头上的默认值
+        Map<String, String> catchup = new LinkedHashMap<>();
+        collectCatchup(attributes, catchup);
+        for (Map.Entry<String, String> e : catchupDefaults.entrySet()) {
+            if (!catchup.containsKey(e.getKey())) catchup.put(e.getKey(), e.getValue());
+        }
+        if (!catchup.isEmpty()) url = StreamUrl.appendMeta(url, catchup);
 
         addChannelToGroup(groupMap, channelIndex, lineKeys, groupName, channelName, url, epgId, logoUrl);
     }
@@ -567,7 +606,8 @@ public class LiveSourceParser {
             keys = new HashSet<>();
             lineKeys.put(channel, keys);
         }
-        if (keys.add(ChannelDeduper.lineKey(url))) {
+        if (keys.add(ChannelDeduper.lineKey(url)) || !StreamUrl.reservedMeta(url).isEmpty()) {
+            // 重复线路带回看元数据时也交给 addSourceUrl：它按 lineKey 去重，并把元数据补到先到的那条上
             channel.addSourceUrl(url);
         }
     }

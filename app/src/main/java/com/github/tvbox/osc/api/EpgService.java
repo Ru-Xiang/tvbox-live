@@ -58,6 +58,8 @@ public class EpgService {
     private static final String SLOT_PLAYING = "playing";
     /** 指定日期查询（节目单弹窗翻日期） */
     private static final String SLOT_QUERY = "query";
+    /** 回看播完找下一个节目：独立入口，打开节目单弹窗（SLOT_QUERY）不会把它取消掉 */
+    private static final String SLOT_CATCHUP = "catchup";
     /** 每个请求入口（slot）最近一次提交的请求；新请求到来时取消同入口的旧请求 */
     private final ConcurrentHashMap<String, EpgRequest> latestBySlot = new ConcurrentHashMap<>();
     /** XMLTV 构建锁：线程池并发时，整份 XMLTV 只下载、解析一次，其余请求等待后直接查询 */
@@ -201,6 +203,11 @@ public class EpgService {
      */
     public void loadEpg(String channelName, String date, EpgCallback callback) {
         load(channelName, date, SLOT_QUERY, callback);
+    }
+
+    /** 回看接续用：与节目单弹窗互不取消 */
+    public void loadEpgForCatchup(String channelName, String date, EpgCallback callback) {
+        load(channelName, date, SLOT_CATCHUP, callback);
     }
 
     /**

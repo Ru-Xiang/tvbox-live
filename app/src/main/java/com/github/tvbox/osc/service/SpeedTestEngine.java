@@ -156,6 +156,32 @@ public class SpeedTestEngine {
                                 java.util.Map.Entry<String, SpeedTestResult> eldest) {
                             return size() > MAX_RESULT_CACHE;
                         }
+
+                        // 键去掉回看元数据（1.3.0 起线路串可能带 |catchup=...）：同一条线路补上/改了回看模板，
+                        // 测速结果、HLS 嗅探标记仍然对得上；旧版缓存在加载时经 put 自动迁移
+                        @Override
+                        public SpeedTestResult get(Object key) {
+                            return super.get(norm(key));
+                        }
+
+                        @Override
+                        public SpeedTestResult put(String key, SpeedTestResult value) {
+                            return super.put(StreamUrl.withoutMeta(key), value);
+                        }
+
+                        @Override
+                        public SpeedTestResult remove(Object key) {
+                            return super.remove(norm(key));
+                        }
+
+                        @Override
+                        public boolean containsKey(Object key) {
+                            return super.containsKey(norm(key));
+                        }
+
+                        private Object norm(Object key) {
+                            return key instanceof String ? StreamUrl.withoutMeta((String) key) : key;
+                        }
                     });
 
     /** 上次持久化时间戳（节流控制） */
@@ -735,11 +761,18 @@ public class SpeedTestEngine {
             // 取一次线路列表快照，避免 size 与 get 之间列表被替换/修改
             List<String> sourceUrls = channel.getSourceUrls();
             if (sourceUrls == null) continue;
-            int size = Math.min(sourceUrls.size(), perChannel);
+            // 配额只算能 HTTP 测速的线路：RTSP/RTMP/组播直连等不可测速线路不发网络请求、瞬间出结果
+            // （UNTESTABLE），仍然入队以便记下状态，但不能占掉配额，否则排在它们后面的 HTTP 线路永远测不到
+            int size = sourceUrls.size();
+            int testable = 0;
             ChannelTracker tracker = trackers.get(channel);
             for (int i = 0; i < size; i++) {
                 String url = sourceUrls.get(i);
                 if (url != null && !url.isEmpty()) {
+                    if (ProtocolFilter.isSpeedTestable(url)) {
+                        if (testable >= perChannel) continue;
+                        testable++;
+                    }
                     if (tracker == null) {
                         tracker = new ChannelTracker();
                         trackers.put(channel, tracker);
@@ -852,9 +885,12 @@ public class SpeedTestEngine {
                         if (cancelled.get() || round.finished) return;
 
                         allResults.add(result);
+                        // udpxy 代理忙、没测成：已有旧结果时保留旧结果与速度，不用"不可测速"覆盖
+                        final boolean keepPrev = UDPXY_BUSY_MSG.equals(result.getErrorMsg())
+                                && resultCache.get(task.url) != null;
 
                         // 更新频道速度信息
-                        try {
+                        if (!keepPrev) try {
                             // 与 LiveChannel 的写时复制重排/删除方法同锁（均 synchronized 在频道对象上）。
                             // 测速期间用户可能置顶/删除线路导致下标漂移，下标不匹配时按 URL 重新定位
                             synchronized (task.channel) {
@@ -873,7 +909,7 @@ public class SpeedTestEngine {
                         } catch (Exception ignore) {}
 
                         // 缓存结果并触发增量持久化（中途取消/崩溃也能保留已完成的部分结果）
-                        resultCache.put(task.url, result);
+                        if (!keepPrev) resultCache.put(task.url, result);
                     }
                     try { persistCacheIncremental(); } catch (Exception ignore) {}
 
@@ -1765,6 +1801,63 @@ public class SpeedTestEngine {
      */
     private SpeedTestResult verifyLine(String urlStr, String channelName, int timeoutSeconds,
                                        int connectCapMs, ConnectInfo connectInfo) {
+        if (!viaUdpxy(urlStr)) return verifyLineInner(urlStr, channelName, timeoutSeconds, connectCapMs, connectInfo);
+        if (!acquireUdpxy(timeoutSeconds)) return udpxyBusy(urlStr, channelName);
+        try {
+            return verifyLineInner(urlStr, channelName, timeoutSeconds, connectCapMs, connectInfo);
+        } finally {
+            UDPXY_PERMIT.release();
+        }
+    }
+
+    // ============ udpxy 代理并发控制（1.3.0） ============
+
+    /**
+     * 经 udpxy 代理的组播线路同一时间只测一条：udpxy 默认只服务 3 个客户端（-c 3），
+     * 正在播放的那路已占一个，5 路并发测速会让多出来的请求被拒、超时，被误判为线路失败；
+     * 并发加入组播组也会冲击上行。
+     */
+    private static final java.util.concurrent.Semaphore UDPXY_PERMIT = new java.util.concurrent.Semaphore(1, true);
+
+    private static boolean viaUdpxy(String raw) {
+        return com.github.tvbox.osc.util.MulticastUrl.isMulticast(raw)
+                && com.github.tvbox.osc.util.MulticastUrl.udpxy() != null;
+    }
+
+    /**
+     * 排队等代理空出来；等不到就放弃（见 udpxyBusy）。上限按"测速并发数条线路各自验证 + 实测 + 一次重试"估算，
+     * 线程被中断（测速取消）时立即放弃
+     */
+    private static boolean acquireUdpxy(int timeoutSeconds) {
+        try {
+            long waitSec = Math.max(20L, (long) (HawkConfig.DEFAULT_SPEED_TEST_CONCURRENCY + 1)
+                    * (Math.max(2, timeoutSeconds) + 1) * 2L);
+            return UDPXY_PERMIT.tryAcquire(waitSec, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** "代理忙"标记结果的说明文字（按它识别，见 isUdpxyBusy） */
+    private static final String UDPXY_BUSY_MSG = "udpxy 代理忙，跳过测速";
+
+    /**
+     * 排不到代理：返回一个全新的"不可测速"标记结果（不复用缓存里的对象，调用方会改它的字段）。
+     * 不可测速不会触发超时重试；收尾时如果这条线路已有旧结果，不拿标记覆盖它（见 Finisher）
+     */
+    private static SpeedTestResult udpxyBusy(String urlStr, String channelName) {
+        SpeedTestResult r = new SpeedTestResult(urlStr, channelName);
+        r.setAvailable(false);
+        r.setStatus(3);
+        r.setFailureType(UNTESTABLE);
+        r.setErrorMsg(UDPXY_BUSY_MSG);
+        r.setTestTime(System.currentTimeMillis());
+        return r;
+    }
+
+    private SpeedTestResult verifyLineInner(String urlStr, String channelName, int timeoutSeconds,
+                                            int connectCapMs, ConnectInfo connectInfo) {
         SpeedTestResult result = new SpeedTestResult(urlStr, channelName);
         result.setStatus(1);
         String url = cleanUrl(urlStr);
@@ -1941,6 +2034,16 @@ public class SpeedTestEngine {
      * @param timeoutSeconds 单源测速总预算（秒）
      */
     private SpeedTestResult performSpeedTest(String urlStr, String channelName, int timeoutSeconds) {
+        if (!viaUdpxy(urlStr)) return performSpeedTestInner(urlStr, channelName, timeoutSeconds);
+        if (!acquireUdpxy(timeoutSeconds)) return udpxyBusy(urlStr, channelName);
+        try {
+            return performSpeedTestInner(urlStr, channelName, timeoutSeconds);
+        } finally {
+            UDPXY_PERMIT.release();
+        }
+    }
+
+    private SpeedTestResult performSpeedTestInner(String urlStr, String channelName, int timeoutSeconds) {
         SpeedTestResult result = new SpeedTestResult(urlStr, channelName);
         result.setStatus(1);
 
@@ -2835,6 +2938,9 @@ public class SpeedTestEngine {
             if (r == null || r.getTestTime() < roundStart) continue;
             // UNTESTABLE（RTSP/RTMP 等流式协议）只是无法测速，线路本身可能可播，不能删
             if (UNTESTABLE.equals(r.getFailureType())) continue;
+            // 经 udpxy 测的组播线路失败不删、也不计入：代理宕机或并发已满时所有组播线路一起失败，
+            // 与线路本身坏了分不清（不可用的组播线路由播放时的超时换线兜底）
+            if (!r.isAvailable() && com.github.tvbox.osc.util.MulticastUrl.isMulticast(url)) continue;
             tested++;
             if (!r.isAvailable()) {
                 unavailable.add(url);

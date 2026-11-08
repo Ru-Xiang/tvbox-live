@@ -231,6 +231,30 @@ public class HawkConfig {
     /** 是否开机自动启动（默认关闭） */
     public static final String LIVE_BOOT_STARTUP = "live_boot_startup";
 
+    // ============ 播放内核调优（1.3.0） ============
+
+    /** 起播缓冲档位：0=快速(0.5s) 1=均衡(1.2s) 2=稳定(2.5s，1.2.x 的行为)，见 FastStartLoadControl */
+    public static final String LIVE_START_BUFFER = "live_start_buffer";
+    public static final int DEFAULT_LIVE_START_BUFFER = 0;
+
+    /** 播放走 OkHttp 网络栈（连接复用、预连接）；关闭则退回系统 HttpURLConnection */
+    public static final String LIVE_USE_OKHTTP = "live_use_okhttp";
+
+    /** 视频只用硬件解码器：设备硬解不了直接提示并换线，不偷偷退回软解 */
+    public static final String LIVE_HW_DECODE_ONLY = "live_hw_decode_only";
+
+    /** AC3 / E-AC3 等音频优先经 HDMI 直通给功放/电视（设备支持时） */
+    public static final String LIVE_AUDIO_PASSTHROUGH = "live_audio_passthrough";
+
+    /** 系统没有对应音频解码器（MP2/AC3/E-AC3/DTS 等）时用内置 FFmpeg 解码兜底 */
+    public static final String LIVE_FFMPEG_AUDIO = "live_ffmpeg_audio";
+
+    /** udpxy / msd_lite 代理地址（如 http://192.168.1.1:4022）；设置后 rtp:// udp:// 线路改写为 HTTP 播放 */
+    public static final String LIVE_UDPXY = "live_udpxy";
+
+    /** 组播直连：不经 udpxy，直接加入 rtp:// udp:// 组播（需盒子接在运营商 IPTV 网络上） */
+    public static final String LIVE_MULTICAST_DIRECT = "live_multicast_direct";
+
     // ============ 线路（源）级 置顶 / 黑名单（仅在所属频道内生效） ============
 
     /**

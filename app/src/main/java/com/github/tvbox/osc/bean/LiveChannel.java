@@ -178,7 +178,11 @@ public class LiveChannel implements Serializable {
             rebuildUrlIndex();
         }
         String key = ChannelDeduper.lineKey(url);
-        if (urlSet.contains(key)) return;
+        if (urlSet.contains(key)) {
+            // 同一条线路（lineKey 不含回看元数据）：新来的带回看模板而已有的没有时补上，否则回看能力被去重吞掉
+            mergeMetaInto(key, url);
+            return;
+        }
         String play = StreamUrl.playUrl(url);
         boolean hasHeaders = !StreamUrl.headers(url).isEmpty();
         String first = playIndex.get(play);
@@ -188,6 +192,9 @@ public class LiveChannel implements Serializable {
                 // 走到这里 url 必然带请求头（不带的话 lineKey 与 first 相同，上面已返回）
                 int idx = sourceUrls.indexOf(first);
                 if (idx >= 0) {
+                    // 换成带请求头的那条时，把旧那条的回看元数据带过来（新的已有的优先）
+                    java.util.Map<String, String> meta = StreamUrl.reservedMeta(first);
+                    if (!meta.isEmpty()) url = StreamUrl.appendMeta(url, meta);
                     sourceUrls.set(idx, url);
                     urlSet.remove(ChannelDeduper.lineKey(first));
                     urlSet.add(key);
@@ -197,8 +204,11 @@ public class LiveChannel implements Serializable {
                 // 索引里的那条已不在列表（理论上不会发生）：按新线路正常追加
                 first = null;
             }
-            // 已有带请求头的同地址线路：不带请求头的这条是它的子集，丢弃
-            else if (!hasHeaders) return;
+            // 已有带请求头的同地址线路：不带请求头的这条是它的子集，丢弃（回看元数据并过去）
+            else if (!hasHeaders) {
+                mergeMetaInto(ChannelDeduper.lineKey(first), url);
+                return;
+            }
             // 两条请求头不同：并存（见上）
         }
         if (sourceUrls.size() >= MAX_SOURCE_URLS) return;
@@ -207,6 +217,27 @@ public class LiveChannel implements Serializable {
         sourceUrls.add(url);
         if (speeds == null) speeds = new ArrayList<>();
         speeds.add(0.0);
+    }
+
+    /**
+     * 把 from 携带的回看元数据补到列表里 lineKey 为 key 的那条线路上（只补缺的键，已有的不动）。
+     * 线路串变了要同步 playIndex；urlSet 不用动（lineKey 不含元数据）。
+     */
+    private void mergeMetaInto(String key, String from) {
+        java.util.Map<String, String> meta = StreamUrl.reservedMeta(from);
+        if (meta.isEmpty() || sourceUrls == null) return;
+        for (int i = 0; i < sourceUrls.size(); i++) {
+            String u = sourceUrls.get(i);
+            if (u == null || !key.equals(ChannelDeduper.lineKey(u))) continue;
+            String merged = StreamUrl.appendMeta(u, meta);
+            if (merged.equals(u)) return;
+            sourceUrls.set(i, merged);
+            if (playIndex != null) {
+                String p = StreamUrl.playUrl(u);
+                if (u.equals(playIndex.get(p))) playIndex.put(p, merged);
+            }
+            return;
+        }
     }
 
     /** 按当前 sourceUrls 重建去重索引（首次出现者为准，与 addSourceUrl 的"保留先到"一致） */
@@ -377,7 +408,23 @@ public class LiveChannel implements Serializable {
         // 与 setPlayingHint 的写入顺序相反：先读 key 再读 URL
         String key = sPlayingKey;
         if (key == null || !key.equals(ch.getKey())) return false;
-        return url.equals(sPlayingUrl);
+        String playing = sPlayingUrl;
+        if (url.equals(playing)) return true;
+        // 刷新后同一条线路可能多了/少了回看元数据（串不同、lineKey 相同），仍算正在播放的那条
+        return playing != null && ChannelDeduper.lineKey(url).equals(ChannelDeduper.lineKey(playing));
+    }
+
+    /** 在线路列表里找 url：先按原串，找不到再按 lineKey（忽略回看元数据）找；都没有返回 -1 */
+    private static int indexOfLine(List<String> urls, String url) {
+        if (urls == null || url == null) return -1;
+        int i = urls.indexOf(url);
+        if (i >= 0) return i;
+        String key = ChannelDeduper.lineKey(url);
+        for (int j = 0; j < urls.size(); j++) {
+            String u = urls.get(j);
+            if (u != null && key.equals(ChannelDeduper.lineKey(u))) return j;
+        }
+        return -1;
     }
 
     /**
@@ -388,7 +435,7 @@ public class LiveChannel implements Serializable {
     public boolean syncSourceIndexTo(String url) {
         List<String> urls = sourceUrls;
         if (url == null || urls == null) return false;
-        int i = urls.indexOf(url);
+        int i = indexOfLine(urls, url);
         if (i < 0) return false;
         sourceIndex = i;
         return true;
@@ -406,12 +453,12 @@ public class LiveChannel implements Serializable {
         if (playingKey != null) {
             if (!playingKey.equals(getKey())) return 0;
             String playing = sPlayingUrl;
-            int ni = playing == null ? -1 : newUrls.indexOf(playing);
+            int ni = playing == null ? -1 : indexOfLine(newUrls, playing);
             return ni < 0 ? 0 : ni;
         }
         int idx = sourceIndex;
         if (idx <= 0 || oldUrls == null || idx >= oldUrls.size()) return 0;
-        int ni = newUrls.indexOf(oldUrls.get(idx));
+        int ni = indexOfLine(newUrls, oldUrls.get(idx));
         return ni < 0 ? 0 : ni;
     }
 

@@ -24,7 +24,8 @@ import timber.log.Timber;
  * </ul>
  *
  * <table>
- *   <tr><td>rtp:// udp:// igmp://</td><td>组播 IPTV，需 udpxy 之类的代理转成 HTTP 才能播</td></tr>
+ *   <tr><td>rtp:// udp://</td><td>组播 IPTV：设置了 udpxy 代理或开启组播直连时保留，否则丢弃（见 MulticastUrl）</td></tr>
+ *   <tr><td>igmp://</td><td>不支持</td></tr>
  *   <tr><td>p2p:// 及其它私有协议</td><td>需专用内核</td></tr>
  * </table>
  */
@@ -51,7 +52,9 @@ public final class ProtocolFilter {
                 || lower.startsWith("rtmp://")
                 || lower.startsWith("rtmpt://")
                 || lower.startsWith("file://")
-                || lower.startsWith("content://");
+                || lower.startsWith("content://")
+                // 组播：设置了 udpxy 代理或开了组播直连才算可播（见 MulticastUrl）
+                || MulticastUrl.playable(lower);
     }
 
     /**
@@ -62,7 +65,10 @@ public final class ProtocolFilter {
      */
     public static boolean isSpeedTestable(String url) {
         if (url == null) return false;
-        String lower = url.trim().toLowerCase(java.util.Locale.ROOT);
+        // 按实际请求地址判断：组播线路经 udpxy 改写后就是 HTTP，可以测速；直连组播不能
+        String play = StreamUrl.playUrl(url);
+        if (play == null) return false;
+        String lower = play.trim().toLowerCase(java.util.Locale.ROOT);
         return lower.startsWith("http://") || lower.startsWith("https://");
     }
 

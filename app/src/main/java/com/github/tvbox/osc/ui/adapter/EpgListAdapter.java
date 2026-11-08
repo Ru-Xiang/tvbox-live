@@ -30,6 +30,17 @@ public class EpgListAdapter extends RecyclerView.Adapter<EpgListAdapter.VH> {
     private int currentProgress = 0;
     private RecyclerView attachedView;
 
+    /** 节目条目被点击（遥控器 OK）：回看用 */
+    public interface OnProgramClickListener {
+        void onProgramClick(int position, EpgProgram program);
+    }
+
+    private OnProgramClickListener clickListener;
+
+    public void setOnProgramClickListener(OnProgramClickListener l) {
+        this.clickListener = l;
+    }
+
     @Override
     public void onAttachedToRecyclerView(@NonNull RecyclerView recyclerView) {
         super.onAttachedToRecyclerView(recyclerView);
@@ -118,6 +129,11 @@ public class EpgListAdapter extends RecyclerView.Adapter<EpgListAdapter.VH> {
         ChannelListAdapter.resetFocusScale(h.itemView);
         h.itemView.setOnFocusChangeListener((v, hasFocus)
                 -> ChannelListAdapter.animateFocus(v, hasFocus));
+        h.itemView.setOnClickListener(v -> {
+            OnProgramClickListener l = clickListener;
+            int pos = h.getBindingAdapterPosition();
+            if (l != null && pos >= 0 && pos < programs.size()) l.onProgramClick(pos, programs.get(pos));
+        });
     }
 
     private String formatDuration(int minutes) {

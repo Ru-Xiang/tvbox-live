@@ -98,8 +98,9 @@ public class LivePlayActivity extends AppCompatActivity {
     /** 最大缓冲时长：最多向前缓存这么多内容以吸收网络抖动 */
     private static final int MAX_BUFFER_MS = 60_000;
     /**
-     * 首次起播所需缓冲。不宜过大：需要小于"播放超时换源"时间，
-     * 否则慢速但可用的源会因迟迟未进入 READY 而被误判为失败并换源。
+     * DefaultLoadControl 的首次起播缓冲（"稳定"档）。1.3.0 起首次起播门槛由
+     * FastStartLoadControl 按设置档位与流类型另行决定（0.5–2.5 秒），这里只是它的上限：
+     * 任何档位都不会比 1.2.x 更慢。不宜过大：需要小于"播放超时换源"时间。
      */
     private static final int BUFFER_FOR_PLAYBACK_MS = 2_500;
     /**
@@ -413,6 +414,64 @@ public class LivePlayActivity extends AppCompatActivity {
     private int blackCheckGen = -1;
     /** 本次起播是否已渲染出首帧 */
     private boolean firstFrameRendered;
+
+    // ============ 起播耗时 / 快速起播 / 预热（1.3.0） ============
+    /** 起播耗时统计（按下到首帧、按下到画面动起来），写运行日志 */
+    private final com.github.tvbox.osc.player.PlaybackMetrics playMetrics =
+            new com.github.tvbox.osc.player.PlaybackMetrics();
+    /** 播放器的 LoadControl：每次起播按流类型设置首次起播门槛 */
+    private com.github.tvbox.osc.player.FastStartLoadControl fastStartLoadControl;
+    /** 已为哪一代起播预热过相邻频道 */
+    private int prewarmedGen = -1;
+    /** 已为哪一代起播提示过"本机不支持硬解" */
+    private int hwMissingNotifiedGen = -1;
+    /**
+     * 本代起播调用 setMediaSource 的时刻（elapsedRealtime）。换台不再先 stop()，上一条线路在
+     * 播放线程上抛出的错误可能在换台之后才送达：错误的 timestampMs 早于这个时刻的就是旧线路的，
+     * 不能算到新线路头上（见 onPlayerError）
+     */
+    private long genStartElapsedMs;
+    /**
+     * 本代起播 prepare() 返回的时刻。旧线路的错误可能在 setMediaSource 前后同一毫秒、或播放线程还没处理到
+     * setMediaSource 时产生，只比 genStartElapsedMs 严格小判不全：以 prepare 返回时刻 + 余量为界（含等于）。
+     * 误判一个真正属于新线路的极早错误只会多 prepare 一次，之后的错误时间更晚，照常走失败流程
+     */
+    private long genAckElapsedMs;
+    private static final long STALE_ERROR_MARGIN_MS = 50L;
+    /** 下一次 initPlayer 是用户操作发起的（起播计时从这里重新算），见 PlaybackMetrics */
+    private boolean userStartPending = true;
+    /** 进入后台时回看播到的位置（相对节目开头），回到前台从这里续播回看；-1 表示没有 */
+    private long resumeCatchupOffsetMs = -1L;
+
+    // ============ 回看 ============
+    /** 正在回看的节目；null 表示在看直播 */
+    private CatchupSession catchup;
+    /** 回看时左右键一次跳多少（毫秒），长按跳得更多 */
+    private static final long CATCHUP_SEEK_MS = 30_000L;
+    private static final long CATCHUP_SEEK_LONG_MS = 5 * 60_000L;
+
+    /** 一次回看：哪个频道的哪条线路、哪个节目，以及从节目开头往后偏移了多少 */
+    private static final class CatchupSession {
+        final LiveChannel channel;
+        final String line;
+        final String title;
+        final long startMs;
+        final long endMs;
+        /** 地址里的开始时间相对节目开头的偏移（服务器不支持拖动时靠重新请求实现跳转） */
+        long offsetMs;
+
+        CatchupSession(LiveChannel channel, String line, String title, long startMs, long endMs) {
+            this.channel = channel;
+            this.line = line;
+            this.title = title;
+            this.startMs = startMs;
+            this.endMs = endMs;
+        }
+
+        long durationMs() {
+            return endMs - startMs;
+        }
+    }
     /** 本次起播的视频轨状态：0 未知，1 有可播放的视频轨，2 没有 */
     private int videoTrackState;
     /** 本次起播的轨道里完全没有视频轨组（真正的纯音频流，区别于"有视频轨但解码不了"） */
@@ -487,6 +546,20 @@ public class LivePlayActivity extends AppCompatActivity {
         if (exoPlayer == null && playerReleasedOnStop) {
             playerReleasedOnStop = false;
             LiveChannel channel = channelManager.getCurrentChannel();
+            // 进入后台前在回看：同一频道还在就从原位置续播回看，而不是悄悄回到直播
+            CatchupSession cs = catchup;
+            if (cs != null && channel != null && (channel == cs.channel
+                    || String.valueOf(channel.getChannelName()).equals(cs.channel.getChannelName()))) {
+                long offset = resumeCatchupOffsetMs >= 0 ? resumeCatchupOffsetMs : cs.offsetMs;
+                resumeCatchupOffsetMs = -1L;
+                resumeUrl = null;
+                playCatchupAt(offset);
+                registerNetworkCallback();
+                scheduleNetworkPollIfNeeded();
+                return;
+            }
+            catchup = null;
+            resumeCatchupOffsetMs = -1L;
             // 续播进入后台前在播的线路；已被测速裁掉时 syncSourceIndexTo 返回 false，按频道当前线路起播
             if (channel != null && resumeUrl != null) channel.syncSourceIndexTo(resumeUrl);
             if (channel != null && channel.getCurrentSourceUrl() != null) {
@@ -533,6 +606,8 @@ public class LivePlayActivity extends AppCompatActivity {
             }
             // releasePlayer 会清空 currentPlayUrl，先记下回到前台要续播的线路
             resumeUrl = currentPlayUrl;
+            // 回看中：记下播到哪了（releasePlayer 之后就读不到位置了）
+            resumeCatchupOffsetMs = catchup != null ? catchupPositionMs() : -1L;
             releasePlayer();
         }
     }
@@ -624,6 +699,11 @@ public class LivePlayActivity extends AppCompatActivity {
     /** 网络恢复后重连当前频道：优先回到断网前稳定播放的那条线路 */
     private void resumeAfterNetworkBack() {
         if (!isAlive() || !started) return;
+        // 回看中不切回直播（回看自己的失败由 handleSourceFailure → exitCatchup 处理）
+        if (catchup != null) {
+            waitingForNetwork = false;
+            return;
+        }
         if (!waitingForNetwork && !allSourcesTimeoutPrompted) return;
         if (!isNetworkConnected()) return; // 又断了，等下一次 onAvailable
         LiveChannel ch = channelManager != null ? channelManager.getCurrentChannel() : null;
@@ -1242,6 +1322,9 @@ public class LivePlayActivity extends AppCompatActivity {
 
     private void playChannel(LiveChannel channel) {
         if (channel == null || !isAlive()) return;
+        // 换台 / 重播本频道都回到直播
+        catchup = null;
+        userStartPending = true;
 
         // 关键：把"当前频道"同步到本次要播放的频道。
         // 否则从频道列表长按菜单（播放此线路/置顶）直接播放非当前频道时，
@@ -1324,34 +1407,49 @@ public class LivePlayActivity extends AppCompatActivity {
      * 允许跨协议重定向（http<->https）、放宽超时、默认使用通用浏览器 UA
      * （部分 IPTV 源会拒绝 ExoPlayer 默认 UA），这些差异是导致"其他播放器能播、ExoPlayer 播不了"的常见原因。
      */
-    private DefaultMediaSourceFactory createMediaSourceFactory(String userAgent,
-                                                               java.util.Map<String, String> requestHeaders,
-                                                               boolean hls) {
+    private com.google.android.exoplayer2.source.MediaSource.Factory createMediaSourceFactory(
+            String userAgent, java.util.Map<String, String> requestHeaders, boolean hls) {
         // 连接超时 8 秒：重连宽限（RECONNECT_PLAY_TIMEOUT_S=15 秒）内连接卡住时 ExoPlayer 能先自己重试一次；
         // 起播超时（默认 5 秒）更短时由超时换源先接管，直接换下一条线路；
         // 读超时 10 秒：FLV/TS 读超时会延后重连，调短能早约 5 秒开始重连，HLS 卡住的分片也能在滚出窗口前更早重试。
-        // 不要再降到 8 秒：很慢但能用的 HLS 连接会更快用完重试次数
-        DefaultHttpDataSource.Factory httpDataSourceFactory = new DefaultHttpDataSource.Factory()
-                .setUserAgent(userAgent)
-                .setConnectTimeoutMs(8000)
-                .setReadTimeoutMs(10000)
-                .setAllowCrossProtocolRedirects(true)
-                .setKeepPostFor302Redirects(true);
-        if (requestHeaders != null && !requestHeaders.isEmpty()) {
-            httpDataSourceFactory.setDefaultRequestProperties(requestHeaders);
+        // 不要再降到 8 秒：很慢但能用的 HLS 连接会更快用完重试次数（超时值见 PlayerNet）。
+        // 1.3.0 起默认走 OkHttp：与 App 共用连接池，HLS 分片、换台回到同一主机都复用连接
+        com.google.android.exoplayer2.upstream.HttpDataSource.Factory httpDataSourceFactory =
+                com.github.tvbox.osc.player.PlayerNet.httpFactory(
+                        Hawk.get(HawkConfig.LIVE_USE_OKHTTP, true), userAgent, requestHeaders);
+        // 按协议分发：rtmp:// 走 RtmpDataSource，rtp:// udp:// 走组播直连，其余走 HTTP 数据源。
+        // rtsp:// 由 DefaultMediaSourceFactory 直接创建 RtspMediaSource，无需数据源支持。
+        com.google.android.exoplayer2.upstream.DataSource.Factory dataSourceFactory =
+                new com.github.tvbox.osc.player.SchemeDataSourceFactory(this, httpDataSourceFactory);
+        // 单次读取失败后在放弃前多重试几次，抵抗瞬时网络抖动；
+        // HLS 改用更短的重试间隔，让分片在滚出直播窗口前尽快重试
+        com.google.android.exoplayer2.upstream.LoadErrorHandlingPolicy errorPolicy = hls
+                ? new HlsLoadErrorPolicy(LOAD_ERROR_RETRY_COUNT)
+                : new com.google.android.exoplayer2.upstream.DefaultLoadErrorHandlingPolicy(
+                        LOAD_ERROR_RETRY_COUNT);
+        if (hls) {
+            // HLS 单独建工厂，才能给分片里的 TS 也设上同样的解析容错标志
+            return new com.google.android.exoplayer2.source.hls.HlsMediaSource.Factory(dataSourceFactory)
+                    .setExtractorFactory(new com.google.android.exoplayer2.source.hls.DefaultHlsExtractorFactory(
+                            TS_PAYLOAD_FLAGS, /* exposeCea608WhenMissingDeclarations= */ true))
+                    .setAllowChunklessPreparation(true)
+                    .setLoadErrorHandlingPolicy(errorPolicy);
         }
-        return new DefaultMediaSourceFactory(this)
-                // 按协议分发：rtmp:// 走 RtmpDataSource，其余走 HTTP 数据源。
-                // rtsp:// 由 DefaultMediaSourceFactory 直接创建 RtspMediaSource，无需数据源支持。
-                .setDataSourceFactory(
-                        new com.github.tvbox.osc.player.SchemeDataSourceFactory(httpDataSourceFactory))
-                // 单次读取失败后在放弃前多重试几次，抵抗瞬时网络抖动；
-                // HLS 改用更短的重试间隔，让分片在滚出直播窗口前尽快重试
-                .setLoadErrorHandlingPolicy(hls
-                        ? new HlsLoadErrorPolicy(LOAD_ERROR_RETRY_COUNT)
-                        : new com.google.android.exoplayer2.upstream.DefaultLoadErrorHandlingPolicy(
-                                LOAD_ERROR_RETRY_COUNT));
+        com.google.android.exoplayer2.extractor.DefaultExtractorsFactory extractors =
+                new com.google.android.exoplayer2.extractor.DefaultExtractorsFactory()
+                        .setTsExtractorFlags(TS_PAYLOAD_FLAGS);
+        return new DefaultMediaSourceFactory(dataSourceFactory, extractors)
+                .setLoadErrorHandlingPolicy(errorPolicy);
     }
+
+    /**
+     * TS 解析容错（国内 IPTV 各种"奇怪的 TS 流"）：
+     * ALLOW_NON_IDR_KEYFRAMES —— 组播 / 转码流常常隔很久才有一个 IDR，把普通 I 帧也当关键帧，起播不用干等 IDR；
+     * DETECT_ACCESS_UNITS —— 不带 AUD 分隔符的 H.264 流按内容自己切分访问单元，否则可能一直解不出帧。
+     */
+    private static final int TS_PAYLOAD_FLAGS =
+            com.google.android.exoplayer2.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES
+                    | com.google.android.exoplayer2.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS;
 
     /**
      * HLS 专用的加载重试策略：重试次数与默认相同，但间隔为 0 / 0.5 / 1 / 1.5 / 2 / 2 秒
@@ -1648,7 +1746,11 @@ public class LivePlayActivity extends AppCompatActivity {
         }
         if (!isAlive()) return;
         try {
-            if (epgDialog == null) epgDialog = new EpgDialog(this);
+            if (epgDialog == null) {
+                epgDialog = new EpgDialog(this);
+                // 节目单里选已播出的节目：回看
+                epgDialog.setOnCatchupListener(this::startCatchup);
+            }
             epgDialog.show(channel);
         } catch (Exception e) {
             Timber.w(e, "显示 EPG 弹窗失败");
@@ -1708,13 +1810,14 @@ public class LivePlayActivity extends AppCompatActivity {
         }
         currentPlayUrl = url;
         playGen++;
-        // 告知 LiveChannel 当前实际播放的线路：测速排序/置顶重排时据此保持索引指向这条线路
-        LiveChannel.setPlayingHint(channelManager.getCurrentChannel(), url);
+        // 告知 LiveChannel 当前实际播放的线路：测速排序/置顶重排时据此保持索引指向这条线路。
+        // 回看地址不是频道的线路，不提示（否则重排时找不到它）
+        if (catchup == null) LiveChannel.setPlayingHint(channelManager.getCurrentChannel(), url);
         if (exoPlayer == null) {
             try {
                 // 播放器级的默认工厂（无线路请求头）。实际每次起播都按线路自带的
                 // UA/Referer 另建媒体源，见下方 setMediaSource。
-                DefaultMediaSourceFactory mediaSourceFactory =
+                com.google.android.exoplayer2.source.MediaSource.Factory mediaSourceFactory =
                         createMediaSourceFactory(StreamUrl.DEFAULT_USER_AGENT, null, false);
 
                 // 大缓冲策略：以牺牲直播时延为代价换取抗抖动能力。
@@ -1731,13 +1834,23 @@ public class LivePlayActivity extends AppCompatActivity {
                                 .setTargetBufferBytes(targetBufferBytes())
                                 .setPrioritizeTimeOverSizeThresholds(false)
                                 .build();
+                // 首次起播门槛单独放低（按设置档位与流类型，见 initPlayer），卡顿恢复与大缓冲不变
+                fastStartLoadControl = new com.github.tvbox.osc.player.FastStartLoadControl(
+                        loadControl, BUFFER_FOR_PLAYBACK_MS);
 
                 // 接入带宽估算器：右下角常驻网速显示需要它提供播放中的实时吞吐
                 bandwidthMeter = new com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
                         .Builder(this).build();
-                exoPlayer = new ExoPlayer.Builder(this)
+                // 解码器配置：只用硬解视频 / FFmpeg 音频兜底 / 音频直通（设置页改动后，
+                // 回到播放页时播放器会重建，见 onStop 释放、onStart 重新起播）
+                com.google.android.exoplayer2.DefaultRenderersFactory renderersFactory =
+                        com.github.tvbox.osc.player.PlayerRenderers.create(this,
+                                Hawk.get(HawkConfig.LIVE_HW_DECODE_ONLY, true),
+                                Hawk.get(HawkConfig.LIVE_FFMPEG_AUDIO, true),
+                                Hawk.get(HawkConfig.LIVE_AUDIO_PASSTHROUGH, true));
+                exoPlayer = new ExoPlayer.Builder(this, renderersFactory)
                         .setMediaSourceFactory(mediaSourceFactory)
-                        .setLoadControl(loadControl)
+                        .setLoadControl(fastStartLoadControl)
                         .setBandwidthMeter(bandwidthMeter)
                         .build();
                 playerView.setPlayer(exoPlayer);
@@ -1761,6 +1874,8 @@ public class LivePlayActivity extends AppCompatActivity {
                             }
                             // 起播后开始轮询右下角实时网速
                             startCornerSpeedTicker();
+                            // 本台起播了：预热上下相邻频道，上下键换台时 DNS / 连接已就绪
+                            prewarmNeighbours();
                             onReadyForBlackCheck();
                             // 出过画面，或流里根本没有视频轨（纯音频/广播线路不会渲染首帧），都算"播过"：
                             // 否则电台类频道永远拿不到原线路重连额度，单源电台一次断流就弹"全部失败"。
@@ -1787,6 +1902,11 @@ public class LivePlayActivity extends AppCompatActivity {
                                         && dur != C.TIME_UNSET && dur <= FINITE_CLIP_MAX_MS;
                             } catch (Exception ignore) {
                             }
+                            if (catchup != null) {
+                                // 回看的节目播完：接着播下一个节目（或回到直播）
+                                if (handler != null) handler.post(() -> onCatchupEnded());
+                                return;
+                            }
                             if (finite) clearPlaybackRecoveryState();
                             RunLog.i("直播流结束(ENDED" + (finite ? "/有限内容" : "") + ")，按中断处理: "
                                     + logUrl(currentPlayUrl));
@@ -1797,6 +1917,12 @@ public class LivePlayActivity extends AppCompatActivity {
                             if (!switchingSource) com.github.tvbox.osc.util.PlaybackGate.setPlaying(false);
                             if (handler != null) handler.removeCallbacks(stablePlayResetRunnable);
                         }
+                    }
+
+                    @Override
+                    public void onIsPlayingChanged(boolean isPlaying) {
+                        // "按下到画面动起来"：本代起播第一次真正开始播放
+                        if (isPlaying) playMetrics.onPlaying(playGen);
                     }
 
                     @Override
@@ -1820,6 +1946,9 @@ public class LivePlayActivity extends AppCompatActivity {
                         // 允许超出解码能力：ExoPlayer 默认仍会尝试播放，播不出来由首帧检测兜底
                         videoTrackState = tracks.isTypeSupported(C.TRACK_TYPE_VIDEO, true) ? 1 : 2;
                         audioOnlyTracks = !tracks.containsType(C.TRACK_TYPE_VIDEO);
+                        // 有视频轨、但"只用硬解"把本机的解码器全过滤掉了：提示并直接换线，
+                        // 不等黑屏检测（软解 4K 在盒子上也播不动，不值得退回软解）
+                        if (videoTrackState == 2 && !audioOnlyTracks) onHwDecoderMissing(tracks);
                         // 自适应码流（HLS 多档位）起播常在低档位，按清单里的最高档位记录线路分辨率
                         for (Tracks.Group g : tracks.getGroups()) {
                             if (g.getType() != C.TRACK_TYPE_VIDEO) continue;
@@ -1835,6 +1964,21 @@ public class LivePlayActivity extends AppCompatActivity {
 
                     @Override
                     public void onPlayerError(@NonNull PlaybackException error) {
+                        if (error.timestampMs <= genAckElapsedMs + STALE_ERROR_MARGIN_MS
+                                && genAckElapsedMs > 0) {
+                            // 换台前上一条线路的错误：内部播放器因它停在 IDLE，新线路的 prepare 被吞掉了。
+                            // 重新 prepare 新线路（会清掉这个错误），不计入换源，也不动本代的超时计时
+                            RunLog.i("忽略换台前旧线路的错误: " + error.getErrorCodeName());
+                            final int gen = playGen;
+                            if (handler != null) handler.post(() -> {
+                                if (!isAlive() || !started || gen != playGen || exoPlayer == null) return;
+                                if (exoPlayer.getPlaybackState() == Player.STATE_IDLE) {
+                                    exoPlayer.prepare();
+                                    exoPlayer.setPlayWhenReady(true);
+                                }
+                            });
+                            return;
+                        }
                         Timber.w("播放出错: %s", error.getMessage());
                         RunLog.i("播放出错: " + error.getErrorCodeName() + " " + logUrl(currentPlayUrl));
                         cancelPlayTimeout();
@@ -1921,6 +2065,7 @@ public class LivePlayActivity extends AppCompatActivity {
                         Integer gen = mediaItemGenOf(eventTime);
                         if (gen != null && gen != playGen) return;
                         firstFrameRendered = true;
+                        playMetrics.onFirstFrame(playGen);
                         if (exoPlayer != null) {
                             VideoSize vs = exoPlayer.getVideoSize();
                             float par = vs.pixelWidthHeightRatio > 0 ? vs.pixelWidthHeightRatio : 1f;
@@ -1944,13 +2089,11 @@ public class LivePlayActivity extends AppCompatActivity {
             // 换线不算停播：观看会话仍在，后台测速继续让路（起播缓冲期间暂缓）
             com.github.tvbox.osc.util.PlaybackGate.setPlaying(true);
             com.github.tvbox.osc.util.PlaybackGate.setBuffering(true);
-            switchingSource = true;
-            try {
-                try { exoPlayer.stop(); } catch (Exception ignore) {}
-                try { exoPlayer.clearMediaItems(); } catch (Exception ignore) {}
-            } finally {
-                switchingSource = false;
-            }
+            // 1.3.0：换台/换源不再先 stop() + clearMediaItems()。stop() 会重置渲染器、释放硬件解码器，
+            // 下一台要重新初始化解码器（Amlogic 盒子上几百毫秒）并黑屏；直接 setMediaSource 时
+            // ExoPlayer 只 flush 解码器，格式兼容（同编码、分辨率在范围内）就原样复用，
+            // 画面停在上一台最后一帧直到新画面出来（布局里 keep_content_on_player_reset）。
+            // 上一条线路的迟到事件仍按媒体项上的起播代次（tag）丢弃，见 mediaItemGenOf
 
             // 去掉 TVBox 风格的 "$标签" 与 "|请求头" 后缀再交给播放器（仅影响本次请求，不改存储的 URL）。
             // 规则与测速共用 StreamUrl，保证两边请求的是同一个地址。
@@ -1961,16 +2104,38 @@ public class LivePlayActivity extends AppCompatActivity {
             boolean asHls = ruleHls || cacheHls;
             currentItemAsHls = asHls;
             currentItemHlsFromCache = cacheHls;
-            RunLog.i("起播: " + logUrl(url) + (asHls ? (cacheHls ? " [HLS/测速]" : " [HLS]") : ""));
+            boolean multicastDirect = com.github.tvbox.osc.util.MulticastUrl.isMulticast(uri.toString());
+            String kind = catchup != null ? "回看" : asHls ? "HLS" : multicastDirect ? "组播" : "流";
+            RunLog.i("起播: " + logUrl(url) + (asHls ? (cacheHls ? " [HLS/测速]" : " [HLS]") : "")
+                    + (catchup != null ? " [回看]" : multicastDirect ? " [组播直连]" : ""));
+            // 首次起播门槛：HLS 分片下载比实时快、起播后缓冲会自己涨，给得低；
+            // FLV/TS/组播按实时速度到达，起播后难再攒，给得稍高，免得刚起播就卡
+            if (fastStartLoadControl != null) {
+                fastStartLoadControl.setStartBufferMs(
+                        com.github.tvbox.osc.player.FastStartLoadControl.startBufferMs(
+                                Hawk.get(HawkConfig.LIVE_START_BUFFER, HawkConfig.DEFAULT_LIVE_START_BUFFER),
+                                !asHls));
+            }
+            // reconnectGrace 此时仍为 true 表示这是已播过线路的原线路重连（startPlayTimeout 才消费它）
+            // 重连自己从头计时（离用户按键可能已过去很久），但不计入中位数
+            playMetrics.begin(playGen, kind, userStartPending || reconnectGrace, !reconnectGrace);
+            userStartPending = false;
             // 直播流设置目标偏移：播放点离直播边缘更远，可容忍更大的网络波动而不卡顿。
             // tag 记录起播代次：首帧事件按它识别迟到的旧线路事件（见 mediaItemGenOf）
+            // 回看：服务器常返回不带 ENDLIST 的 EVENT 清单（从节目开始到现在），ExoPlayer 会把它当直播，
+            // 按目标偏移跳到"现在-20 秒"。回看不设目标偏移、锁定 1 倍速（不追直播边缘），并从窗口开头起播
+            MediaItem.LiveConfiguration liveConfig = catchup != null
+                    ? new MediaItem.LiveConfiguration.Builder()
+                            .setMinPlaybackSpeed(1f)
+                            .setMaxPlaybackSpeed(1f)
+                            .build()
+                    : new MediaItem.LiveConfiguration.Builder()
+                            .setTargetOffsetMs(LIVE_TARGET_OFFSET_MS)
+                            .build();
             MediaItem.Builder itemBuilder = new MediaItem.Builder()
                     .setUri(uri)
                     .setTag(playGen)
-                    .setLiveConfiguration(
-                            new MediaItem.LiveConfiguration.Builder()
-                                    .setTargetOffsetMs(LIVE_TARGET_OFFSET_MS)
-                                    .build());
+                    .setLiveConfiguration(liveConfig);
             if (asHls) itemBuilder.setMimeType(MimeTypes.APPLICATION_M3U8);
             MediaItem item = itemBuilder.build();
             // 线路自带的 UA/Referer（#EXTVLCOPT 或 url|User-Agent=..）逐条生效：
@@ -1986,8 +2151,18 @@ public class LivePlayActivity extends AppCompatActivity {
                     it.remove();
                 }
             }
-            exoPlayer.setMediaSource(createMediaSourceFactory(ua, headers, asHls).createMediaSource(item));
+            // 换台期间保留上一台最后一帧（"全部失败"终态时会临时关掉，这里恢复）
+            if (playerView != null) playerView.setKeepContentOnPlayerReset(true);
+            genStartElapsedMs = android.os.SystemClock.elapsedRealtime();
+            com.google.android.exoplayer2.source.MediaSource source =
+                    createMediaSourceFactory(ua, headers, asHls).createMediaSource(item);
+            if (catchup != null) {
+                exoPlayer.setMediaSource(source, /* startPositionMs= */ 0L);
+            } else {
+                exoPlayer.setMediaSource(source);
+            }
             exoPlayer.prepare();
+            genAckElapsedMs = android.os.SystemClock.elapsedRealtime();
             exoPlayer.setPlayWhenReady(true);
             startPlayTimeout();
             // 切源后立刻刷新右下角网速（显示新线路）
@@ -2027,6 +2202,234 @@ public class LivePlayActivity extends AppCompatActivity {
         });
     }
 
+    // ============ 预热 / 硬解提示（1.3.0） ============
+
+    /** 本代起播首次 READY 后，预热当前分组里上下相邻频道的当前线路 */
+    private void prewarmNeighbours() {
+        if (prewarmedGen == playGen || catchup != null || channelManager == null) return;
+        prewarmedGen = playGen;
+        for (int d : new int[]{1, -1}) {
+            LiveChannel c = channelManager.peekAdjacent(d);
+            if (c != null) com.github.tvbox.osc.player.PlayerNet.prewarm(c.getCurrentSourceUrl());
+        }
+    }
+
+    /**
+     * 视频轨因"只用硬解"找不到解码器：提示一次并按解码错误直接换线（不占重连额度）。
+     * 只在被过滤掉的格式确实是本次流里的视频格式时触发，避免拿上一条线路的旧记录误判。
+     */
+    private void onHwDecoderMissing(@NonNull Tracks tracks) {
+        if (hwMissingNotifiedGen == playGen) return;
+        String missing = com.github.tvbox.osc.player.PlayerRenderers.lastMissingHwMime();
+        if (missing == null) return;
+        Format videoFormat = null;
+        for (Tracks.Group g : tracks.getGroups()) {
+            if (g.getType() != C.TRACK_TYPE_VIDEO) continue;
+            for (int i = 0; i < g.length; i++) {
+                Format f = g.getTrackFormat(i);
+                if (missing.equals(f.sampleMimeType)) videoFormat = f;
+            }
+        }
+        if (videoFormat == null) return;
+        hwMissingNotifiedGen = playGen;
+        com.github.tvbox.osc.player.PlayerRenderers.clearMissingHwMime();
+        String name = com.github.tvbox.osc.player.PlayerRenderers.friendlyName(missing);
+        String res = videoFormat.height > 0 ? " " + videoFormat.height + "p" : "";
+        if (catchup != null) {
+            // 回看不换线：说明原因后回直播（异步，不在 onTracksChanged 回调里重建播放）
+            RunLog.i("回看：本机没有 " + name + res + " 硬件解码器，回到直播");
+            cancelPlayTimeout();
+            final int gen = playGen;
+            final String msg = "本机不支持硬解 " + name + res + "，无法回看，已回到直播（可在设置里关闭「视频只用硬解」）";
+            if (handler != null) handler.post(() -> {
+                if (isAlive() && gen == playGen) exitCatchup(msg);
+            });
+            return;
+        }
+        RunLog.i("本机没有 " + name + res + " 硬件解码器，换线: " + logUrl(currentPlayUrl));
+        ToastUtil.show(this, "本机不支持硬解 " + name + res + "，换下一条线路"
+                + "（可在设置里关闭「视频只用硬解」改用软解）");
+        cancelPlayTimeout();
+        postSourceFailure(false, PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED);
+    }
+
+    // ============ 回看（1.3.0） ============
+
+    /** 节目单里选了一个已播出的节目：用当前频道支持回看的线路回看它 */
+    private void startCatchup(LiveChannel channel, EpgProgram program, long startMs, long endMs) {
+        if (!isAlive() || !started || channelManager == null) return;
+        LiveChannel cur = channelManager.getCurrentChannel();
+        if (cur == null) return;
+        // 节目单只为当前频道打开；期间频道对象可能被刷新替换，按名字对上即可
+        if (channel != null && cur != channel
+                && !String.valueOf(cur.getChannelName()).equals(channel.getChannelName())) {
+            ToastUtil.show(this, "频道已切换，请重新打开节目单");
+            return;
+        }
+        String line = pickCatchupLine(cur);
+        if (line == null) {
+            ToastUtil.show(this, "当前频道的线路不支持回看");
+            return;
+        }
+        String title = program != null && program.getTitle() != null ? program.getTitle() : "";
+        catchup = new CatchupSession(cur, line, title, startMs, endMs);
+        RunLog.i("开始回看: " + cur.getChannelName() + " " + title);
+        playCatchupAt(0);
+    }
+
+    /** 优先用正在播的线路；它不支持回看就找本频道第一条支持的 */
+    private static String pickCatchupLine(LiveChannel ch) {
+        String cur = ch.getCurrentSourceUrl();
+        if (com.github.tvbox.osc.util.CatchupUrl.supports(cur)) return cur;
+        List<String> urls = ch.getSourceUrls();
+        if (urls != null) {
+            for (String u : urls) {
+                if (com.github.tvbox.osc.util.CatchupUrl.supports(u)) return u;
+            }
+        }
+        return null;
+    }
+
+    /** 从节目开头往后 offsetMs 处起播回看（服务器不支持拖动时，跳转也走这里：重新请求） */
+    private void playCatchupAt(long offsetMs) {
+        CatchupSession s = catchup;
+        if (s == null) return;
+        // 显式开始/跳转回看：上一个节目（或上一次后台）存下的续播位置作废
+        resumeCatchupOffsetMs = -1L;
+        // 直播留下的"全部失败 / 等网络"状态与回看无关：不清掉的话，网络回调会把回看拉回直播
+        allSourcesTimeoutPrompted = false;
+        sourceTryCount = 0;
+        waitingForNetwork = false;
+        if (handler != null) handler.removeCallbacks(networkResumeRunnable);
+        s.offsetMs = Math.max(0L, Math.min(offsetMs, catchupMaxPositionMs(s)));
+        String url = com.github.tvbox.osc.util.CatchupUrl.build(s.line, s.startMs + s.offsetMs, s.endMs);
+        if (url == null) {
+            exitCatchup("该线路不支持回看");
+            return;
+        }
+        // 与换台一样清掉上一次的失败 / 重连状态
+        clearPlaybackRecoveryState();
+        java.util.Arrays.fill(blwTimes, 0L);
+        reconnectGrace = false;
+        consecutiveHttp4xx = 0;
+        dismissAllSourcesDialog();
+        showCatchupToast(s, s.offsetMs);
+        userStartPending = true;
+        initPlayer(url);
+    }
+
+    /** 回看能跳到的最远位置：节目末尾前 5 秒；节目还在播时不超过"现在"前 30 秒 */
+    private static long catchupMaxPositionMs(CatchupSession s) {
+        long byEnd = s.durationMs() - 5_000L;
+        long byNow = System.currentTimeMillis() - 30_000L - s.startMs;
+        return Math.max(0L, Math.min(byEnd, byNow));
+    }
+
+    /** 服务器给的回看流本身可拖动（HLS 点播等）：在流内 seek，不必重新请求 */
+    private boolean catchupSeekable() {
+        try {
+            // EVENT 清单（回看常见）也是"直播"但可拖动，窗口开头固定在请求的开始时间，不能因 isLive 排除
+            return exoPlayer != null && exoPlayer.isCurrentMediaItemSeekable()
+                    && exoPlayer.getDuration() != C.TIME_UNSET;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** 当前回看位置（相对节目开头，毫秒） */
+    private long catchupPositionMs() {
+        CatchupSession s = catchup;
+        if (s == null || exoPlayer == null) return 0L;
+        return s.offsetMs + Math.max(0L, exoPlayer.getCurrentPosition());
+    }
+
+    /** 回看中快进 / 快退 */
+    private void seekCatchup(long deltaMs) {
+        CatchupSession s = catchup;
+        if (s == null || exoPlayer == null) return;
+        long want = catchupPositionMs() + deltaMs;
+        long max = catchupMaxPositionMs(s);
+        if (deltaMs > 0 && want > max && s.endMs > System.currentTimeMillis()) {
+            // 节目还在播、已经追到"现在"：直接回直播
+            exitCatchup("已追上直播");
+            return;
+        }
+        long target = Math.max(0L, Math.min(want, max));
+        long rel = target - s.offsetMs;
+        long dur = exoPlayer.getDuration();
+        if (catchupSeekable() && rel >= 0 && (dur == C.TIME_UNSET || rel < dur)) {
+            exoPlayer.seekTo(rel);
+            showCatchupToast(s, target);
+        } else {
+            playCatchupAt(target);
+        }
+    }
+
+    private void showCatchupToast(CatchupSession s, long positionMs) {
+        ToastUtil.show(this, "回看 " + s.title + "  " + formatClock(positionMs) + " / "
+                + formatClock(s.durationMs()) + "（左右键快退快进，返回键回直播）");
+    }
+
+    private static String formatClock(long ms) {
+        long t = Math.max(0L, ms / 1000L);
+        long h = t / 3600, m = (t % 3600) / 60, sec = t % 60;
+        return h > 0 ? String.format(java.util.Locale.ROOT, "%d:%02d:%02d", h, m, sec)
+                : String.format(java.util.Locale.ROOT, "%02d:%02d", m, sec);
+    }
+
+    /** 结束回看，回到当前频道的直播 */
+    private void exitCatchup(String message) {
+        if (catchup == null) return;
+        catchup = null;
+        if (message != null) ToastUtil.show(this, message);
+        LiveChannel ch = channelManager != null ? channelManager.getCurrentChannel() : null;
+        if (ch != null && started) playChannel(ch);
+    }
+
+    /** 回看的节目播完：按节目单接着播下一个节目；已经追到现在或找不到下一个节目就回直播 */
+    private void onCatchupEnded() {
+        final CatchupSession s = catchup;
+        if (s == null || !isAlive()) return;
+        if (s.endMs >= System.currentTimeMillis() - 60_000L) {
+            exitCatchup("节目已播完，回到直播");
+            return;
+        }
+        final String date = new java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.CHINA)
+                .format(new java.util.Date(s.endMs));
+        final int gen = playGen;
+        epgService.loadEpgForCatchup(s.channel.getChannelName(), date, new EpgService.EpgCallback() {
+            @Override
+            public void onEpgLoaded(List<EpgProgram> programs, EpgProgram current) {
+                runOnUiThread(() -> {
+                    if (!isAlive() || catchup != s || gen != playGen) return;
+                    if (programs != null) {
+                        for (EpgProgram p : programs) {
+                            long[] r = EpgDialog.programRange(p, date);
+                            // 下一个节目：开始时间紧接着上一个结束（允许 1 分钟误差）
+                            if (r != null && r[0] >= s.endMs - 60_000L && r[0] <= s.endMs + 5 * 60_000L
+                                    && r[0] < System.currentTimeMillis()) {
+                                catchup = new CatchupSession(s.channel, s.line,
+                                        p.getTitle() != null ? p.getTitle() : "", r[0], r[1]);
+                                RunLog.i("回看接下一个节目: " + catchup.title);
+                                playCatchupAt(0);
+                                return;
+                            }
+                        }
+                    }
+                    exitCatchup("节目已播完，回到直播");
+                });
+            }
+
+            @Override
+            public void onEpgError(String msg) {
+                runOnUiThread(() -> {
+                    if (!isAlive() || catchup != s || gen != playGen) return;
+                    exitCatchup("节目已播完，回到直播");
+                });
+            }
+        });
+    }
+
     // ============ 超时换源 ============
 
     /** 启动播放超时定时器：在设定时间内未成功起播则自动换源 */
@@ -2038,7 +2441,9 @@ public class LivePlayActivity extends AppCompatActivity {
         reconnectGrace = false; // 宽限只用一次
         if (configured <= 0) return; // 0 表示关闭超时换源
         // 重连是冷启动（重新建连、清空缓冲），默认 5 秒不够：至少给 RECONNECT_PLAY_TIMEOUT_S
-        final int timeoutSec = grace ? Math.max(configured, RECONNECT_PLAY_TIMEOUT_S) : configured;
+        // 回看服务器按时间点现拼流，起播普遍比直播慢：同样给足宽限
+        final int timeoutSec = (grace || catchup != null)
+                ? Math.max(configured, RECONNECT_PLAY_TIMEOUT_S) : configured;
         playTimeoutRunnable = () -> {
             Timber.w("播放超时(%ds)，自动换源", timeoutSec);
             // 同样走异步换源通道，保持所有失败路径一致
@@ -2063,6 +2468,12 @@ public class LivePlayActivity extends AppCompatActivity {
      * @param errorCode 播放器错误码，超时/流结束/其他为 -1
      */
     private void handleSourceFailure(boolean byTimeout, int errorCode) {
+        // 回看失败不走换线流程（回看地址不是频道的线路，也不该拿它去标记/轮换线路）：提示后回到直播
+        if (catchup != null) {
+            RunLog.i((byTimeout ? "回看起播超时: " : "回看失败: ") + logUrl(currentPlayUrl));
+            exitCatchup(byTimeout ? "回看连接超时，已回到直播" : "该节目暂不能回看，已回到直播");
+            return;
+        }
         LiveChannel channel = channelManager.getCurrentChannel();
         if (channel == null) return;
         RunLog.i((byTimeout ? "起播超时: " : "线路失败: ") + channel.getChannelName() + " " + logUrl(currentPlayUrl));
@@ -2168,7 +2579,13 @@ public class LivePlayActivity extends AppCompatActivity {
             // 终态：没有线路可播了。停掉播放器并清掉"正在播放"标记，否则死流可能一直停在
             // BUFFERING，PlaybackGate 残留 playing+buffering，弹窗里发起的测速反被它"让路"拖慢
             try {
-                if (exoPlayer != null) exoPlayer.stop();
+                // 布局里开了"换台保留最后一帧"：终态不该留着别的频道的画面，先关掉再 stop 让画面变黑
+                if (playerView != null) playerView.setKeepContentOnPlayerReset(false);
+                if (exoPlayer != null) {
+                    exoPlayer.stop();
+                    // stop() 不清轨道，播放器视图看到还有视频轨就不关遮罩；清空媒体项后轨道为空，画面才变黑
+                    exoPlayer.clearMediaItems();
+                }
             } catch (Exception ignore) {
             }
             com.github.tvbox.osc.util.PlaybackGate.setPlaying(false);
@@ -2213,7 +2630,8 @@ public class LivePlayActivity extends AppCompatActivity {
 
     /** 记录本次起播观察到的画面尺寸（只记最高的一次），供测速结束时按分辨率剔除线路 */
     private void noteResolution(int width, int height) {
-        if (width <= 0 || height <= 0 || currentPlayUrl == null) return;
+        // 回看地址不是线路：不记分辨率，免得污染线路质量记录
+        if (width <= 0 || height <= 0 || currentPlayUrl == null || catchup != null) return;
         int eq = LineQuality.equivalentHeight(width, height);
         if (eq <= recordedHeight) return;
         recordedHeight = eq;
@@ -2240,6 +2658,8 @@ public class LivePlayActivity extends AppCompatActivity {
         if (blackCheckDone || !started || !isAlive() || exoPlayer == null
                 || handler == null || currentPlayUrl == null) return false;
         if (!LineQuality.filterBlackEnabled()) return false;
+        // 回看不做黑屏判定（结论会记到线路上，而回看地址不是线路）
+        if (catchup != null) return false;
         return !LineQuality.isAudioChannel(channelManager.getCurrentChannel());
     }
 
@@ -2616,6 +3036,11 @@ public class LivePlayActivity extends AppCompatActivity {
                 return true;
 
             case KeyEvent.KEYCODE_BACK:
+                // 回看中：返回键回到直播，而不是退出
+                if (catchup != null) {
+                    exitCatchup("已回到直播");
+                    return true;
+                }
                 showExitDialog();
                 return true;
 
@@ -2663,6 +3088,13 @@ public class LivePlayActivity extends AppCompatActivity {
             showEpgDialog();
             return true;
         }
+        if (catchup != null
+                && (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)) {
+            // 回看中长按左/右：快退 / 快进 5 分钟
+            sourceKeyLongPressed = true;
+            seekCatchup(keyCode == KeyEvent.KEYCODE_DPAD_LEFT ? -CATCHUP_SEEK_LONG_MS : CATCHUP_SEEK_LONG_MS);
+            return true;
+        }
         if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
             // 长按左/右：打开当前频道线路管理（列表未显示，无需还原光标）
             sourceKeyLongPressed = true;
@@ -2700,12 +3132,22 @@ public class LivePlayActivity extends AppCompatActivity {
                 sourceKeyLongPressed = false;
                 return true;
             }
+            // 回看中：左键快退 30 秒（不换线路）
+            if (catchup != null) {
+                seekCatchup(-CATCHUP_SEEK_MS);
+                return true;
+            }
             switchToPrevSource();
             return true;
         }
         if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
             if (sourceKeyLongPressed) {
                 sourceKeyLongPressed = false;
+                return true;
+            }
+            // 回看中：右键快进 30 秒
+            if (catchup != null) {
+                seekCatchup(CATCHUP_SEEK_MS);
                 return true;
             }
             switchToNextSource();
@@ -3562,9 +4004,13 @@ public class LivePlayActivity extends AppCompatActivity {
         // 不能用 isPlayableUrl：它只校验协议合法，全部测速失败时会误报"N 条可用"，
         // 还会把播放器强行重启到死线路上，再次逐条超时后又弹"全部失败"
         int playable = 0;
+        // RTSP/RTMP/组播直连等"不可测速"线路单独计数：它们不是失败，多半能播
+        int untestable = 0;
         if (event.results != null) {
             for (SpeedTestResult r : event.results) {
-                if (r != null && r.isAvailable()) playable++;
+                if (r == null) continue;
+                if (r.isAvailable()) playable++;
+                else if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) untestable++;
             }
         }
         List<String> lines = tested != null ? tested.getSourceUrls() : null;
@@ -3576,7 +4022,17 @@ public class LivePlayActivity extends AppCompatActivity {
             return;
         }
         if (tested != null && playable > 0) {
-            ToastUtil.show(this, "「" + name + "」测速完成：" + playable + " 条线路可用");
+            ToastUtil.show(this, "「" + name + "」测速完成：" + playable + " 条线路可用"
+                    + (untestable > 0 ? "，" + untestable + " 条不可测速" : ""));
+        } else if (tested != null && untestable > 0) {
+            int total = 0;
+            for (SpeedTestResult r : event.results) if (r != null) total++;
+            if (untestable == total) {
+                ToastUtil.show(this, "「" + name + "」测速完成：线路均无法测速（流式协议或代理忙），仍可尝试播放");
+            } else {
+                ToastUtil.show(this, "「" + name + "」测速完成：" + (total - untestable) + " 条线路测速失败，"
+                        + untestable + " 条无法测速（仍可尝试播放）");
+            }
         } else {
             ToastUtil.show(this, "「" + name + "」测速完成：没有找到可用线路");
         }

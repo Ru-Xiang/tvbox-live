@@ -241,6 +241,9 @@ public final class IpVersionFilter {
      * </ul>
      */
     private static boolean matches(String url, boolean wantIpv6) {
+        // 组播线路要么经局域网里的 udpxy 代理、要么在 IPTV 专网直连，与上网用 IPv4 还是 IPv6 无关：
+        // 按组播组地址（总是 IPv4）判断会在"仅 IPv6"时把它们全部误删
+        if (MulticastUrl.isMulticast(url)) return true;
         String host = extractHost(url);
         if (host == null || host.isEmpty()) {
             // 无法识别主机：目标 IPv6 时无法确认其支持 IPv6，剔除；
@@ -354,6 +357,7 @@ public final class IpVersionFilter {
                 if (ch == null || ch.getSourceUrls() == null) continue;
                 for (String url : ch.getSourceUrls()) {
                     if (hosts.size() >= MAX_PREFETCH_HOSTS) return;
+                    if (MulticastUrl.isMulticast(url)) continue;
                     String host = extractHost(url);
                     if (host == null || host.isEmpty() || isIpLiteral(host)) continue;
                     String key = host.toLowerCase(Locale.ROOT);

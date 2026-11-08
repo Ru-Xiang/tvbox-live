@@ -114,6 +114,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
     private SeekBar sbPlayTimeout;
     private TextView tvPlayTimeoutValue;
 
+    // ============ 播放内核（1.3.0） ============
+    private Spinner spStartBuffer;
+    private CheckBox cbUseOkHttp;
+    private CheckBox cbHwDecodeOnly;
+    private CheckBox cbAudioPassthrough;
+    private CheckBox cbFfmpegAudio;
+    private Button btnUdpxy;
+    private CheckBox cbMulticastDirect;
+
     // ============ 系统 ============
     private CheckBox cbBootStartup;
 
@@ -211,6 +220,13 @@ public class LiveSettingsActivity extends AppCompatActivity {
         tvInfoDurationValue = findViewById(R.id.tv_info_duration_value);
         cbShowSpeedInfo = findViewById(R.id.cb_show_speed_info);
         sbPlayTimeout = findViewById(R.id.sb_play_timeout);
+        spStartBuffer = findViewById(R.id.sp_start_buffer);
+        cbUseOkHttp = findViewById(R.id.cb_use_okhttp);
+        cbHwDecodeOnly = findViewById(R.id.cb_hw_decode_only);
+        cbAudioPassthrough = findViewById(R.id.cb_audio_passthrough);
+        cbFfmpegAudio = findViewById(R.id.cb_ffmpeg_audio);
+        btnUdpxy = findViewById(R.id.btn_udpxy);
+        cbMulticastDirect = findViewById(R.id.cb_multicast_direct);
         tvPlayTimeoutValue = findViewById(R.id.tv_play_timeout_value);
 
         // 系统
@@ -273,6 +289,15 @@ public class LiveSettingsActivity extends AppCompatActivity {
                     new String[]{"系统播放器", "IJK 播放器", "ExoPlayer"});
             playerAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
             spPlayerType.setAdapter(playerAdapter);
+        }
+
+        // 起播速度
+        if (spStartBuffer != null) {
+            ArrayAdapter<String> sbAdapter = new ArrayAdapter<>(this,
+                    android.R.layout.simple_spinner_item,
+                    new String[]{"快速（0.5–0.8 秒）", "均衡（1–1.5 秒）", "稳定（2.5 秒）"});
+            sbAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+            spStartBuffer.setAdapter(sbAdapter);
         }
 
         // 缩放模式
@@ -416,6 +441,18 @@ public class LiveSettingsActivity extends AppCompatActivity {
         if (tvPlayTimeoutValue != null) {
             tvPlayTimeoutValue.setText(playTimeout == 0 ? "关闭" : playTimeout + " 秒");
         }
+
+        // 播放内核
+        if (spStartBuffer != null) {
+            int lv = Hawk.get(HawkConfig.LIVE_START_BUFFER, HawkConfig.DEFAULT_LIVE_START_BUFFER);
+            spStartBuffer.setSelection(Math.max(0, Math.min(2, lv)));
+        }
+        if (cbUseOkHttp != null) cbUseOkHttp.setChecked(Hawk.get(HawkConfig.LIVE_USE_OKHTTP, true));
+        if (cbHwDecodeOnly != null) cbHwDecodeOnly.setChecked(Hawk.get(HawkConfig.LIVE_HW_DECODE_ONLY, true));
+        if (cbAudioPassthrough != null) cbAudioPassthrough.setChecked(Hawk.get(HawkConfig.LIVE_AUDIO_PASSTHROUGH, true));
+        if (cbFfmpegAudio != null) cbFfmpegAudio.setChecked(Hawk.get(HawkConfig.LIVE_FFMPEG_AUDIO, true));
+        if (cbMulticastDirect != null) cbMulticastDirect.setChecked(Hawk.get(HawkConfig.LIVE_MULTICAST_DIRECT, false));
+        updateUdpxyButton();
 
         // 系统：开机自启（默认关闭）
         if (cbBootStartup != null) {
@@ -641,6 +678,9 @@ public class LiveSettingsActivity extends AppCompatActivity {
                 @Override public void onStopTrackingTouch(SeekBar seekBar) {}
             });
         }
+
+        // udpxy 代理地址
+        if (btnUdpxy != null) btnUdpxy.setOnClickListener(v -> showUdpxyDialog());
 
         // 测速启用/禁用联动
         if (cbSpeedTestEnabled != null) {
@@ -887,6 +927,42 @@ public class LiveSettingsActivity extends AppCompatActivity {
                 .show();
     }
 
+    /** 按钮上显示当前的 udpxy 代理 */
+    private void updateUdpxyButton() {
+        if (btnUdpxy == null) return;
+        String base = com.github.tvbox.osc.util.MulticastUrl.normalizeBase(Hawk.get(HawkConfig.LIVE_UDPXY, ""));
+        btnUdpxy.setText("udpxy / msd_lite 代理：" + (base != null ? base : "未设置"));
+    }
+
+    /** 设置 udpxy / msd_lite 代理地址：rtp:// udp:// 组播线路经它转成 HTTP 播放（留空＝不用代理） */
+    private void showUdpxyDialog() {
+        EditText input = new EditText(this);
+        input.setHint("如 192.168.1.1:4022（留空表示不用代理）");
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
+        input.setPadding(40, 20, 40, 20);
+        String cur = Hawk.get(HawkConfig.LIVE_UDPXY, "");
+        if (cur != null) input.setText(cur);
+
+        new AlertDialog.Builder(this)
+                .setTitle("udpxy / msd_lite 代理地址")
+                .setMessage("设置后 rtp://组播地址:端口 会改写成 http://代理/rtp/组播地址:端口 播放，也能测速。"
+                        + "改动后请刷新一次直播源。")
+                .setView(input)
+                .setPositiveButton("保存", (dialog, which) -> {
+                    String raw = input.getText().toString().trim();
+                    if (!raw.isEmpty() && com.github.tvbox.osc.util.MulticastUrl.normalizeBase(raw) == null) {
+                        ToastUtil.show(this, "地址格式不对");
+                        return;
+                    }
+                    Hawk.put(HawkConfig.LIVE_UDPXY, raw);
+                    com.github.tvbox.osc.util.MulticastUrl.reload();
+                    updateUdpxyButton();
+                    ToastUtil.show(this, raw.isEmpty() ? "已取消 udpxy 代理" : "已保存，刷新直播源后生效");
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
     private void showAddCustomSourceDialog() {
         EditText input = new EditText(this);
         input.setHint("请输入直播源URL（支持 M3U/TXT 格式）");
@@ -1031,6 +1107,18 @@ public class LiveSettingsActivity extends AppCompatActivity {
         if (cbShowSpeedInfo != null) putIfChanged(HawkConfig.LIVE_SHOW_SPEED_INFO, cbShowSpeedInfo.isChecked());
         if (sbInfoDuration != null) putIfChanged(HawkConfig.LIVE_CHANNEL_INFO_DURATION, Math.max(1, sbInfoDuration.getProgress()));
         if (sbPlayTimeout != null) putIfChanged(HawkConfig.LIVE_PLAY_TIMEOUT, sbPlayTimeout.getProgress());
+
+        // 播放内核（回到播放页时播放器会重建，改动随之生效）
+        if (spStartBuffer != null) {
+            int pos = spStartBuffer.getSelectedItemPosition();
+            if (pos >= 0 && pos <= 2) putIfChanged(HawkConfig.LIVE_START_BUFFER, pos);
+        }
+        if (cbUseOkHttp != null) putIfChanged(HawkConfig.LIVE_USE_OKHTTP, cbUseOkHttp.isChecked());
+        if (cbHwDecodeOnly != null) putIfChanged(HawkConfig.LIVE_HW_DECODE_ONLY, cbHwDecodeOnly.isChecked());
+        if (cbAudioPassthrough != null) putIfChanged(HawkConfig.LIVE_AUDIO_PASSTHROUGH, cbAudioPassthrough.isChecked());
+        if (cbFfmpegAudio != null) putIfChanged(HawkConfig.LIVE_FFMPEG_AUDIO, cbFfmpegAudio.isChecked());
+        if (cbMulticastDirect != null) putIfChanged(HawkConfig.LIVE_MULTICAST_DIRECT, cbMulticastDirect.isChecked());
+        com.github.tvbox.osc.util.MulticastUrl.reload();
 
         // 系统：开机自启
         if (cbBootStartup != null) putIfChanged(HawkConfig.LIVE_BOOT_STARTUP, cbBootStartup.isChecked());
@@ -1207,12 +1295,17 @@ public class LiveSettingsActivity extends AppCompatActivity {
         if (event.cancelled) return;
         int available = 0;
         int total = 0;
+        // 不可测速线路（RTSP/RTMP/组播直连）不算失败，单独说明、不计入分母
+        int untestable = 0;
         if (event.results != null) {
             total = event.results.size();
             for (com.github.tvbox.osc.bean.SpeedTestResult r : event.results) {
-                if (r != null && r.isAvailable()) available++;
+                if (r == null) continue;
+                if (r.isAvailable()) available++;
+                else if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) untestable++;
             }
         }
+        String untestableNote = untestable > 0 ? "，" + untestable + " 条不可测速" : "";
         if (event.channelKey != null) {
             // 单频道测速：不是一整轮，"上次测速时间"不变，提示里注明频道
             String key = event.channelKey;
@@ -1223,11 +1316,11 @@ public class LiveSettingsActivity extends AppCompatActivity {
                 return;
             }
             ToastUtil.show(this, String.format(java.util.Locale.CHINA,
-                    "「%s」测速完成: %d/%d 条线路可用", name, available, total));
+                    "「%s」测速完成: %d/%d 条线路可用%s", name, available, total - untestable, untestableNote));
             return;
         }
         ToastUtil.show(this, String.format(java.util.Locale.CHINA,
-                "测速完成: %d/%d 个源可用", available, total));
+                "测速完成: %d/%d 个源可用%s", available, total - untestable, untestableNote));
         // 刷新"上次测速时间"显示
         if (tvLastSpeedTestTime != null) {
             long last = Hawk.get(HawkConfig.SPEED_TEST_LAST_TIME, 0L);

@@ -111,6 +111,11 @@ dependencies {
     implementation "com.google.android.exoplayer:exoplayer-rtsp:${rootProject.ext.exoplayerVersion}"
     // RTMP 支持：提供 RtmpDataSource（含 native 库），需在数据源工厂中按协议分发
     implementation "com.google.android.exoplayer:extension-rtmp:${rootProject.ext.exoplayerVersion}"
+    // OkHttp 数据源：与 App 共用连接池，换台复用连接、支持预连接
+    implementation "com.google.android.exoplayer:extension-okhttp:${rootProject.ext.exoplayerVersion}"
+    // FFmpeg 音频解码兜底（Jellyfin 预编译，含 mp3(兼解 MP2)/aac/ac3/eac3/dca/truehd 等）：
+    // 只在系统没有对应解码器时启用，见 player/PlayerRenderers
+    implementation "org.jellyfin.exoplayer:exoplayer-ffmpeg-extension:${rootProject.ext.exoplayerVersion}+1"
 
     // 图片加载
     implementation "com.github.bumptech.glide:glide:${rootProject.ext.glideVersion}"

@@ -926,6 +926,27 @@ public class ChannelManager {
     }
 
     /** 切换到下一个频道 */
+    /**
+     * 只读地取当前频道上/下相邻的频道（不改当前位置），用于起播后预热相邻频道的线路。
+     * 只在当前分组内取；到分组边界返回 null（跨分组的情况少，不值得多预热）。
+     *
+     * @param delta +1=下一个，-1=上一个
+     */
+    public synchronized LiveChannel peekAdjacent(int delta) {
+        try {
+            if (lostPlaying != null) return null;
+            ChannelGroup group = getCurrentGroup();
+            if (group == null) return null;
+            List<LiveChannel> channels = group.getChannels();
+            if (channels == null) return null;
+            int idx = currentChannelIndex + delta;
+            if (idx < 0 || idx >= channels.size()) return null;
+            return channels.get(idx);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     public synchronized LiveChannel nextChannel() {
         // 钉住期间旧位置已被"顶上来"的下一个频道占据：直接播放该位置的频道，
         // 再自增会把它跳过
@@ -1620,12 +1641,18 @@ public class ChannelManager {
      * 断网轮次（见 {@link #KEY_NET_ABORTED_ROUND_AT}）写入的失败同样视为"未测"。
      */
     private int lineStatus(String url, long roundStart, long abortedAt) {
+        // 按当前设置已经播不了的线路（例如关掉 udpxy / 组播直连后列表里残留的 rtp://）：按失败处理，
+        // 不能因为"不可测速"被当成可播的保底线路，让频道留在列表里点进去却没有一条能播
+        if (url != null && !com.github.tvbox.osc.util.ProtocolFilter.isSupported(url)) return ST_FAILED;
         SpeedTestResult r = url == null ? null : speedTestEngine.getCachedResult(url);
         if (r == null) return ST_UNTESTED;
         if (roundStart > 0 && r.getTestTime() < roundStart) return ST_UNTESTED;
         if (SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) return ST_UNTESTABLE;
         if (r.isAvailable()) return ST_OK;
         if (abortedAt > 0 && abortedAt >= roundStart && r.getTestTime() >= abortedAt) return ST_UNTESTED;
+        // 当前设置下可播的组播线路测速失败按"未测"算：udpxy 宕机/并发满时所有组播线路一起失败，
+        // 与线路坏了分不清；按失败算会让只有组播线路的频道整个从列表和本地播放列表里消失
+        if (url != null && com.github.tvbox.osc.util.MulticastUrl.isMulticast(url)) return ST_UNTESTED;
         return ST_FAILED;
     }
 
@@ -2108,6 +2135,10 @@ public class ChannelManager {
                             if (url == null) continue;
                             int st = lineStatus(url, roundStart, 0L);
                             if (st != ST_OK && st != ST_FAILED) continue;
+                            // 当前设置下可播的组播线路测速失败不删：udpxy 代理宕机 / 并发满了时所有组播线路
+                            // 一起失败，与线路本身坏了分不清（设置关掉后残留的组播线路仍按失败删除）
+                            if (st == ST_FAILED && com.github.tvbox.osc.util.MulticastUrl.isMulticast(url)
+                                    && com.github.tvbox.osc.util.ProtocolFilter.isSupported(url)) continue;
                             tested++;
                             if (st != ST_FAILED) continue;
                             failed++;
@@ -2383,9 +2414,9 @@ public class ChannelManager {
      * 优先取"本轮测速可用"的线路，比较规则与线路重排一致（见 {@link #compareAvailable}：
      * 当前排序模式的主键 → 另一指标 → 原顺序），保证同分时与播放的首条是同一条。
      *
-     * <p>没有可用线路时依次回退：无法测速的协议线路（RTSP/RTMP）→ 未测线路
-     * （无记录、被单轮配额截断、早于本轮的旧结果、断网轮次的失败；取列表中第一条，
-     * 重排后未测线路排在失败线路之前）→ 黑屏线路（测速无视频轨或播放时标记黑屏；
+     * <p>没有可用线路时依次回退：无法测速的协议线路（RTSP/RTMP）与未测线路
+     * （无记录、被单轮配额截断、早于本轮的旧结果、断网轮次的失败）中列表里靠前的一条
+     * （与重排后的顺序一致：两者同属一档、保持原顺序，本地列表首条与 App 内首条相同）→ 黑屏线路（测速无视频轨或播放时标记黑屏；
      * 广播/电台类频道不按黑屏处理）→ 用户置顶线路。
      * <b>只有全部线路都在本轮明确失败时返回 null</b>，由调用方把该频道从节目列表中剔除，
      * 避免用户点进去只能黑屏/转圈。原先只要测过的线路都失败就剔除整个频道，
@@ -2397,8 +2428,8 @@ public class ChannelManager {
 
         String bestUrl = null;
         SpeedTestResult best = null;
-        String untestableUrl = null;    // 无法测速但可能可播的线路（RTSP/RTMP）
-        String untestedUrl = null;      // 本轮未测到的线路
+        // 无法测速但可能可播的线路（RTSP/RTMP）或本轮未测到的线路：取列表中靠前的一条
+        String fallbackUrl = null;
         String blackUrl = null;         // 黑屏线路（能连上但没画面），最后才用
         // 广播/电台类频道本来没有画面，不按黑屏处理
         final boolean audio = LineQuality.isAudioChannel(channel);
@@ -2410,8 +2441,8 @@ public class ChannelManager {
                 if (r == null) {
                     if (!audio && LineQuality.isBlackLine(url, null)) {
                         if (blackUrl == null) blackUrl = url;
-                    } else if (untestedUrl == null) {
-                        untestedUrl = url;
+                    } else if (fallbackUrl == null) {
+                        fallbackUrl = url;
                     }
                     continue;
                 }
@@ -2428,19 +2459,15 @@ public class ChannelManager {
                 if (!audio && LineQuality.isBlackLine(url, null)) {
                     // 播放时被标记为黑屏
                     if (blackUrl == null) blackUrl = url;
-                } else if (st == ST_UNTESTABLE) {
-                    if (untestableUrl == null) untestableUrl = url;
-                } else if (untestedUrl == null) {
-                    untestedUrl = url;
+                } else if (fallbackUrl == null) {
+                    fallbackUrl = url;
                 }
             }
         }
 
         if (bestUrl != null) return bestUrl;
-        // 无可用线路，但有无法测速的协议线路 → 保留它
-        if (untestableUrl != null) return untestableUrl;
-        // 有本轮未测到的线路 → 保留它，避免误删
-        if (untestedUrl != null) return untestedUrl;
+        // 无可用线路，但有无法测速的协议线路或本轮未测到的线路 → 保留它，避免误删
+        if (fallbackUrl != null) return fallbackUrl;
         // 只剩黑屏线路 → 仍然保留（可能只是暂时没画面），不因此隐藏频道
         if (blackUrl != null) return blackUrl;
         // 用户置顶的线路（用户确认能播）→ 保留

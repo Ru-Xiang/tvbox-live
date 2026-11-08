@@ -1,5 +1,6 @@
 package com.github.tvbox.osc.player;
 
+import android.content.Context;
 import android.net.Uri;
 
 import androidx.annotation.NonNull;
@@ -24,6 +25,8 @@ import java.util.Map;
  *
  * <ul>
  *   <li>{@code rtmp://} / {@code rtmpe://} 等 → RtmpDataSource（extension-rtmp 提供）</li>
+ *   <li>{@code rtp://} / {@code udp://} → {@link MulticastDataSource}（组播直连；设置了 udpxy 时
+ *       地址在起播前已改写成 HTTP，不会走到这里）</li>
  *   <li>其它（http/https/file/content…） → 传入的默认数据源</li>
  * </ul>
  *
@@ -32,14 +35,16 @@ import java.util.Map;
  */
 public class SchemeDataSourceFactory implements DataSource.Factory {
 
+    private final Context appContext;
     private final DataSource.Factory defaultFactory;
     @Nullable
     private final DataSource.Factory rtmpFactory;
 
     /**
-     * @param defaultFactory 默认数据源工厂（一般为 DefaultHttpDataSource.Factory）
+     * @param defaultFactory 默认数据源工厂（OkHttpDataSource 或 DefaultHttpDataSource 的工厂）
      */
-    public SchemeDataSourceFactory(DataSource.Factory defaultFactory) {
+    public SchemeDataSourceFactory(Context context, DataSource.Factory defaultFactory) {
+        this.appContext = context.getApplicationContext();
         this.defaultFactory = defaultFactory;
         this.rtmpFactory = createRtmpFactory();
     }
@@ -63,6 +68,7 @@ public class SchemeDataSourceFactory implements DataSource.Factory {
     @Override
     public DataSource createDataSource() {
         return new SchemeDispatchingDataSource(
+                appContext,
                 defaultFactory.createDataSource(),
                 rtmpFactory != null ? rtmpFactory.createDataSource() : null);
     }
@@ -70,15 +76,21 @@ public class SchemeDataSourceFactory implements DataSource.Factory {
     /** 在 open() 时按协议选择底层数据源的包装实现 */
     private static class SchemeDispatchingDataSource implements DataSource {
 
+        private final Context appContext;
         private final DataSource defaultSource;
         @Nullable
         private final DataSource rtmpSource;
+        /** 组播数据源按需创建（绝大多数线路用不到，不必每次都建） */
+        @Nullable
+        private DataSource multicastSource;
         private final List<TransferListener> pendingListeners = new ArrayList<>();
 
         @Nullable
         private DataSource active;
 
-        SchemeDispatchingDataSource(DataSource defaultSource, @Nullable DataSource rtmpSource) {
+        SchemeDispatchingDataSource(Context appContext, DataSource defaultSource,
+                                    @Nullable DataSource rtmpSource) {
+            this.appContext = appContext;
             this.defaultSource = defaultSource;
             this.rtmpSource = rtmpSource;
         }
@@ -91,6 +103,9 @@ public class SchemeDataSourceFactory implements DataSource.Factory {
             if (rtmpSource != null) {
                 rtmpSource.addTransferListener(transferListener);
             }
+            if (multicastSource != null) {
+                multicastSource.addTransferListener(transferListener);
+            }
         }
 
         @Override
@@ -101,10 +116,17 @@ public class SchemeDataSourceFactory implements DataSource.Factory {
 
         private DataSource select(@Nullable Uri uri) {
             String scheme = uri != null ? uri.getScheme() : null;
-            if (scheme != null && rtmpSource != null) {
+            if (scheme != null) {
                 String s = scheme.toLowerCase(Locale.ROOT);
-                if (s.startsWith("rtmp")) {
+                if (rtmpSource != null && s.startsWith("rtmp")) {
                     return rtmpSource;
+                }
+                if (s.equals("rtp") || s.equals("udp")) {
+                    if (multicastSource == null) {
+                        multicastSource = new MulticastDataSource(appContext);
+                        for (TransferListener l : pendingListeners) multicastSource.addTransferListener(l);
+                    }
+                    return multicastSource;
                 }
             }
             return defaultSource;

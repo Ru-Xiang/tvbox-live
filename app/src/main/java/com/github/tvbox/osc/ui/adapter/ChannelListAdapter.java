@@ -162,7 +162,22 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
         // 监听器只在创建 ViewHolder 时设置一次。
         // 若放在 onBindViewHolder 中，每次绑定都会新建 3 个 lambda 实例，
         // 列表快速滑动时产生大量临时对象，加重低内存设备的 GC 压力。
-        view.setOnFocusChangeListener((v, hasFocus) -> animateFocus(v, hasFocus));
+        view.setOnFocusChangeListener((v, hasFocus) -> {
+            animateFocus(v, hasFocus);
+            if (hasFocus) {
+                // 焦点停留 300ms 才预热该频道的线路（快速滚动经过的条目不预热），
+                // 按 OK 起播时 DNS / 连接已就绪
+                v.removeCallbacks(holder.prewarm);
+                v.postDelayed(holder.prewarm, 300);
+            } else {
+                v.removeCallbacks(holder.prewarm);
+            }
+        });
+        holder.prewarm = () -> {
+            if (!holder.itemView.hasFocus() && !holder.itemView.isFocused()) return;
+            LiveChannel c = getItem(holder.getBindingAdapterPosition());
+            if (c != null) com.github.tvbox.osc.player.PlayerNet.prewarm(c.getCurrentSourceUrl());
+        };
         view.setOnClickListener(v -> {
             int pos = holder.getBindingAdapterPosition();
             LiveChannel c = getItem(pos);
@@ -335,6 +350,8 @@ public class ChannelListAdapter extends RecyclerView.Adapter<ChannelListAdapter.
     }
 
     static class ChannelViewHolder extends RecyclerView.ViewHolder {
+        /** 焦点停留后的线路预热任务（onCreateViewHolder 里赋值一次） */
+        Runnable prewarm;
         final ImageView ivLogo;
         final ImageView ivFavorite;
         final TextView tvName;

@@ -48,6 +48,31 @@ public final class LineQuality {
         protected boolean removeEldestEntry(Map.Entry<String, Obs> eldest) {
             return size() > MAX_ENTRIES;
         }
+
+        // 键去掉回看元数据（见 StreamUrl.withoutMeta）：线路补上回看模板后黑屏/分辨率记录仍然对得上
+        @Override
+        public Obs get(Object key) {
+            return super.get(norm(key));
+        }
+
+        @Override
+        public Obs put(String key, Obs value) {
+            return super.put(StreamUrl.withoutMeta(key), value);
+        }
+
+        @Override
+        public Obs remove(Object key) {
+            return super.remove(norm(key));
+        }
+
+        @Override
+        public boolean containsKey(Object key) {
+            return super.containsKey(norm(key));
+        }
+
+        private Object norm(Object key) {
+            return key instanceof String ? StreamUrl.withoutMeta((String) key) : key;
+        }
     };
     private static boolean loaded;
     private static final ExecutorService IO = Executors.newSingleThreadExecutor(r -> {
