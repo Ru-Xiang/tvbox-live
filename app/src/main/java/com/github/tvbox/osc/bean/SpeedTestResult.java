@@ -62,6 +62,11 @@ public class SpeedTestResult implements Serializable {
      * 否则会按渐进式流打开而黑屏。
      */
     private boolean hls;
+    /**
+     * 实时倍率（1.3.2）：收到的内容时长 ÷ 花掉的时间，见 MediaClock。
+     * HLS 分片常在 3–10×，直播直链 / RTMP / 组播健康的约 1× 以上，&lt;1 表示跟不上。0 表示未知
+     */
+    private double realtime;
 
     /** 测速时探测到的视频轨情况：VIDEO_UNKNOWN / VIDEO_PRESENT / VIDEO_MISSING（只有音频） */
     private int videoState;
@@ -162,6 +167,9 @@ public class SpeedTestResult implements Serializable {
 
     public boolean isHls() { return hls; }
     public void setHls(boolean hls) { this.hls = hls; }
+
+    public double getRealtime() { return realtime; }
+    public void setRealtime(double realtime) { this.realtime = realtime; }
 
     /** 是否为超时失败（用于智能重试判定） */
     public boolean isTimeoutFailure() {

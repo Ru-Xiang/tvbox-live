@@ -11,7 +11,7 @@ import com.github.tvbox.osc.bean.SpeedTestResult;
  * 得到综合质量评分，用于源排序、最佳源选择、清理策略等。
  *
  * 权重分配（总和 = 100）：
- *   下载速度（Speed）   45%
+ *   速度（Speed）       45%  —— 1.3.2 起有实时倍率时按实时倍率打分（见 scoreRealtime），没有才按 KB/s
  *   分辨率（Resolution） 25%
  *   延迟（Latency）      20%
  *   编码格式（Codec）    10%
@@ -65,13 +65,18 @@ public final class StreamQualityScorer {
         // 否则 60 KB/s 的 1080P 线路会排在 300 KB/s 的流畅直链前面。
         // 速度足够（ratio=1）或未声明码率（直链、媒体列表）时评分与以前完全一致。
         long bandwidth = result.getBandwidth();
-        if (bandwidth > 0) {
+        double rt = result.getRealtime();
+        if (bandwidth > 0 || rt > 0) {
+            // 跟得上的程度：优先用实测的实时倍率，没有才用"实测速度 / 声明码率"
             double needKBps = bandwidth / 8.0 / 1024.0;
-            double ratio = needKBps > 0 ? Math.max(0, Math.min(1, result.getSpeed() / needKBps)) : 1;
+            // 实时倍率 ≥0.9 视为跟得上（测量误差内），不再重复扣分辨率 / 编码的分
+            double ratio = rt > 0 ? (rt >= 0.9 ? 1 : rt / 0.9)
+                    : needKBps > 0 ? Math.max(0, Math.min(1, result.getSpeed() / needKBps)) : 1;
             if (res > RES_UNKNOWN) res = RES_UNKNOWN + (res - RES_UNKNOWN) * ratio;
             if (codec > CODEC_UNKNOWN) codec = CODEC_UNKNOWN + (codec - CODEC_UNKNOWN) * ratio;
         }
-        double s = scoreSpeed(result.getSpeed()) * W_SPEED
+        double speedScore = speedComponent(result);
+        double s = speedScore * W_SPEED
                 + res * W_RES
                 + scoreLatency(result.getLatency()) * W_LATENCY
                 + codec * W_CODEC;
@@ -86,6 +91,45 @@ public final class StreamQualityScorer {
         return scoreSpeed(effSpeed) * (W_SPEED + W_CODEC)
                 + scoreResolution(resolution) * W_RES
                 + 60 * W_LATENCY; // 未知延迟给中位值
+    }
+
+    /**
+     * 速度项得分（0–100），评分与"按速度"排序共用同一个值，保证两种排序口径一致、比较满足全序。
+     * <ul>
+     *   <li>HLS 有实时倍率：按余量打分（{@link #scoreRealtime}，1× 刚好 50 分，3× 满分）；</li>
+     *   <li>推流类（直链 / RTMP / 组播，服务器按实时速度推）有实时倍率：健康的上限就是 1× 左右，
+     *       达到 0.95× 即 90 分，开头突发越大越接近满分；跟不上的扣分与 HLS 相同；</li>
+     *   <li>没有实时倍率：按 KB/s；其中 HLS 的 KB/s 是下载带宽，封顶 75 分，不让它仅凭带宽排到最前。</li>
+     * </ul>
+     */
+    public static double speedComponent(SpeedTestResult r) {
+        if (r == null) return 0;
+        double rt = r.getRealtime();
+        if (rt > 0 && !Double.isNaN(rt)) return r.isHls() ? scoreRealtime(rt) : scorePacedRealtime(rt);
+        double s = scoreSpeed(r.getSpeed());
+        return r.isHls() ? Math.min(s, 75) : s;
+    }
+
+    /** 推流类线路的实时倍率打分：≥0.95× 为 90–100 分（突发余量越大越高，2× 封顶），低于 0.95× 迅速扣分 */
+    static double scorePacedRealtime(double rt) {
+        if (rt <= 0) return 0;
+        if (rt < 0.85) return rt / 0.85 * 30;
+        if (rt < 0.95) return 30 + (rt - 0.85) / 0.1 * 60;
+        return Math.min(100, 90 + (rt - 0.95) / 1.05 * 10);
+    }
+
+    /**
+     * 实时倍率打分：&lt;0.9 跟不上（0–30）；0.9–1 勉强（30–50）；1× 刚好跟上（50）；
+     * 1–3× 余量越大越稳（50–100）；≥3× 满分
+     */
+    static double scoreRealtime(double rt) {
+        if (rt <= 0) return 0;
+        // 0.95–1× 在测量误差内（首帧、窗口截断），按刚好跟上算
+        if (rt < 0.85) return rt / 0.85 * 30;
+        if (rt < 0.95) return 30 + (rt - 0.85) / 0.1 * 20;
+        if (rt < 1.0) return 50;
+        if (rt >= 3.0) return 100;
+        return 50 + (rt - 1.0) / 2.0 * 50;
     }
 
     private static double scoreSpeed(double kbps) {

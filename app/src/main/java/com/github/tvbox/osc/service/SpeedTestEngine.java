@@ -6,6 +6,7 @@ import com.github.tvbox.osc.bean.LiveChannel;
 import com.github.tvbox.osc.bean.SpeedTestResult;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LineQuality;
+import com.github.tvbox.osc.util.MediaClock;
 import com.github.tvbox.osc.util.MediaProbe;
 import com.github.tvbox.osc.util.PlaybackGate;
 import com.github.tvbox.osc.util.ProtocolFilter;
@@ -381,6 +382,7 @@ public class SpeedTestEngine {
                 r.setFailureType(optStr(o, compact ? "f" : "failureType"));
                 r.setHls(o.optBoolean("h", false));
                 r.setVideoState(o.optInt("v", SpeedTestResult.VIDEO_UNKNOWN));
+                r.setRealtime(clampRealtime(o.optDouble("x", 0)));
                 resultCache.put(url, r);
             }
             Timber.d("从持久化恢复测速缓存: %d 条", resultCache.size());
@@ -453,6 +455,7 @@ public class SpeedTestEngine {
                 if (r.getFailureType() != null) o.put("f", r.getFailureType());
                 if (r.isHls()) o.put("h", true);
                 if (r.getVideoState() != SpeedTestResult.VIDEO_UNKNOWN) o.put("v", r.getVideoState());
+                if (r.getRealtime() > 0) o.put("x", Math.round(r.getRealtime() * 100) / 100.0);
                 arr.put(o);
             }
             String out = arr.toString();
@@ -878,7 +881,8 @@ public class SpeedTestEngine {
                     // 若写入缓存会让新一轮/线路过滤把好线路当成不可用
                     if (cancelled.get()) return;
 
-                    // 计算综合评分
+                    // 与上次结果加权平滑，再计算综合评分
+                    smoothWithPrevious(result, resultCache.get(task.url));
                     try { StreamQualityScorer.score(result); } catch (Exception ignore) {}
                     // RTSP 只确认在线、没有速度：评分压到最低的正数——排在所有实测可用线路之后，
                     // 仍在未测 / 不可测速 / 失败线路之前
@@ -1586,6 +1590,15 @@ public class SpeedTestEngine {
     private static final int STABILITY_WINDOW = 4;
     /** 稳定性波动阈值（窗口极差/均值低于此值即认为稳定） */
     private static final double STABILITY_THRESHOLD = 0.15;
+    /** 最后一块数据之后空等超过这么久算"卡住" */
+    private static final long STALL_MS = 500;
+    /** 能解析时间戳的直链读满这么久再停（见 measureStream） */
+    private static final long DIRECT_WINDOW_MS = 2000;
+    /** 直链最多读这么多（高带宽的有限文件很快就能读满） */
+    private static final long DIRECT_MAX_BYTES = 8L * 1024 * 1024;
+    /** 算实时倍率至少要这么多秒的内容、这么久的墙钟时间，否则结果不可信 */
+    private static final double MIN_MEDIA_SPAN_S = 0.3;
+    private static final long MIN_REALTIME_WALL_MS = 500;
     /** 至少下载字节数；直链在此之前就读到流结束，说明是错误页/短文件而不是直播流 */
     private static final long MIN_BYTES = 64 * 1024;
     /** 单个 HLS 媒体列表最多采样的分片数 */
@@ -1615,6 +1628,44 @@ public class SpeedTestEngine {
     private static final long HLS_MEASURE_BODY_MS = 1500;
     /** 已读正文不足这么多字节时才去读下一个分片（上一个失败或太短） */
     private static final long HLS_MIN_USEFUL_BYTES = 256 * 1024;
+
+    /** 实时倍率上限：再大没有区分意义，还能挡住时间戳异常造成的离谱值 */
+    static final double MAX_REALTIME = 20.0;
+
+    static double clampRealtime(double rt) {
+        if (Double.isNaN(rt) || rt <= 0) return 0;
+        return Math.min(MAX_REALTIME, rt);
+    }
+
+    /** 平滑只用这么新的上次结果 */
+    private static final long SMOOTH_MAX_AGE_MS = 3L * 24 * 3600_000L;
+    /** 平滑时本次结果的权重 */
+    private static final double SMOOTH_NEW_WEIGHT = 0.7;
+
+    /**
+     * 同一条线路的速度与实时倍率和上次结果加权平滑（本次 70%、上次 30%）：单次测速受一时的网络抖动、
+     * 播放让路、CDN 调度影响很大，直接用单次值排序，线路顺序会在两次测速之间来回跳。
+     * 两次都可用才平滑；状态（可用 / 不可用）仍以本次为准，变差时 70% 的权重足够让它马上掉下去。
+     */
+    private static void smoothWithPrevious(SpeedTestResult result, SpeedTestResult prev) {
+        if (result == null || prev == null || prev == result) return;
+        if (!result.isAvailable() || !prev.isAvailable()) return;
+        if (System.currentTimeMillis() - prev.getTestTime() > SMOOTH_MAX_AGE_MS) return;
+        // 两次的度量口径不同就不平滑：HLS 与直链的 KB/s 含义不同；上次没有实时倍率（1.3.1 及以前，
+        // 直链常停在开头突发里、速度虚高）时，速度不混入旧值
+        if (prev.isHls() != result.isHls()) return;
+        boolean prevComparable = prev.getRealtime() > 0 || result.getRealtime() <= 0;
+        if (prevComparable && result.getSpeed() > 0 && prev.getSpeed() > 0) {
+            result.setSpeed(result.getSpeed() * SMOOTH_NEW_WEIGHT + prev.getSpeed() * (1 - SMOOTH_NEW_WEIGHT));
+        }
+        double cur = result.getRealtime(), old = prev.getRealtime();
+        // 只在两次都跟得上（≥1×）时平滑：本次卡顿必须马上体现；上次卡过也不能把本次正常的拖到 1× 以下。
+        // 平滑后最多比本次高 25%：上次 10× 不能把本次 1.2× 抬成"余量充足"
+        if (cur >= 1.0 && old >= 1.0) {
+            double blended = cur * SMOOTH_NEW_WEIGHT + old * (1 - SMOOTH_NEW_WEIGHT);
+            result.setRealtime(Math.min(blended, cur * 1.25));
+        }
+    }
 
     /** 测速失败分类：无异常但没测到数据 / 低于速度阈值（都不触发超时重试） */
     private static final String ZERO_SPEED = "ZERO_SPEED";
@@ -1720,6 +1771,14 @@ public class SpeedTestEngine {
     /** 直链测量结果 */
     private static final class StreamStat {
         double speed;
+        /** 实时倍率，0＝未知 */
+        double realtime;
+        /** 响应头到达后多久才收到第一个带时间戳的数据（计入延迟） */
+        long firstMediaDelayMs;
+        /** 解析到过时间戳（TS / FLV 流） */
+        boolean clockSeen;
+        /** 以卡住结束（超时 / 断开且之前已空等一阵） */
+        boolean stalled;
         long bytes;
         /** 读到了流结束（-1）；直播流不会在测量窗口内结束 */
         boolean eof;
@@ -1729,6 +1788,12 @@ public class SpeedTestEngine {
     /** 单个分片的下载结果 */
     private static final class SegmentStat {
         long bytes;
+        /** 读到的这部分对应多少秒内容（时间戳解析，0＝未知） */
+        double mediaSecs;
+        /** 分片总长度（Content-Length，-1＝未知） */
+        long contentLength = -1;
+        /** 整个分片读完了（读到 -1） */
+        boolean eof;
         /** 响应头到达后读正文的耗时（不含连接/首包等待） */
         long bodyMs;
         long totalMs;
@@ -1860,6 +1925,7 @@ public class SpeedTestEngine {
         }
         if (o.resolution != null) result.setResolution(o.resolution);
         result.setVideoState(o.videoState);
+        result.setRealtime(o.realtime);
         boolean available;
         if (o.speedKBps >= 0) {
             result.setSpeed(o.speedKBps);
@@ -2274,6 +2340,7 @@ public class SpeedTestEngine {
             // 嗅探首块，判断是否为 m3u8 文本
             byte[] head = new byte[8192];
             int headLen = Math.max(0, in.read(head));
+
             boolean isM3u8 = looksLikeM3u8(contentType, finalUrl)
                     || (headLen > 0 && startsWithExtm3u(head, headLen));
 
@@ -2296,16 +2363,28 @@ public class SpeedTestEngine {
                 // 同时保留开头的样本，测完后探测有无视频轨与分辨率
                 Capture cap = new Capture();
                 cap.append(head, 0, headLen);
-                StreamStat st = measureStream(in, headLen, bodyStart, probe, cap);
+                StreamStat st = measureStream(in, head, headLen, bodyStart, probe, cap);
                 if (st.eof && st.bytes < MIN_BYTES) {
                     // 直播流不会这么快结束；短 body 只能是错误页/占位文件
                     throw new Exception("流提前结束（仅 " + (st.bytes / 1024) + " KB），不是有效的直播流");
                 }
                 result.setSpeed(st.speed);
+                result.setRealtime(st.realtime);
+                // 延迟各类线路统一只算到响应头（HLS 也是），首包等待不另加，保持口径一致
                 applyMediaProbe(result, cap);
                 // 窗口结束时仍在出数据、且没有声明长度 → 直播流（速度≈码率）；
                 // 读完了或声明了长度 → 有限文件（速度≈带宽），沿用用户阈值
                 info.liveDirect = !st.eof && st.elapsedMs >= MIN_MEASURE_MS && conn.getContentLength() <= 0;
+                // 解析不出时间戳（MP3 电台、fMP4 直链等）但整个测量期都在持续出数据的直播流：
+                // 至少跟得上实时，记 1×，与其它直链用同一把尺子比较（否则又退回 KB/s 打分）
+                // 只给真正解析不出时间戳、且没有卡住的流：解析到了时间戳却没算出倍率的（内容太少），
+                // 或测量中卡住的，都不能当成"跟得上"。有声明码率（icy-br）就按实测速率 ÷ 声明码率；
+                // 没有就记 0.9×：证明不了跟得上，排在实测 ≥0.95× 的线路之后、明显跟不上的线路之前
+                if (info.liveDirect && result.getRealtime() <= 0 && !st.clockSeen && !st.stalled) {
+                    double rt = info.icyBrKbps > 0
+                            ? clampRealtime(st.speed / (info.icyBrKbps / 8.0)) : 0.9;
+                    result.setRealtime(rt > 0 ? rt : 0.9);
+                }
                 String ct = contentType == null ? "" : contentType.toLowerCase(Locale.ROOT);
                 info.audio = ct.startsWith("audio/")
                         || conn.getHeaderField("icy-name") != null
@@ -2352,6 +2431,7 @@ public class SpeedTestEngine {
         if (segments.isEmpty()) {
             throw new Exception("m3u8 无可用分片");
         }
+        Map<String, Double> durations = parseSegmentDurations(playlistUrl, content);
 
         // 最新分片优先：最接近播放器实际请求的位置，也最不容易已从 CDN 过期；其余按采样顺序兜底
         List<String> sampled = new ArrayList<>();
@@ -2363,6 +2443,11 @@ public class SpeedTestEngine {
         long bodyBytes = 0;
         long bodyMs = 0;
         long totalMs = 0;
+        // 实时倍率：读到的内容时长 ÷ 读它花的时间（只统计能得出内容时长的分片）
+        double mediaSecs = 0;
+        long mediaMs = 0;
+        long fullSegBytes = 0;
+        double fullSegSecs = 0;
         boolean timedOut = false;
         int lastHttp = 0;
         Exception lastErr = null;
@@ -2382,6 +2467,22 @@ public class SpeedTestEngine {
                 bodyBytes += r.bytes;
                 bodyMs += r.bodyMs;
                 totalMs += r.totalMs;
+                // 内容时长：优先按时间戳；解析不了（fMP4 等）时按"读到的比例 × #EXTINF 时长"
+                double secs = r.mediaSecs;
+                if (secs <= 0 && r.contentLength > 0) {
+                    Double d = durations.get(seg);
+                    if (d != null && d > 0) secs = d * Math.min(1.0, (double) r.bytes / r.contentLength);
+                }
+                if (secs > 0) {
+                    mediaSecs += secs;
+                    mediaMs += r.bodyMs >= MIN_SEGMENT_BODY_MS ? r.bodyMs : r.totalMs;
+                }
+                // 完整读完的分片：记下字节数与 #EXTINF 时长，最后兜底算内容码率
+                Double fd = durations.get(seg);
+                if (r.eof && fd != null && fd > 0) {
+                    fullSegBytes += r.bytes;
+                    fullSegSecs += fd;
+                }
             } else {
                 // 没拿到数据的分片不计耗时，一个卡住的分片不拉低本来正常的线路
                 if (r.timeout) timedOut = true;
@@ -2396,6 +2497,16 @@ public class SpeedTestEngine {
             long ms = bodyMs >= MIN_SEGMENT_BODY_MS ? bodyMs : totalMs;
             if (ms <= 0) ms = 1;
             result.setSpeed((bodyBytes / 1024.0) / (ms / 1000.0));
+            if (mediaSecs >= MIN_MEDIA_SPAN_S && mediaMs > 0) {
+                result.setRealtime(clampRealtime(mediaSecs / (Math.max(MIN_SEGMENT_BODY_MS, mediaMs) / 1000.0)));
+            } else if (result.getBandwidth() > 0) {
+                // 内容时长都拿不到：用清单声明的码率估算
+                result.setRealtime(clampRealtime(result.getSpeed() / (result.getBandwidth() / 8.0 / 1024.0)));
+            } else if (fullSegBytes > 0 && fullSegSecs > 0) {
+                // 也没声明码率：用完整读完的分片算出内容码率（字节 ÷ #EXTINF 时长）
+                double rateKBps = fullSegBytes / 1024.0 / fullSegSecs;
+                if (rateKBps > 0) result.setRealtime(clampRealtime(result.getSpeed() / rateKBps));
+            }
             applyMediaProbe(result, cap);
             return;
         }
@@ -2413,16 +2524,34 @@ public class SpeedTestEngine {
      * @param start     计时起点（响应头到达时刻，早于预读，预读耗时也计入）
      * @param cap       媒体样本（可为 null）：读到的数据顺带保留开头一段
      */
-    private StreamStat measureStream(InputStream in, int prefixLen, long start, Probe probe, Capture cap) throws Exception {
+    private StreamStat measureStream(InputStream in, byte[] prefix, int prefixLen, long start, Probe probe,
+                                     Capture cap) throws Exception {
         StreamStat st = new StreamStat();
         byte[] buffer = new byte[16 * 1024];
         long totalBytes = Math.max(0, prefixLen);
         long lastTime = start;
         long lastBytes = 0;
+        long lastDataAt = prefixLen > 0 ? System.currentTimeMillis() : -1;
         List<Double> samples = new ArrayList<>();
+        // 解析媒体时间戳：算"收到多少秒内容"，得出实时倍率（见 MediaClock）
+        MediaClock clock = new MediaClock();
+        // 实时倍率从"解析到第一个时间戳"起计时：之前的等待（按需回源、首个关键帧前的空档）
+        // 不是"跟不上"，算进分母会让正好 1× 的流测成 0.7×；这段等待另计入延迟
+        long clockStartAt = -1;
+        if (prefixLen > 0) {
+            clock.feed(prefix, 0, prefixLen);
+            if (clock.hasTimestamp()) clockStartAt = System.currentTimeMillis();
+        }
+        // 是否因为读满窗口 / 字节上限而结束（否则是超时、断开：最后一块数据之后的空等也要算进去）
+        boolean windowEnd = false;
+        boolean stableBreak = false;
 
         while (true) {
             if (System.currentTimeMillis() >= probe.deadline) break;
+            if (totalBytes >= DIRECT_MAX_BYTES) {
+                windowEnd = true;
+                break;
+            }
 
             int n;
             try {
@@ -2438,8 +2567,20 @@ public class SpeedTestEngine {
             }
             totalBytes += n;
             if (cap != null) cap.append(buffer, 0, n);
+            clock.feed(buffer, 0, n);
 
             long now = System.currentTimeMillis();
+            lastDataAt = now;
+            if (clockStartAt < 0 && clock.hasTimestamp()) clockStartAt = now;
+            long elapsed = now - start;
+            // 能解析时间戳的流（TS / FLV）读满固定窗口：直播服务器开头常突发一段 GOP 缓存（按带宽发），
+            // 若在突发阶段就判"稳定"提前停下，测到的是带宽；读到后面才是实时推送的码率——同一条线路两次结果能差几倍。
+            // 读满窗口后，实时倍率同时反映"跟不跟得上"和"突发有多大"
+            boolean clockKnown = clock.spanSeconds() > 0;
+            if (clockKnown && clockStartAt > 0 && now - clockStartAt >= DIRECT_WINDOW_MS) {
+                windowEnd = true;
+                break;
+            }
             long dt = now - lastTime;
             if (dt >= 100) { // 每 ~100ms 采样一次瞬时速度
                 double inst = (totalBytes - lastBytes) / 1024.0 / (dt / 1000.0); // KB/s
@@ -2447,18 +2588,20 @@ public class SpeedTestEngine {
                 lastTime = now;
                 lastBytes = totalBytes;
 
-                long elapsed = now - start;
-                if (elapsed >= MIN_MEASURE_MS && totalBytes >= MIN_BYTES && samples.size() >= STABILITY_WINDOW) {
+                // 解析不了时间戳的流（fMP4、MP3 等）：沿用"速度稳定即停"
+                if (!clockKnown && elapsed >= MIN_MEASURE_MS && totalBytes >= MIN_BYTES
+                        && samples.size() >= STABILITY_WINDOW) {
                     List<Double> window = samples.subList(samples.size() - STABILITY_WINDOW, samples.size());
                     double mean = 0;
                     double mn = Double.MAX_VALUE, mx = 0;
-                    for (double s : window) {
-                        mean += s;
-                        mn = Math.min(mn, s);
-                        mx = Math.max(mx, s);
+                    for (double v : window) {
+                        mean += v;
+                        mn = Math.min(mn, v);
+                        mx = Math.max(mx, v);
                     }
                     mean /= window.size();
                     if (mean > 0 && (mx - mn) / mean < STABILITY_THRESHOLD) {
+                        stableBreak = true;
                         break; // 速度已稳定
                     }
                 }
@@ -2469,6 +2612,26 @@ public class SpeedTestEngine {
         st.bytes = totalBytes;
         st.elapsedMs = totalTime;
         st.speed = (totalTime > 0 && totalBytes > 0) ? (totalBytes / 1024.0) / (totalTime / 1000.0) : 0;
+        // 实时倍率：内容时长 ÷ 从第一个时间戳到结束的时间。读满窗口时结束于最后一块数据；
+        // 超时 / 断开 / 预算用完时结束于循环退出——吐完缓存就卡住的线路，卡住的时间必须算进去
+        double span = clock.spanSeconds();
+        long loopEnd = System.currentTimeMillis();
+        st.clockSeen = clock.hasTimestamp();
+        // 卡住：不是读满窗口、也不是速度稳定后停的，而是超时 / 断开，且最后一块数据之后空等了一阵
+        st.stalled = !windowEnd && !stableBreak
+                && (probe.expired || (lastDataAt > 0 ? loopEnd - lastDataAt : totalTime) > STALL_MS);
+        if (clockStartAt > 0) {
+            long wallMs = (windowEnd ? lastDataAt : loopEnd) - clockStartAt;
+            if (wallMs >= MIN_REALTIME_WALL_MS) {
+                if (span >= MIN_MEDIA_SPAN_S) {
+                    st.realtime = clampRealtime(span / (wallMs / 1000.0));
+                } else if (st.stalled) {
+                    // 只收到一点内容就卡住了：给出一个很低的倍率（明确"跟不上"），而不是未知
+                    st.realtime = clampRealtime(Math.max(0.01, span / (wallMs / 1000.0)));
+                }
+            }
+            st.firstMediaDelayMs = Math.max(0, clockStartAt - start);
+        }
         return st;
     }
 
@@ -2491,8 +2654,14 @@ public class SpeedTestEngine {
                 return st;
             }
             bodyStart = System.currentTimeMillis();
+            try {
+                String cl = resp.conn.getHeaderField("Content-Length");
+                if (cl != null) st.contentLength = Long.parseLong(cl.trim());
+            } catch (Exception ignore) {
+            }
             in = resp.conn.getInputStream();
             byte[] buffer = new byte[16 * 1024];
+            MediaClock clock = new MediaClock();
             while (true) {
                 long now = System.currentTimeMillis();
                 if (now >= probe.deadline) break;
@@ -2500,10 +2669,15 @@ public class SpeedTestEngine {
                 if (body >= maxBodyMs || st.bytes >= fastMaxBytes) break;
                 if (st.bytes >= maxBytes && body >= HLS_FAST_BODY_MS) break;
                 int n = in.read(buffer);
-                if (n == -1) break;
+                if (n == -1) {
+                    st.eof = true;
+                    break;
+                }
                 st.bytes += n;
                 if (cap != null) cap.append(buffer, 0, n);
+                clock.feed(buffer, 0, n);
             }
+            st.mediaSecs = clock.spanSeconds();
             // 读完即计时：读到一半停下时关闭连接要丢弃剩余正文（最多约 100ms），不能算进下载耗时
             readEnd = System.currentTimeMillis();
         } catch (Exception e) {
@@ -2802,6 +2976,31 @@ public class SpeedTestEngine {
     }
 
     /** 解析媒体播放列表中的分片 URL（绝对化） */
+    /** 媒体列表里每个分片的时长（#EXTINF，秒），按解析后的分片地址索引 */
+    private Map<String, Double> parseSegmentDurations(String baseUrl, String content) {
+        Map<String, Double> out = new java.util.HashMap<>();
+        double pending = -1;
+        for (String raw : content.split("\\r?\\n")) {
+            String line = stripBom(raw.trim());
+            if (line.isEmpty()) continue;
+            if (line.startsWith("#EXTINF:")) {
+                String v = line.substring(8);
+                int comma = v.indexOf(',');
+                if (comma >= 0) v = v.substring(0, comma);
+                try {
+                    pending = Double.parseDouble(v.trim());
+                } catch (NumberFormatException e) {
+                    pending = -1;
+                }
+                continue;
+            }
+            if (line.startsWith("#")) continue;
+            if (pending > 0) out.put(resolveUrl(baseUrl, line), pending);
+            pending = -1;
+        }
+        return out;
+    }
+
     private List<String> parseSegments(String baseUrl, String content) {
         List<String> segments = new ArrayList<>();
         for (String raw : content.split("\\r?\\n")) {

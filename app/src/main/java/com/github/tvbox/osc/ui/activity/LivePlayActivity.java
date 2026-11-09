@@ -3347,6 +3347,18 @@ public class LivePlayActivity extends AppCompatActivity {
         return null;
     }
 
+    /** 当前线路的实时倍率（测速缓存里的），未知返回 0 */
+    private double getSourceRealtime(LiveChannel ch) {
+        try {
+            String url = ch.getCurrentSourceUrl();
+            if (url == null || speedTestEngine == null) return 0;
+            SpeedTestResult r = speedTestEngine.getCachedResult(url);
+            return r != null && r.isAvailable() ? r.getRealtime() : 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
     /** 是否为无法用 HTTP 测速的流式协议（RTSP/RTMP 等） */
     private boolean isStreamProtocol(String url) {
         return url != null && !url.trim().isEmpty()
@@ -3414,7 +3426,10 @@ public class LivePlayActivity extends AppCompatActivity {
             Double cur = showSpeed ? getSourceSpeedKbps(channel) : null;
             if (cur != null && cur > 0) {
                 tvSpeedInfo.setVisibility(View.VISIBLE);
-                tvSpeedInfo.setText(String.format("%.0f KB/s", cur));
+                // 附上实时倍率：HLS 显示的是下载带宽、直链是码率，KB/s 本身不能横向比，倍率可以
+                double rt = getSourceRealtime(channel);
+                tvSpeedInfo.setText(String.format(java.util.Locale.ROOT, "%.0f KB/s", cur)
+                        + (rt > 0 ? String.format(java.util.Locale.ROOT, " · %.1f×", Math.min(rt, 99)) : ""));
             } else if (cur != null && cur < 0) {
                 // RTSP：探测确认在线，不知道速度
                 tvSpeedInfo.setVisibility(View.VISIBLE);

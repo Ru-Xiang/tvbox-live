@@ -107,6 +107,10 @@ public final class StreamProbe {
         long latencyMs = -1;
         /** 码率 KB/s；&lt;0 表示不知道（RTSP） */
         double speedKBps = -1;
+        /** 实时倍率（内容时长 ÷ 用时），0＝未知 */
+        double realtime;
+        /** 建连后多久收到第一个带时间戳的数据（计入延迟） */
+        long firstMediaDelayMs;
         /** 分辨率（拉流探测由 MediaProbe 从样本解析；RTSP 取 SDP 里声明的），未知为 null */
         String resolution;
         int videoState = SpeedTestResult.VIDEO_UNKNOWN;
@@ -311,9 +315,14 @@ public final class StreamProbe {
         boolean eof = false;
         boolean windowDone = false;
         String err = null;
+        com.github.tvbox.osc.util.MediaClock clock = new com.github.tvbox.osc.util.MediaClock();
+        // 实时倍率从第一个时间戳起计时（加入组播 / 回源的等待不算"跟不上"）
+        long clockStartAt = -1;
         while (true) {
             long now = SystemClock.elapsedRealtime();
-            if (now - openedAt >= READ_WINDOW_MS || total >= READ_MAX_BYTES) {
+            // 首个时间戳来得晚（加入组播后等关键帧）时，窗口至少覆盖它之后 1.5 秒，否则算不出倍率
+            boolean clockShort = clockStartAt > 0 && now - clockStartAt < 1500;
+            if ((now - openedAt >= READ_WINDOW_MS && !clockShort) || total >= READ_MAX_BYTES) {
                 windowDone = true;
                 break;
             }
@@ -339,6 +348,8 @@ public final class StreamProbe {
             if (firstDataAt < 0) firstDataAt = t;
             lastDataAt = t;
             total += n;
+            clock.feed(buf, 0, n);
+            if (clockStartAt < 0 && clock.hasTimestamp()) clockStartAt = t;
             if (t - openedAt >= BURST_SKIP_MS) lateBytes += n;
             if (sample.size() < SAMPLE_MAX) sample.write(buf, 0, Math.min(n, SAMPLE_MAX - sample.size()));
         }
@@ -364,6 +375,18 @@ public final class StreamProbe {
         } else {
             long span = Math.max(MIN_DATA_SPAN_MS, lastDataAt - openedAt);
             o.speedKBps = total / 1024.0 / (span / 1000.0);
+        }
+        // 实时倍率：内容时长 ÷ 从建连完成到最后一块数据的时间（含开头突发：突发越大说明带宽余量越足）
+        // 读满窗口时结束于最后一块数据；超时 / 断开时结束于循环退出（卡住的时间要算进去）
+        double span = clock.spanSeconds();
+        if (clockStartAt > 0) o.firstMediaDelayMs = Math.max(0, clockStartAt - openedAt);
+        else if (firstDataAt > 0) o.firstMediaDelayMs = Math.max(0, firstDataAt - openedAt);
+        if (clockStartAt > 0) {
+            long end = windowDone ? lastDataAt : SystemClock.elapsedRealtime();
+            long wall = end - clockStartAt;
+            if (span >= 0.3 && wall >= 500) {
+                o.realtime = Math.min(SpeedTestEngine.MAX_REALTIME, span / (wall / 1000.0));
+            }
         }
         // 当场探测画面信息、不保留样本（成功结论会缓存一段时间，带着 512KB 样本太占内存）
         try {

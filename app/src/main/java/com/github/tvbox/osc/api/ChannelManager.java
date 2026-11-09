@@ -7,6 +7,7 @@ import com.github.tvbox.osc.bean.LiveChannel;
 import com.github.tvbox.osc.bean.SpeedTestResult;
 import com.github.tvbox.osc.cache.LiveChannelDatabase;
 import com.github.tvbox.osc.service.SpeedTestEngine;
+import com.github.tvbox.osc.util.StreamQualityScorer;
 import com.github.tvbox.osc.util.ChannelNameMatcher;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.LineQuality;
@@ -1664,11 +1665,29 @@ public class ChannelManager {
         // RTSP "仅在线"（不知道速度）总排在实测到速度的可用线路之后，与按分 / 按速两种模式无关
         boolean oa = SpeedTestEngine.isOnlineUnknownSpeed(a), ob = SpeedTestEngine.isOnlineUnknownSpeed(b);
         if (oa != ob) return oa ? 1 : -1;
-        double sa = safe(a.getSpeed()), sb = safe(b.getSpeed());
         int qa = a.getQualityScore(), qb = b.getQualityScore();
-        int c = byScore ? Integer.compare(qb, qa) : Double.compare(sb, sa);
+        if (byScore) {
+            int c = Integer.compare(qb, qa);
+            if (c != 0) return c;
+            return compareSpeedKey(a, b);
+        }
+        int c = compareSpeedKey(a, b);
         if (c != 0) return c;
-        return byScore ? Double.compare(sb, sa) : Integer.compare(qb, qa);
+        return Integer.compare(qb, qa);
+    }
+
+    /**
+     * "速度"的全序比较（&lt;0 表示 a 更好）：先比评分里的速度项（{@link StreamQualityScorer#speedComponent}，
+     * 对 HLS / 推流类 / 有无实时倍率都已换算到同一把尺子），相同再比倍率、KB/s。
+     * 用单一数值键才能保证全序——"两条都有倍率才比倍率、否则比 KB/s"在三条线路混在一起时会出现
+     * A&gt;B&gt;C&gt;A 的循环，排序结果和 pickBestSource 选出的最佳线路就对不上
+     */
+    private static int compareSpeedKey(SpeedTestResult a, SpeedTestResult b) {
+        int c = Double.compare(StreamQualityScorer.speedComponent(b), StreamQualityScorer.speedComponent(a));
+        if (c != 0) return c;
+        c = Double.compare(safe(b.getRealtime()), safe(a.getRealtime()));
+        if (c != 0) return c;
+        return Double.compare(safe(b.getSpeed()), safe(a.getSpeed()));
     }
 
     private static double safe(double v) {
