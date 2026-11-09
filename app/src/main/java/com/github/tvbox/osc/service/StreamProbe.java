@@ -64,14 +64,14 @@ public final class StreamProbe {
     private StreamProbe() {}
 
     /** 拉流探测的读取窗口（从建连完成算起，毫秒） */
-    private static final long READ_WINDOW_MS = 2500;
+    private static final long READ_WINDOW_MS = 3000; // 1.3.3：与 HTTP 直链窗口一致，降低网络波动影响
     /** 窗口开头这段时间的数据不计入码率：服务器常先突发一个 GOP 缓存，会把码率算高 */
     private static final long BURST_SKIP_MS = 500;
     /** 计算码率至少要跨这么久的数据（不足按"流提前结束"处理） */
     private static final long MIN_DATA_SPAN_MS = 1000;
     /** 读够这么多字节就提前结束（高码率流）；样本另有上限 */
     private static final long READ_MAX_BYTES = 4L * 1024 * 1024;
-    /** 至少读到这么多才算"在出数据"：排除只回了握手/元数据就没下文的情况（低码率电台 2.5 秒也有十几 KB） */
+    /** 至少读到这么多才算"在出数据"：排除只回了握手/元数据就没下文的情况（低码率电台 3 秒也有十几 KB） */
     private static final long MIN_OK_BYTES = 4 * 1024;
     /** MediaProbe 样本上限（与 HTTP 测速一致） */
     private static final int SAMPLE_MAX = 512 * 1024;

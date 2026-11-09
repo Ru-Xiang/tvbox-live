@@ -772,7 +772,7 @@ public class SpeedTestEngine {
             for (int i = 0; i < size; i++) {
                 String url = sourceUrls.get(i);
                 if (url != null && !url.isEmpty()) {
-                    // RTSP / RTMP / 组播直连现在会真正探测（每条 2–3 秒），同样计入配额
+                    // RTSP / RTMP / 组播直连现在会真正探测（每条约 3–4 秒），同样计入配额
                     if (ProtocolFilter.isSpeedTestable(url) || StreamProbe.canProbe(url)) {
                         if (testable >= perChannel) continue;
                         testable++;
@@ -1593,9 +1593,9 @@ public class SpeedTestEngine {
     /** 最后一块数据之后空等超过这么久算"卡住" */
     private static final long STALL_MS = 500;
     /** 能解析时间戳的直链读满这么久再停（见 measureStream） */
-    private static final long DIRECT_WINDOW_MS = 2000;
+    private static final long DIRECT_WINDOW_MS = 3000; // 1.3.3：2 秒 → 3 秒，降低一时网络波动对结果的影响
     /** 直链最多读这么多（高带宽的有限文件很快就能读满） */
-    private static final long DIRECT_MAX_BYTES = 8L * 1024 * 1024;
+    private static final long DIRECT_MAX_BYTES = 3L * 1024 * 1024; // 1.3.3：读满 3MB 或 3 秒，先到先停
     /** 算实时倍率至少要这么多秒的内容、这么久的墙钟时间，否则结果不可信 */
     private static final double MIN_MEDIA_SPAN_S = 0.3;
     private static final long MIN_REALTIME_WALL_MS = 500;
@@ -1617,17 +1617,18 @@ public class SpeedTestEngine {
     /** HLS 分片正文总耗时短于此值时（几个包就读完）不足以算吞吐，改用含首包等待的总耗时 */
     private static final long MIN_SEGMENT_BODY_MS = 50;
     /**
-     * HLS 实测读够这么多正文即停止。实测是单线程串行的，以前每条都把分片读到预算用完（约 5 秒），
-     * 整轮时间几乎全花在这里；读 1MB 已足够区分快慢与是否达到可用阈值
+     * HLS 实测读够这么多正文即停止（与正文时长上限 HLS_MEASURE_BODY_MS 先到先停）。
+     * 1.3.3 起与直链统一为"3MB 或 3 秒"：读得更多，单次网络波动对结果的影响更小；
+     * 实测是单线程串行的，再往上加会明显拉长整轮测速
      */
-    private static final long HLS_MEASURE_BYTES = 1024 * 1024;
-    /** 读满 HLS_MEASURE_BYTES 只用了不到 HLS_FAST_BODY_MS（极快线路）：继续读到这么多再停，避免停在 TCP 慢启动阶段而低估 */
-    private static final long HLS_MEASURE_BYTES_FAST = 2 * 1024 * 1024;
-    private static final long HLS_FAST_BODY_MS = 300;
-    /** HLS 实测正文最多读这么久（慢线路读不满字节上限时） */
-    private static final long HLS_MEASURE_BODY_MS = 1500;
-    /** 已读正文不足这么多字节时才去读下一个分片（上一个失败或太短） */
-    private static final long HLS_MIN_USEFUL_BYTES = 256 * 1024;
+    private static final long HLS_MEASURE_BYTES = 3L * 1024 * 1024; // 1.3.3：1MB → 3MB
+    /** 不再对极快线路额外放宽：统一"3MB 或 3 秒，先到先停" */
+    private static final long HLS_MEASURE_BYTES_FAST = HLS_MEASURE_BYTES;
+    private static final long HLS_FAST_BODY_MS = 0;
+    /** HLS 实测正文最多读这么久（慢线路读不满字节上限时）；1.3.3：1.5 秒 → 3 秒 */
+    private static final long HLS_MEASURE_BODY_MS = 3000;
+    /** 一个分片读完还没凑够 3MB / 3 秒时接着读下一个分片（多个分片累计） */
+    private static final long HLS_MIN_USEFUL_BYTES = HLS_MEASURE_BYTES;
 
     /** 实时倍率上限：再大没有区分意义，还能挡住时间戳异常造成的离谱值 */
     static final double MAX_REALTIME = 20.0;
@@ -2581,30 +2582,10 @@ public class SpeedTestEngine {
                 windowEnd = true;
                 break;
             }
-            long dt = now - lastTime;
-            if (dt >= 100) { // 每 ~100ms 采样一次瞬时速度
-                double inst = (totalBytes - lastBytes) / 1024.0 / (dt / 1000.0); // KB/s
-                samples.add(inst);
-                lastTime = now;
-                lastBytes = totalBytes;
-
-                // 解析不了时间戳的流（fMP4、MP3 等）：沿用"速度稳定即停"
-                if (!clockKnown && elapsed >= MIN_MEASURE_MS && totalBytes >= MIN_BYTES
-                        && samples.size() >= STABILITY_WINDOW) {
-                    List<Double> window = samples.subList(samples.size() - STABILITY_WINDOW, samples.size());
-                    double mean = 0;
-                    double mn = Double.MAX_VALUE, mx = 0;
-                    for (double v : window) {
-                        mean += v;
-                        mn = Math.min(mn, v);
-                        mx = Math.max(mx, v);
-                    }
-                    mean /= window.size();
-                    if (mean > 0 && (mx - mn) / mean < STABILITY_THRESHOLD) {
-                        stableBreak = true;
-                        break; // 速度已稳定
-                    }
-                }
+            // 解析不了时间戳的流（fMP4、MP3 等）：同样读满 3 秒（1.3.3 起不再"速度一稳定就停"，降低网络波动影响）
+            if (!clockKnown && elapsed >= DIRECT_WINDOW_MS) {
+                windowEnd = true;
+                break;
             }
         }
 
