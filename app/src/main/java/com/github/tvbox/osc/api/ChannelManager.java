@@ -1661,6 +1661,9 @@ public class ChannelManager {
      * 全部相等返回 0，由调用方保持原顺序。重排与本地列表选最佳线路共用，保证同分时结论一致。
      */
     private static int compareAvailable(SpeedTestResult a, SpeedTestResult b, boolean byScore) {
+        // RTSP "仅在线"（不知道速度）总排在实测到速度的可用线路之后，与按分 / 按速两种模式无关
+        boolean oa = SpeedTestEngine.isOnlineUnknownSpeed(a), ob = SpeedTestEngine.isOnlineUnknownSpeed(b);
+        if (oa != ob) return oa ? 1 : -1;
         double sa = safe(a.getSpeed()), sb = safe(b.getSpeed());
         int qa = a.getQualityScore(), qb = b.getQualityScore();
         int c = byScore ? Integer.compare(qb, qa) : Double.compare(sb, sa);
@@ -2206,8 +2209,8 @@ public class ChannelManager {
             if (LineQuality.isBlackLine(url, r) || LineQuality.isLowResolution(url, r)) {
                 // 置顶线路也计入不合格（不算正常线路），删除时再跳过
                 lowQuality.add(url);
-            } else {
-                good++;   // 本轮实测可用且画质合格
+            } else if (!SpeedTestEngine.isOnlineUnknownSpeed(r)) {
+                good++;   // 本轮实测可用且画质合格（RTSP 仅在线不算，见引擎 removeUnavailableSources）
             }
         }
         if (lowQuality.isEmpty()) return;

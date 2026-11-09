@@ -111,6 +111,8 @@ dependencies {
     implementation "com.google.android.exoplayer:exoplayer-rtsp:${rootProject.ext.exoplayerVersion}"
     // RTMP 支持：提供 RtmpDataSource（含 native 库），需在数据源工厂中按协议分发
     implementation "com.google.android.exoplayer:extension-rtmp:${rootProject.ext.exoplayerVersion}"
+    // RTMP 线路测速探测直接用 librtmp 客户端（extension-rtmp 只把它作为运行时依赖，版本保持一致）
+    implementation "io.antmedia:rtmp-client:3.2.0"
     // OkHttp 数据源：与 App 共用连接池，换台复用连接、支持预连接
     implementation "com.google.android.exoplayer:extension-okhttp:${rootProject.ext.exoplayerVersion}"
     // FFmpeg 音频解码兜底（Jellyfin 预编译，含 mp3(兼解 MP2)/aac/ac3/eac3/dca/truehd 等）：

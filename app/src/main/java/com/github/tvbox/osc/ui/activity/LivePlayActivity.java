@@ -3301,18 +3301,24 @@ public class LivePlayActivity extends AppCompatActivity {
     /**
      * 当前线路自己的测速值。
      *
-     * @return null＝尚未测速；0＝测过但不可用；>0＝该线路的测速值（KB/s）
+     * @return null＝尚未测速 / 不可测速；0＝测过但不可用；>0＝该线路的测速值（KB/s）；
+     *         -1＝探测确认在线但不知道速度（RTSP）
      */
     private Double getSourceSpeedKbps(LiveChannel ch) {
         try {
             String url = ch.getCurrentSourceUrl();
-            // RTSP/RTMP 这类流式协议无法用 HTTP 片段测速，缓存里记的是"不可测速"而非"不可用"。
-            // 必须在这里就返回 null（未测速），否则会被当成 0 显示成"不可用"，误导用户以为线路坏了。
-            if (url != null && !com.github.tvbox.osc.util.ProtocolFilter.isSpeedTestable(url)) {
-                return null;
-            }
+            // 既不能 HTTP 测速、也不能探测的协议：没有结论，按未测速显示
+            boolean probeable = url != null && (com.github.tvbox.osc.util.ProtocolFilter.isSpeedTestable(url)
+                    || com.github.tvbox.osc.service.StreamProbe.canProbe(url));
+            if (url != null && !probeable) return null;
             if (url != null && speedTestEngine != null) {
                 SpeedTestResult r = speedTestEngine.getCachedResult(url);
+                // "不可测速"（探测下不了结论）不是"不可用"：按未测速显示
+                if (r != null && SpeedTestEngine.UNTESTABLE.equals(r.getFailureType())) return null;
+                // RTSP 探测确认在线，但没有速度
+                if (SpeedTestEngine.isOnlineUnknownSpeed(r)) return -1.0;
+                // 非 HTTP 线路还没有测速结果：不能用下面的速度列表兜底（默认 0 会显示成"不可用"）
+                if (r == null && !com.github.tvbox.osc.util.ProtocolFilter.isSpeedTestable(url)) return null;
                 // 缓存命中即直接采用：0 也是结论（测过但不可用），
                 // 不能因为 <=0 就往下走，否则会被误判成"未测速"。
                 // 低于最低速度阈值的线路 available=false 但仍保留测得的速度（排序要用），
@@ -3409,6 +3415,10 @@ public class LivePlayActivity extends AppCompatActivity {
             if (cur != null && cur > 0) {
                 tvSpeedInfo.setVisibility(View.VISIBLE);
                 tvSpeedInfo.setText(String.format("%.0f KB/s", cur));
+            } else if (cur != null && cur < 0) {
+                // RTSP：探测确认在线，不知道速度
+                tvSpeedInfo.setVisibility(View.VISIBLE);
+                tvSpeedInfo.setText("在线");
             } else if (cur != null) {
                 // 该线路测过但不可用
                 tvSpeedInfo.setVisibility(View.VISIBLE);

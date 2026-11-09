@@ -769,7 +769,8 @@ public class SpeedTestEngine {
             for (int i = 0; i < size; i++) {
                 String url = sourceUrls.get(i);
                 if (url != null && !url.isEmpty()) {
-                    if (ProtocolFilter.isSpeedTestable(url)) {
+                    // RTSP / RTMP / 组播直连现在会真正探测（每条 2–3 秒），同样计入配额
+                    if (ProtocolFilter.isSpeedTestable(url) || StreamProbe.canProbe(url)) {
                         if (testable >= perChannel) continue;
                         testable++;
                     }
@@ -879,6 +880,9 @@ public class SpeedTestEngine {
 
                     // 计算综合评分
                     try { StreamQualityScorer.score(result); } catch (Exception ignore) {}
+                    // RTSP 只确认在线、没有速度：评分压到最低的正数——排在所有实测可用线路之后，
+                    // 仍在未测 / 不可测速 / 失败线路之前
+                    if (isOnlineUnknownSpeed(result)) result.setQualityScore(1);
 
                     synchronized (round) {
                         // 本轮已进入收尾：迟到的结果赶不上排序与本地列表，不再写入
@@ -1071,10 +1075,15 @@ public class SpeedTestEngine {
                             try {
                                 if (cancelled.get()) return;
                                 if (!waitWhilePlaybackBuffering(cancelled)) return;
-                                SpeedTestResult result = withTimeoutRetry(
+                                // RTSP / RTMP / 组播直连：验证阶段已完整探测过（拉流、码率、画面），直接用验证结论，
+                                // 不再连第二次（第二次结果还可能覆盖验证结论）
+                                SpeedTestResult result = StreamProbe.canProbe(task.url)
+                                        ? c.verified
+                                        : withTimeoutRetry(
                                         () -> performSpeedTest(task.url, name, timeout),
                                         cancelled, task.url);
-                                ok = result.isAvailable();
+                                // RTSP "仅在线"（不知道速度）不占实测名额：凑够 K 条可用要靠真正测到速度的线路
+                                ok = result.isAvailable() && !isOnlineUnknownSpeed(result);
                                 fin.finish(task, result);
                             } catch (Throwable t) {
                                 fin.fail(task, t);
@@ -1810,6 +1819,83 @@ public class SpeedTestEngine {
         }
     }
 
+    // ============ 非 HTTP 线路探测（1.3.1） ============
+
+    /**
+     * RTSP / RTMP / 组播直连线路的测速结果：由 StreamProbe 实际连一次得出。
+     * <ul>
+     *   <li>拉流探测（RTMP、组播）：有码率，按直播直链的下限判断可用（与 HTTP 直链一致）；</li>
+     *   <li>RTSP：只确认服务器在线、流存在，速度未知，记为"可用、速度 0"（排在实测可用线路之后）；</li>
+     *   <li>无法判断的（应答看不懂、需要认证但地址里没账号等）：记为不可测速，不删除。</li>
+     * </ul>
+     *
+     * @param allowCached 实测阶段传 true：直接用验证阶段 90 秒内的成功结论，不重复连接
+     */
+    private SpeedTestResult probeStreamLine(String urlStr, String channelName, int timeoutSeconds,
+                                            boolean allowCached, ConnectInfo connectInfo) {
+        SpeedTestResult result = new SpeedTestResult(urlStr, channelName);
+        long deadline = System.currentTimeMillis() + Math.max(2, timeoutSeconds) * 1000L;
+        StreamProbe.Outcome o = StreamProbe.probe(urlStr, deadline, allowCached);
+        // 建连结果交给按主机熔断：RTMP/RTSP 服务器整台挂掉时，同主机的其余线路延后复核，不再逐条等超时
+        // （组播没有"主机"，不参与）
+        if (connectInfo != null && !StreamProbe.isMulticastDirect(urlStr)) {
+            String hk = hostKeyOf(urlStr);
+            if (hk != null) {
+                if (o.connectFailKind != null) {
+                    connectInfo.failHost = hk;
+                    connectInfo.failKind = o.connectFailKind;
+                } else if (o.connected) {
+                    connectInfo.okHosts.add(hk);
+                }
+            }
+        }
+        result.setTestTime(System.currentTimeMillis());
+        result.setLatency(o.latencyMs > 0 ? o.latencyMs : -1);
+        if (!o.ok) {
+            result.setAvailable(false);
+            result.setStatus(3);
+            result.setFailureType(o.inconclusive ? UNTESTABLE : o.failureType);
+            result.setErrorMsg(o.errorMsg);
+            return result;
+        }
+        if (o.resolution != null) result.setResolution(o.resolution);
+        result.setVideoState(o.videoState);
+        boolean available;
+        if (o.speedKBps >= 0) {
+            result.setSpeed(o.speedKBps);
+            MeasureInfo info = new MeasureInfo();
+            info.liveDirect = true; // 实时推送的流：测得的是码率，按直链下限判断
+            info.audio = result.isVideoMissing();
+            int minSpeed = Hawk.get(HawkConfig.SPEED_MIN_THRESHOLD, HawkConfig.DEFAULT_SPEED_MIN_THRESHOLD);
+            double effMin = effectiveMinSpeed(minSpeed, info);
+            available = o.speedKBps > 0 && (effMin <= 0 || o.speedKBps >= effMin);
+            if (!available) {
+                result.setFailureType(BELOW_MIN);
+                result.setErrorMsg("码率低于阈值 " + Math.round(effMin) + " KB/s");
+            }
+        } else {
+            available = true;
+            // 用 failureType 做标记：它会随测速缓存落盘（errorMsg 不会），重启后界面仍能显示"在线"
+            result.setFailureType(ONLINE_ONLY);
+            result.setErrorMsg("在线（RTSP 不测速度）");
+        }
+        result.setAvailable(available);
+        result.setStatus(available ? 2 : 3);
+        Timber.d("流探测完成: %s - %s, %s%s", channelName,
+                o.speedKBps >= 0 ? String.format(Locale.ROOT, "%.1f KB/s", o.speedKBps) : "在线",
+                result.getResolution() != null ? result.getResolution() : "?",
+                result.isVideoMissing() ? " 无视频轨" : "");
+        return result;
+    }
+
+    /** 可用结果上的标记：探测确认在线、但不知道速度（RTSP）。界面据此显示"在线"而不是"不可用" */
+    public static final String ONLINE_ONLY = "ONLINE_ONLY";
+
+    /** 测速结果是"可用但速度未知"（RTSP 在线） */
+    public static boolean isOnlineUnknownSpeed(SpeedTestResult r) {
+        return r != null && r.isAvailable() && ONLINE_ONLY.equals(r.getFailureType());
+    }
+
     // ============ udpxy 代理并发控制（1.3.0） ============
 
     /**
@@ -1862,6 +1948,10 @@ public class SpeedTestEngine {
         result.setStatus(1);
         String url = cleanUrl(urlStr);
         if (!ProtocolFilter.isSpeedTestable(url)) {
+            // RTSP / RTMP / 组播直连：用与播放相同的通道真正探测一次（见 StreamProbe）
+            if (StreamProbe.canProbe(urlStr)) {
+                return probeStreamLine(urlStr, channelName, timeoutSeconds, false, connectInfo);
+            }
             result.setAvailable(false);
             result.setStatus(3);
             result.setFailureType(UNTESTABLE);
@@ -2053,9 +2143,10 @@ public class SpeedTestEngine {
         // 否则按 UA/Referer 放行的源会"测速失败但能播"或反过来
         String url = cleanUrl(urlStr);
 
-        // 仅 HTTP(S) 可下载测速；RTSP/RTMP 是流式协议，无法用 HTTP 拉取片段测速。
-        // 标记为"不可测速"而非"不可用"，这类线路仍可播放，不应在测速后被移除。
+        // 仅 HTTP(S) 可下载测速。RTSP / RTMP / 组播直连改由 StreamProbe 探测（实测阶段复用验证阶段的成功结论）；
+        // 其余探测不了的协议标记为"不可测速"而非"不可用"，这类线路仍可播放，不应在测速后被移除。
         if (!ProtocolFilter.isSpeedTestable(url)) {
+            if (StreamProbe.canProbe(urlStr)) return probeStreamLine(urlStr, channelName, timeoutSeconds, true, null);
             result.setAvailable(false);
             result.setStatus(3);
             result.setFailureType(UNTESTABLE);
@@ -2442,8 +2533,21 @@ public class SpeedTestEngine {
     /** 线路地址的 host:port（小写，缺省端口按协议补全）；解析失败返回 null */
     private static String hostKeyOf(String url) {
         if (url == null) return null;
+        String play = StreamUrl.playUrl(url);
+        if (play == null) return null;
+        String lower = play.trim().toLowerCase(Locale.ROOT);
+        // RTSP / RTMP：java.net.URL 不认这些协议，按 URI 解析并补默认端口；组播没有"主机"
+        int defPort = lower.startsWith("rtsp://") ? 554
+                : (lower.startsWith("rtmp://") || lower.startsWith("rtmpt://")) ? (lower.startsWith("rtmpt") ? 80 : 1935)
+                : -1;
         try {
-            URL u = new URL(StreamUrl.playUrl(url));
+            if (defPort > 0) {
+                java.net.URI u = new java.net.URI(play.trim());
+                String host = u.getHost();
+                if (host == null || host.isEmpty()) return null;
+                return host.toLowerCase(Locale.ROOT) + ":" + (u.getPort() > 0 ? u.getPort() : defPort);
+            }
+            URL u = new URL(play);
             String host = u.getHost();
             if (host == null || host.isEmpty()) return null;
             int port = u.getPort() >= 0 ? u.getPort() : u.getDefaultPort();
@@ -2946,8 +3050,9 @@ public class SpeedTestEngine {
                 unavailable.add(url);
             } else if (checkQuality && (LineQuality.isBlackLine(url, r) || LineQuality.isLowResolution(url, r))) {
                 lowQuality.add(url);
-            } else {
-                // 本轮实测可用、且画质合格（或不做画质判断）的线路才算"正常线路"
+            } else if (!isOnlineUnknownSpeed(r)) {
+                // 本轮实测可用、且画质合格（或不做画质判断）的线路才算"正常线路"。
+                // RTSP 只确认了在线（DESCRIBE 成功不代表一定拉得到流），不算：不能凭它放开删除其它线路
                 good++;
             }
         }

@@ -47,6 +47,8 @@ public final class MulticastDataSource extends BaseDataSource {
     private static final int RECEIVE_BUFFER = 4 * 1024 * 1024;
 
     private final Context appContext;
+    /** 收不到包多久算断流；测速探测会调短（见 setReceiveTimeoutMs） */
+    private int receiveTimeoutMs = SOCKET_TIMEOUT_MS;
     private final byte[] packetBuffer = new byte[MAX_PACKET];
     private final DatagramPacket packet = new DatagramPacket(packetBuffer, MAX_PACKET);
 
@@ -62,6 +64,11 @@ public final class MulticastDataSource extends BaseDataSource {
     public MulticastDataSource(Context context) {
         super(/* isNetwork= */ true);
         this.appContext = context.getApplicationContext();
+    }
+
+    /** 在 open() 之前调用：收包超时（毫秒），测速探测用较短的值 */
+    public void setReceiveTimeoutMs(int ms) {
+        this.receiveTimeoutMs = Math.max(200, ms);
     }
 
     @Override
@@ -106,7 +113,7 @@ public final class MulticastDataSource extends BaseDataSource {
                 s = new MulticastSocket(port);
             }
             socket = s;
-            s.setSoTimeout(SOCKET_TIMEOUT_MS);
+            s.setSoTimeout(receiveTimeoutMs);
             try {
                 s.setReceiveBufferSize(RECEIVE_BUFFER);
             } catch (Exception ignore) {
