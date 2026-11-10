@@ -320,9 +320,35 @@ public class App extends Application {
                 }
                 Hawk.put(HawkConfig.IPTV_MULTI_REPO_DEFAULTS_SEEDED, true);
             }
+            // 1.3.5：默认多仓链接换成新的 5 个。只替换"没改过"的旧默认列表（或空列表）；
+            // 用户自己增删过的列表保持原样
+            if (!Hawk.get(HawkConfig.IPTV_MULTI_REPO_DEFAULTS_V2, false)) {
+                String repos = Hawk.get(HawkConfig.IPTV_MULTI_REPO_URLS, "");
+                java.util.Set<String> cur = jsonUrlSet(repos);
+                if (cur.isEmpty() || cur.equals(jsonUrlSet(HawkConfig.LEGACY_DEFAULT_MULTI_REPO_URLS_V1))) {
+                    Hawk.put(HawkConfig.IPTV_MULTI_REPO_URLS, HawkConfig.DEFAULT_MULTI_REPO_URLS);
+                    Timber.i("默认多仓链接已更新为新的默认值");
+                }
+                Hawk.put(HawkConfig.IPTV_MULTI_REPO_DEFAULTS_V2, true);
+            }
         } catch (Exception e) {
             Timber.w(e, "配置迁移失败");
         }
+    }
+
+    /** JSON 数组字符串里的地址集合（去掉首尾空白）；解析失败返回空集合 */
+    private static java.util.Set<String> jsonUrlSet(String json) {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        if (json == null || json.trim().isEmpty()) return out;
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(json.trim());
+            for (int i = 0; i < arr.length(); i++) {
+                String u = arr.optString(i, "").trim();
+                if (!u.isEmpty()) out.add(u);
+            }
+        } catch (Exception ignore) {
+        }
+        return out;
     }
 
     /**

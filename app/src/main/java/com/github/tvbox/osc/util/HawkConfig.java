@@ -71,6 +71,9 @@ public class HawkConfig {
      */
     public static final String IPTV_MULTI_REPO_DEFAULTS_SEEDED = "iptv_multi_repo_defaults_seeded";
 
+    /** 1.3.5 新默认多仓链接的一次性迁移标记（只替换没改过的旧默认列表） */
+    public static final String IPTV_MULTI_REPO_DEFAULTS_V2 = "iptv_multi_repo_defaults_v2";
+
     /** 自定义/订阅源连续未入选次数统计（JSON: {url:count}） */
     public static final String IPTV_SOURCE_FAIL_COUNT = "iptv_source_fail_count";
 
@@ -299,6 +302,14 @@ public class HawkConfig {
      * 新安装直接生效；老用户若从未配置过多仓链接，升级后由一次性迁移补上（见 App#migrateConfig）。
      */
     public static final String DEFAULT_MULTI_REPO_URLS =
+            "[\"http://ztha.top/TVBox/GYCK.json\","
+            + "\"http://xmbjm.fh4u.org/dc.txt\","
+            + "\"http://xhztv.top/dc\","
+            + "\"http://www.饭太硬.net/tv\","
+            + "\"https://gitlab.com/noimank/tvbox/-/raw/main/tvboxmuti.json\"]";
+
+    /** 1.3.4 及以前的默认多仓链接：老用户的列表还是它（没改过）时，升级换成新的默认值 */
+    public static final String LEGACY_DEFAULT_MULTI_REPO_URLS_V1 =
             "[\"https://gitlab.com/noimank/tvbox/-/raw/main/tvboxmuti.json\","
             + "\"https://gh-proxy.com/https://raw.githubusercontent.com/wxrjck/-YSC-/refs/heads/main/wx.json\"]";
 
