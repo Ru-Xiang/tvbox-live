@@ -383,6 +383,7 @@ public class SpeedTestEngine {
                 r.setHls(o.optBoolean("h", false));
                 r.setVideoState(o.optInt("v", SpeedTestResult.VIDEO_UNKNOWN));
                 r.setRealtime(clampRealtime(o.optDouble("x", 0)));
+                r.setMeasuredTime(o.optLong("m", 0));
                 resultCache.put(url, r);
             }
             Timber.d("从持久化恢复测速缓存: %d 条", resultCache.size());
@@ -456,6 +457,7 @@ public class SpeedTestEngine {
                 if (r.isHls()) o.put("h", true);
                 if (r.getVideoState() != SpeedTestResult.VIDEO_UNKNOWN) o.put("v", r.getVideoState());
                 if (r.getRealtime() > 0) o.put("x", Math.round(r.getRealtime() * 100) / 100.0);
+                if (r.getMeasuredTime() != r.getTestTime()) o.put("m", r.getMeasuredTime());
                 arr.put(o);
             }
             String out = arr.toString();
@@ -846,7 +848,12 @@ public class SpeedTestEngine {
         // 通过的线路再进实测池做完整下载测量。实测池只有 1 个线程：同一时间只有一条线路在测速度，
         // 测出的速度不会因为多条线路同时下载、互相抢带宽而失真
         final ExecutorService pool = newBackgroundPool(concurrency, "SpeedTestVerify");
-        final ExecutorService measurePool = newBackgroundPool(1, "SpeedTestMeasure");
+        // 1.3.4：实测池 3 个线程。推流类线路（直链 / RTMP / 组播，按码率推送、只占码率大小的带宽）
+        // 可以同时测；HLS 按带宽下载，测量时独占（measureLock 写锁），不与任何测量重叠，测出的带宽不失真
+        final ExecutorService measurePool = newBackgroundPool(
+                Math.max(1, Math.min(PACED_MEASURE_THREADS, concurrency)), "SpeedTestMeasure");
+        final java.util.concurrent.locks.ReentrantReadWriteLock measureLock =
+                new java.util.concurrent.locks.ReentrantReadWriteLock(true);
         round.pool = pool;
         round.measurePool = measurePool;
         final AtomicBoolean cancelled = round.cancelled;
@@ -881,8 +888,14 @@ public class SpeedTestEngine {
                     // 若写入缓存会让新一轮/线路过滤把好线路当成不可用
                     if (cancelled.get()) return;
 
-                    // 与上次结果加权平滑，再计算综合评分
-                    smoothWithPrevious(result, resultCache.get(task.url));
+                    // 新实测的结果：实测时间就是测速时间（沿用的结果已带上原实测时间）
+                    if (result.getMeasuredTime() <= 0 || result.getMeasuredTime() == result.getTestTime()) {
+                        result.setMeasuredTime(result.getTestTime());
+                    }
+                    // 沿用的结果不再与上次平滑（就是上次的值）
+                    if (result.getMeasuredTime() == result.getTestTime()) {
+                        smoothWithPrevious(result, resultCache.get(task.url));
+                    }
                     try { StreamQualityScorer.score(result); } catch (Exception ignore) {}
                     // RTSP 只确认在线、没有速度：评分压到最低的正数——排在所有实测可用线路之后，
                     // 仍在未测 / 不可测速 / 失败线路之前
@@ -1015,6 +1028,21 @@ public class SpeedTestEngine {
                         boolean forced = isPinnedQuietly(cm, task.channel, task.url)
                                 || LiveChannel.isPlayingUrl(task.channel, task.url);
                         SpeedTestResult prev = resultCache.get(task.url);
+                        // 整轮测速：近期实测过且结果良好的线路，验证能连上后直接沿用上次的速度与倍率，不再实测
+                        // （单频道测速是用户主动要求，总是完整实测）
+                        SpeedTestResult reused = round.partial ? null : reuseRecent(prev, checked);
+                        if (reused != null) {
+                            fin.finish(task, reused);
+                            synchronized (tr) {
+                                tr.measuredOk++;
+                            }
+                            if (countsPending) {
+                                verifyDone(tr);
+                            } else {
+                                pump(tr);
+                            }
+                            return;
+                        }
                         int prevScore = prev != null && prev.isAvailable() ? prev.getQualityScore() : -1;
                         synchronized (tr) {
                             tr.pending.add(new Candidate(task, checked, forced, prevScore));
@@ -1081,11 +1109,26 @@ public class SpeedTestEngine {
                                 if (!waitWhilePlaybackBuffering(cancelled)) return;
                                 // RTSP / RTMP / 组播直连：验证阶段已完整探测过（拉流、码率、画面），直接用验证结论，
                                 // 不再连第二次（第二次结果还可能覆盖验证结论）
-                                SpeedTestResult result = StreamProbe.canProbe(task.url)
-                                        ? c.verified
-                                        : withTimeoutRetry(
-                                        () -> performSpeedTest(task.url, name, timeout),
-                                        cancelled, task.url);
+                                SpeedTestResult result;
+                                if (StreamProbe.canProbe(task.url)) {
+                                    result = c.verified;
+                                } else {
+                                    // HLS 独占（写锁），推流类共享（读锁）；公平锁保证 HLS 不会被饿死。
+                                    // 经 udpxy 的组播也独占：它在实测里还要排队等代理名额（同一时间只测一条），
+                                    // 拿着共享锁排队会让 HLS 跟着干等
+                                    boolean exclusive = c.verified.isHls() || viaUdpxy(task.url);
+                                    java.util.concurrent.locks.Lock lock = exclusive
+                                            ? measureLock.writeLock() : measureLock.readLock();
+                                    lock.lockInterruptibly();
+                                    try {
+                                        if (cancelled.get()) return;
+                                        result = withTimeoutRetry(
+                                                () -> performSpeedTest(task.url, name, timeout),
+                                                cancelled, task.url);
+                                    } finally {
+                                        lock.unlock();
+                                    }
+                                }
                                 // RTSP "仅在线"（不知道速度）不占实测名额：凑够 K 条可用要靠真正测到速度的线路
                                 ok = result.isAvailable() && !isOnlineUnknownSpeed(result);
                                 fin.finish(task, result);
@@ -1590,6 +1633,9 @@ public class SpeedTestEngine {
     private static final int STABILITY_WINDOW = 4;
     /** 稳定性波动阈值（窗口极差/均值低于此值即认为稳定） */
     private static final double STABILITY_THRESHOLD = 0.15;
+    /** 读满这么久（从第一个时间戳起）倍率仍低于 EARLY_ABORT_REALTIME 的线路提前结束测量 */
+    static final long EARLY_ABORT_AFTER_MS = 1000;
+    static final double EARLY_ABORT_REALTIME = 0.5;
     /** 最后一块数据之后空等超过这么久算"卡住" */
     private static final long STALL_MS = 500;
     /** 能解析时间戳的直链读满这么久再停（见 measureStream） */
@@ -1636,6 +1682,41 @@ public class SpeedTestEngine {
     static double clampRealtime(double rt) {
         if (Double.isNaN(rt) || rt <= 0) return 0;
         return Math.min(MAX_REALTIME, rt);
+    }
+
+    /** 推流类线路可以同时实测的条数 */
+    private static final int PACED_MEASURE_THREADS = 3;
+    /** 整轮测速沿用近期实测结果的有效期 */
+    private static final long REUSE_MAX_AGE_MS = 6L * 3600_000L;
+
+    /**
+     * 近期实测过且结果良好的线路：用本轮验证结果（新的延迟、能连上）加上次实测的速度 / 倍率 / 画面信息，
+     * 生成本轮结果；不满足条件返回 null（照常实测）。
+     * 条件：上次可用、有速度或倍率、不是 RTSP"仅在线"、类型（HLS / 直链）没变、实测时间在 6 小时内。
+     * 沿用的结果保留原实测时间，6 小时后一定会重新实测。
+     */
+    private static SpeedTestResult reuseRecent(SpeedTestResult prev, SpeedTestResult checked) {
+        if (prev == null || checked == null || !prev.isAvailable() || isOnlineUnknownSpeed(prev)) return null;
+        if (prev.getRealtime() <= 0 && prev.getSpeed() <= 0) return null;
+        if (prev.isHls() != checked.isHls()) return null;
+        long age = System.currentTimeMillis() - prev.getMeasuredTime();
+        if (age < 0 || age > REUSE_MAX_AGE_MS) return null;
+        if (StreamProbe.canProbe(checked.getUrl())) return null; // 验证阶段已完整探测过，用验证结果即可
+        SpeedTestResult r = new SpeedTestResult(checked.getUrl(), checked.getChannelName());
+        r.setAvailable(true);
+        r.setStatus(2);
+        r.setSpeed(prev.getSpeed());
+        r.setRealtime(prev.getRealtime());
+        r.setLatency(checked.getLatency() >= 0 ? checked.getLatency() : prev.getLatency());
+        r.setResolution(prev.getResolution());
+        r.setVideoState(prev.getVideoState());
+        r.setHls(prev.isHls());
+        r.setBandwidth(prev.getBandwidth());
+        r.setCodecs(prev.getCodecs());
+        r.setTestTime(System.currentTimeMillis());
+        r.setMeasuredTime(prev.getMeasuredTime());
+        r.setErrorMsg("沿用 " + Math.max(1, age / 60_000L) + " 分钟前的实测结果");
+        return r;
     }
 
     /** 平滑只用这么新的上次结果 */
@@ -1795,6 +1876,8 @@ public class SpeedTestEngine {
         long contentLength = -1;
         /** 整个分片读完了（读到 -1） */
         boolean eof;
+        /** 明显跟不上而提前结束 */
+        boolean earlyAbort;
         /** 响应头到达后读正文的耗时（不含连接/首包等待） */
         long bodyMs;
         long totalMs;
@@ -2449,6 +2532,7 @@ public class SpeedTestEngine {
         long mediaMs = 0;
         long fullSegBytes = 0;
         double fullSegSecs = 0;
+        boolean earlyAborted = false;
         boolean timedOut = false;
         int lastHttp = 0;
         Exception lastErr = null;
@@ -2456,7 +2540,7 @@ public class SpeedTestEngine {
         Capture cap = new Capture();
         for (String seg : sampled) {
             // 已读到足够数据，或正文时长已用满：不再读下一个分片
-            if (bodyBytes >= HLS_MIN_USEFUL_BYTES || bodyMs >= HLS_MEASURE_BODY_MS) break;
+            if (bodyBytes >= HLS_MIN_USEFUL_BYTES || bodyMs >= HLS_MEASURE_BODY_MS || earlyAborted) break;
             if (remainingMs(probe.deadline) <= 0) {
                 timedOut = true;
                 break;
@@ -2468,6 +2552,7 @@ public class SpeedTestEngine {
                 bodyBytes += r.bytes;
                 bodyMs += r.bodyMs;
                 totalMs += r.totalMs;
+                if (r.earlyAbort) earlyAborted = true; // 一个分片已经明显跟不上，不再读下一个
                 // 内容时长：优先按时间戳；解析不了（fMP4 等）时按"读到的比例 × #EXTINF 时长"
                 double secs = r.mediaSecs;
                 if (secs <= 0 && r.contentLength > 0) {
@@ -2546,6 +2631,7 @@ public class SpeedTestEngine {
         // 是否因为读满窗口 / 字节上限而结束（否则是超时、断开：最后一块数据之后的空等也要算进去）
         boolean windowEnd = false;
         boolean stableBreak = false;
+        boolean earlyAbort = false;
 
         while (true) {
             if (System.currentTimeMillis() >= probe.deadline) break;
@@ -2582,6 +2668,12 @@ public class SpeedTestEngine {
                 windowEnd = true;
                 break;
             }
+            // 明显跟不上：读满 1 秒倍率仍不到 0.5×，再读也改变不了结论，提前结束（按卡住处理，给出低倍率）
+            if (clockKnown && clockStartAt > 0 && now - clockStartAt >= EARLY_ABORT_AFTER_MS
+                    && clock.spanSeconds() / ((now - clockStartAt) / 1000.0) < EARLY_ABORT_REALTIME) {
+                earlyAbort = true;
+                break;
+            }
             // 解析不了时间戳的流（fMP4、MP3 等）：同样读满 3 秒（1.3.3 起不再"速度一稳定就停"，降低网络波动影响）
             if (!clockKnown && elapsed >= DIRECT_WINDOW_MS) {
                 windowEnd = true;
@@ -2599,8 +2691,8 @@ public class SpeedTestEngine {
         long loopEnd = System.currentTimeMillis();
         st.clockSeen = clock.hasTimestamp();
         // 卡住：不是读满窗口、也不是速度稳定后停的，而是超时 / 断开，且最后一块数据之后空等了一阵
-        st.stalled = !windowEnd && !stableBreak
-                && (probe.expired || (lastDataAt > 0 ? loopEnd - lastDataAt : totalTime) > STALL_MS);
+        st.stalled = earlyAbort || (!windowEnd && !stableBreak
+                && (probe.expired || (lastDataAt > 0 ? loopEnd - lastDataAt : totalTime) > STALL_MS));
         if (clockStartAt > 0) {
             long wallMs = (windowEnd ? lastDataAt : loopEnd) - clockStartAt;
             if (wallMs >= MIN_REALTIME_WALL_MS) {
@@ -2657,6 +2749,14 @@ public class SpeedTestEngine {
                 st.bytes += n;
                 if (cap != null) cap.append(buffer, 0, n);
                 clock.feed(buffer, 0, n);
+                // 明显跟不上：正文读了 1 秒，下到的内容时长还不到用时的一半，提前结束（结论不会变）
+                long bodyNow = System.currentTimeMillis() - bodyStart;
+                double spanNow = clock.spanSeconds();
+                if (bodyNow >= EARLY_ABORT_AFTER_MS && spanNow > 0
+                        && spanNow / (bodyNow / 1000.0) < EARLY_ABORT_REALTIME) {
+                    st.earlyAbort = true;
+                    break;
+                }
             }
             st.mediaSecs = clock.spanSeconds();
             // 读完即计时：读到一半停下时关闭连接要丢弃剩余正文（最多约 100ms），不能算进下载耗时

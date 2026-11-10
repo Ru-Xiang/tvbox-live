@@ -67,6 +67,11 @@ public class SpeedTestResult implements Serializable {
      * HLS 分片常在 3–10×，直播直链 / RTMP / 组播健康的约 1× 以上，&lt;1 表示跟不上。0 表示未知
      */
     private double realtime;
+    /**
+     * 速度 / 倍率真正实测的时间（1.3.4）。沿用近期结果时 testTime 会更新为本轮，measuredTime 保持原值：
+     * 沿用只能在实测后的一段时间内发生，不会一轮轮无限续期。0＝与 testTime 相同
+     */
+    private long measuredTime;
 
     /** 测速时探测到的视频轨情况：VIDEO_UNKNOWN / VIDEO_PRESENT / VIDEO_MISSING（只有音频） */
     private int videoState;
@@ -169,6 +174,9 @@ public class SpeedTestResult implements Serializable {
     public void setHls(boolean hls) { this.hls = hls; }
 
     public double getRealtime() { return realtime; }
+
+    public long getMeasuredTime() { return measuredTime > 0 ? measuredTime : testTime; }
+    public void setMeasuredTime(long measuredTime) { this.measuredTime = measuredTime; }
     public void setRealtime(double realtime) { this.realtime = realtime; }
 
     /** 是否为超时失败（用于智能重试判定） */

@@ -316,6 +316,7 @@ public final class StreamProbe {
         boolean windowDone = false;
         String err = null;
         com.github.tvbox.osc.util.MediaClock clock = new com.github.tvbox.osc.util.MediaClock();
+        boolean earlyAbort = false;
         // 实时倍率从第一个时间戳起计时（加入组播 / 回源的等待不算"跟不上"）
         long clockStartAt = -1;
         while (true) {
@@ -324,6 +325,12 @@ public final class StreamProbe {
             boolean clockShort = clockStartAt > 0 && now - clockStartAt < 1500;
             if ((now - openedAt >= READ_WINDOW_MS && !clockShort) || total >= READ_MAX_BYTES) {
                 windowDone = true;
+                break;
+            }
+            // 明显跟不上：从第一个时间戳起读了 1 秒，倍率还不到 0.5×，提前结束（按跟不上给出低倍率）
+            if (clockStartAt > 0 && now - clockStartAt >= SpeedTestEngine.EARLY_ABORT_AFTER_MS
+                    && clock.spanSeconds() / ((now - clockStartAt) / 1000.0) < SpeedTestEngine.EARLY_ABORT_REALTIME) {
+                earlyAbort = true;
                 break;
             }
             if (System.currentTimeMillis() >= deadlineMs) break;
@@ -358,7 +365,8 @@ public final class StreamProbe {
             return fail(FAIL_TIMEOUT, what + (eof ? " 连上后立即断开" : " 连上但没有数据"));
         }
         long dataSpan = lastDataAt - firstDataAt;
-        if (!windowDone && dataSpan < MIN_DATA_SPAN_MS) {
+        // 提前结束（明显跟不上）的不算"流提前结束"：它确实在出数据，结论交给低倍率表达
+        if (!windowDone && !earlyAbort && dataSpan < MIN_DATA_SPAN_MS) {
             // 只吐了一点缓存就断开 / 卡住：推流已停或鉴权在 play 之后才拒绝
             if (err != null) return fail(FAIL_OTHER, what + " 读取失败: " + err);
             return fail(eof ? FAIL_OTHER : FAIL_TIMEOUT, what + " 流提前结束");

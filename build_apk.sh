@@ -34,7 +34,7 @@ NC='\033[0m'
 
 # 项目信息
 PROJECT_NAME="TVBoxOS-Live"
-VERSION="1.3.3"
+VERSION="1.3.4"
 
 echo -e "${PURPLE}"
 echo "╔═══════════════════════════════════════════╗"
